@@ -1,0 +1,20 @@
+[package]
+name = "rs_ipc"
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+lto = "fat"
+
+[lib]
+name = "rs_ipc"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23.4" }
+rustix = { version = "0.38", default-features = false, features = ["mm", "shm", "std", "linux_latest"] }
+linux-futex = "1.0.0"
+rayon = "1.10.0"
+
+[dev-dependencies]
+pyo3 = { version = "0.23.4", features = ["auto-initialize"] }
