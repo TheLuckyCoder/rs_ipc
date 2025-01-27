@@ -12,8 +12,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pyo3 = { version = "0.23.4" }
-rustix = { version = "0.38", default-features = false, features = ["mm", "shm", "std", "linux_latest"] }
-linux-futex = "1.0.0"
+rustix = { version = "0.38", default-features = false, features = ["std", "mm", "shm", "thread", "linux_latest"] }
 rayon = "1.10.0"
 
 [dev-dependencies]
