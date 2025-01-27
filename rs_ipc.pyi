@@ -3,7 +3,7 @@ from typing import Callable
 
 
 class ReaderWaitPolicy:
-    class All:
+    class All(ReaderWaitPolicy):
         """
         Wait for all readers to read the message before writing
         """
@@ -11,7 +11,7 @@ class ReaderWaitPolicy:
         def __init__(self):
             pass
 
-    class Count:
+    class Count(ReaderWaitPolicy):
         """
         Wait for the specified number of readers to read the message before writing
         """

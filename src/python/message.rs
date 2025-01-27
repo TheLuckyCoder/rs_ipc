@@ -113,7 +113,7 @@ impl PythonSharedMessage {
             self.write_async(data)?;
             None
         } else {
-            Some(data.py().allow_threads(|| self.write_sync(data_bytes)))
+            data.py().allow_threads(|| self.write_sync(data_bytes))
         })
     }
 
@@ -159,14 +159,18 @@ impl PythonSharedMessage {
 }
 
 impl PythonSharedMessage {
-    fn write_sync(&self, data: &[u8]) -> usize {
+    fn write_sync(&self, data: &[u8]) -> Option<usize> {
         let version = if self.reader_wait_policy == ReaderWaitPolicy::Count(0) {
-            self.shared_memory.write(data)
+            Some(self.shared_memory.write(data))
         } else {
             self.shared_memory
                 .write_waiting_for_readers(data, self.reader_wait_policy.to_count())
         };
-        self.last_written_version.store(version, Ordering::Relaxed);
+        
+        if let Some(version) = version {
+            self.last_written_version.store(version, Ordering::Relaxed);
+        }
+        
         version
     }
 
@@ -188,10 +192,13 @@ impl PythonSharedMessage {
                 let new_version = if reader_wait_policy == ReaderWaitPolicy::Count(0) {
                     // If we are not waiting for readers, we only care about the latest data
                     let data = receiver.try_iter().last().unwrap_or(data);
-                    shared_memory.write(data.bytes())
+                    Some(shared_memory.write(data.bytes()))
                 } else {
                     shared_memory
                         .write_waiting_for_readers(data.bytes(), reader_wait_policy.to_count())
+                };
+                let Some(new_version) = new_version else {
+                    break;
                 };
 
                 last_written_version.store(new_version, Ordering::Relaxed);
@@ -359,6 +366,7 @@ mod tests {
 
         assert!(memory.read(false).is_none());
         memory.close();
+        assert!(memory.is_closed());
     }
 
     #[test]

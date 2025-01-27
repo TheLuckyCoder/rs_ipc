@@ -59,20 +59,19 @@ impl SharedMessage {
         new_version
     }
 
-    pub(crate) fn write_waiting_for_readers(&self, data: &[u8], wait_for: u32) -> usize {
+    pub(crate) fn write_waiting_for_readers(&self, data: &[u8], wait_for: u32) -> Option<usize> {
         let mut content = self.data.lock();
 
-        if self.get_version().version != 0 {
-            content = self.read_condvar.wait_while(content, |lock| {
-                lock.read_count < wait_for.min(lock.consumer_count)
-            });
-        }
+        content = self.read_condvar.wait_while(content, |lock| {
+            let ClosedAndVersion { closed, version } = self.get_version();
+            !closed && version != 0 && lock.read_count < wait_for.min(lock.consumer_count)
+        });
 
         let new_version = self.increment_version();
         content.copy(data);
         self.write_condvar.notify_all();
 
-        new_version
+        Some(new_version)
     }
 
     pub(crate) fn try_read(&self, current_version: usize, mut read: impl FnMut(usize, &[u8])) {
@@ -141,7 +140,9 @@ impl SharedMessage {
         let _ = self.data.lock();
         self.closed_and_version
             .fetch_or(Self::CLOSED_BIT, Ordering::Relaxed);
+
         self.write_condvar.notify_all();
+        self.read_condvar.notify_all();
     }
 
     /// This function must only be called when the mutex is locked and if the message not is closed
