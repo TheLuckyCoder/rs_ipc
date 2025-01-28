@@ -34,6 +34,7 @@ impl SharedCondvar {
     // All the memory orderings here are `Relaxed`,
     // because synchronization is done by unlocking and locking the mutex.
     
+    #[allow(dead_code)]
     pub fn notify_one(&self) {
         self.0.fetch_add(1, Relaxed);
         assert!(shared_futex::futex_wake(&self.0, 1));

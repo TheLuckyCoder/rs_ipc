@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
-#[pyclass]
+#[pyclass(module = "rs_ipc")]
 #[pyo3(frozen, name = "SharedMessage")]
 pub struct PythonSharedMessage {
     shared_memory: Arc<SharedMemoryMapper<SharedMessage>>,

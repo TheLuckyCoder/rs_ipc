@@ -54,7 +54,7 @@ impl SharedMessage {
         if self.get_version().stopped {
             return None;
         }
-        
+
         let mut content = self.data.lock();
 
         let new_version = unsafe { self.increment_version() };
@@ -67,10 +67,16 @@ impl SharedMessage {
     pub(crate) fn write_waiting_for_readers(&self, data: &[u8], wait_for: u32) -> Option<usize> {
         let mut content = self.data.lock();
 
+        let mut status = StoppedAndVersion::default();
         content = self.read_condvar.wait_while(content, |lock| {
-            let StoppedAndVersion { stopped, version } = self.get_version();
-            !stopped && version != 0 && lock.read_count < wait_for.min(lock.consumer_count)
+            status = self.get_version();
+            !status.stopped
+                && status.version != 0
+                && lock.read_count < wait_for.min(lock.consumer_count)
         });
+        if status.stopped {
+            return None;
+        }
 
         let new_version = unsafe { self.increment_version() };
         content.copy(data);
@@ -87,12 +93,15 @@ impl SharedMessage {
         }
 
         let mut content = self.data.lock();
-        // Read the version again after the lock has been acquired
-        let new_version = self.get_version().version;
+        // Read the version again after the lock has been acquired, as it could have changed
+        let StoppedAndVersion { stopped, version } = self.get_version();
+        if stopped {
+            return;
+        }
 
-        read(new_version, &content.payload[..content.size]);
+        read(version, &content.payload[..content.size]);
         content.read_count += 1;
-        self.read_condvar.notify_one();
+        self.read_condvar.notify_all();
     }
 
     pub(crate) fn blocking_read(&self, current_version: usize, mut read: impl FnMut(usize, &[u8])) {
@@ -109,7 +118,7 @@ impl SharedMessage {
 
         read(status.version, &content.payload[..content.size]);
         content.read_count += 1;
-        self.read_condvar.notify_one();
+        self.read_condvar.notify_all();
     }
 
     pub(crate) fn is_new_version_available(&self, current_version: usize) -> bool {
@@ -127,7 +136,7 @@ impl SharedMessage {
         content.consumer_count -= 1;
         self.read_condvar.notify_all();
     }
-    
+
     pub(crate) fn is_stopped(&self) -> bool {
         self.get_version().stopped
     }
@@ -140,7 +149,7 @@ impl SharedMessage {
         self.write_condvar.notify_all();
         self.read_condvar.notify_all();
     }
-    
+
     #[inline]
     fn get_version(&self) -> StoppedAndVersion {
         let version = self.stopped_and_version.load(Ordering::Relaxed);
@@ -149,8 +158,7 @@ impl SharedMessage {
         StoppedAndVersion { stopped, version }
     }
 
-
-    /// This function must only be called when the mutex is locked and if the message not is closed
+    /// This function must only be called when the mutex is locked and if the message not is stopped
     unsafe fn increment_version(&self) -> usize {
         let old_version = self.stopped_and_version.fetch_add(1, Ordering::Relaxed);
         let new_version = old_version + 1;
