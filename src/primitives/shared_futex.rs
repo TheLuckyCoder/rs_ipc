@@ -8,13 +8,13 @@ const LOCKED: u32 = 1; // locked, no other threads waiting
 const CONTENDED: u32 = 2; // locked, and other threads waiting (contended)
 
 #[inline]
-pub fn futex_wait(futex: &AtomicU32, state: u32) -> rustix::io::Result<()> {
-    futex::wait(futex, futex::Flags::empty(), state, None)
+pub fn futex_wait(futex: &AtomicU32, state: u32) -> bool {
+    futex::wait(futex, futex::Flags::empty(), state, None).is_ok()
 }
 
 #[inline]
-pub fn futex_wake(futex: &AtomicU32, count: u32) -> rustix::io::Result<usize> {
-    futex::wake(futex, futex::Flags::empty(), count)
+pub fn futex_wake(futex: &AtomicU32, count: i32) -> bool {
+    futex::wake(futex, futex::Flags::empty(), count as u32).is_ok()
 }
 
 #[derive(Default)]

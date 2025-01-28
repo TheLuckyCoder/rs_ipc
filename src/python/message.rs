@@ -39,8 +39,9 @@ impl PythonSharedMessage {
 
         let shared_memory = Arc::new(shared_memory);
         let last_read_version = Arc::new(AtomicUsize::default());
-        let receiver = (op_mode == OperationMode::ReadAsync)
-            .then(|| Self::start_reader_thread(shared_memory.clone(), last_read_version.clone()));
+        let receiver = (op_mode == OperationMode::ReadAsync).then(|| {
+            Self::start_reader_thread(shared_memory.clone(), &name, last_read_version.clone())
+        });
 
         Self {
             shared_memory,
@@ -149,11 +150,10 @@ impl PythonSharedMessage {
     }
 
     fn is_closed(&self) -> bool {
-        self.shared_memory.get_version().closed
+        self.shared_memory.is_closed()
     }
 
     fn close(&self) {
-        self.op_mode.check_write_permission();
         self.shared_memory.close();
     }
 }
@@ -166,11 +166,11 @@ impl PythonSharedMessage {
             self.shared_memory
                 .write_waiting_for_readers(data, self.reader_wait_policy.to_count())
         };
-        
+
         if let Some(version) = version {
             self.last_written_version.store(version, Ordering::Relaxed);
         }
-        
+
         version
     }
 
@@ -185,24 +185,29 @@ impl PythonSharedMessage {
             let shared_memory = self.shared_memory.clone();
             let reader_wait_policy = self.reader_wait_policy;
 
-            std::thread::spawn(move || loop {
-                let Ok(data) = receiver.recv() else {
-                    break;
-                };
-                let new_version = if reader_wait_policy == ReaderWaitPolicy::Count(0) {
-                    // If we are not waiting for readers, we only care about the latest data
-                    let data = receiver.try_iter().last().unwrap_or(data);
-                    Some(shared_memory.write(data.bytes()))
-                } else {
-                    shared_memory
-                        .write_waiting_for_readers(data.bytes(), reader_wait_policy.to_count())
-                };
-                let Some(new_version) = new_version else {
-                    break;
-                };
+            std::thread::Builder::new()
+                .name(format!("{} writer thread", self.name))
+                .spawn(move || loop {
+                    let Ok(data) = receiver.recv() else {
+                        break;
+                    };
 
-                last_written_version.store(new_version, Ordering::Relaxed);
-            });
+                    let new_version = if reader_wait_policy == ReaderWaitPolicy::Count(0) {
+                        // If we are not waiting for readers, we only care about the latest data
+                        let data = receiver.try_iter().last().unwrap_or(data);
+                        Some(shared_memory.write(data.bytes()))
+                    } else {
+                        shared_memory
+                            .write_waiting_for_readers(data.bytes(), reader_wait_policy.to_count())
+                    };
+
+                    let Some(new_version) = new_version else {
+                        break;
+                    };
+
+                    last_written_version.store(new_version, Ordering::Relaxed);
+                })
+                .expect("Failed to create writer thread");
 
             sender
         });
@@ -262,28 +267,32 @@ impl PythonSharedMessage {
 
     fn start_reader_thread(
         shared_memory: Arc<SharedMemoryMapper<SharedMessage>>,
+        name: &str,
         last_read_version: Arc<AtomicUsize>,
     ) -> Receiver<ReceiverQueueData> {
         let (sender, receiver) = channel();
         let mut local_last_reader_version = last_read_version.load(Ordering::Relaxed);
 
-        std::thread::spawn(move || {
-            while !shared_memory.get_version().closed {
-                let mut queue_data = None;
-                shared_memory.blocking_read(local_last_reader_version, |new_version, data| {
-                    queue_data = Some(ReceiverQueueData {
-                        version: new_version,
-                        data: RustPyBytes::new(data),
+        std::thread::Builder::new()
+            .name(format!("{} writer thread", name))
+            .spawn(move || {
+                while !shared_memory.is_closed() {
+                    let mut queue_data = None;
+                    shared_memory.blocking_read(local_last_reader_version, |new_version, data| {
+                        queue_data = Some(ReceiverQueueData {
+                            version: new_version,
+                            data: RustPyBytes::new(data),
+                        });
                     });
-                });
 
-                if let Some(queue_data) = queue_data {
-                    local_last_reader_version = queue_data.version;
-                    last_read_version.store(local_last_reader_version, Ordering::Relaxed);
-                    let _ = sender.send(queue_data);
+                    if let Some(queue_data) = queue_data {
+                        local_last_reader_version = queue_data.version;
+                        last_read_version.store(local_last_reader_version, Ordering::Relaxed);
+                        let _ = sender.send(queue_data);
+                    }
                 }
-            }
-        });
+            })
+            .expect("Failed to create reader thread");
 
         receiver
     }
@@ -443,11 +452,11 @@ mod tests {
                 ReaderWaitPolicy::All(),
             );
 
-            for i in 0..100 {
+            for i in 0..255 {
                 memory.write_async(PyBytes::new(py, &[i])).unwrap();
             }
 
-            for i in 0..100 {
+            for i in 0..255 {
                 assert_eq!(memory.read(true).unwrap(), RustPyBytes::new(&[i]));
             }
         });

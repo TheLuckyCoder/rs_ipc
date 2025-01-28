@@ -31,12 +31,17 @@ impl SharedCondvar {
         guard
     }
 
+    // All the memory orderings here are `Relaxed`,
+    // because synchronization is done by unlocking and locking the mutex.
+    
     pub fn notify_one(&self) {
-        let _ = shared_futex::futex_wake(&self.0, 1);
+        self.0.fetch_add(1, Relaxed);
+        assert!(shared_futex::futex_wake(&self.0, 1));
     }
 
     pub fn notify_all(&self) {
-        let _ = shared_futex::futex_wake(&self.0, u32::MAX);
+        self.0.fetch_add(1, Relaxed);
+        assert!(shared_futex::futex_wake(&self.0, i32::MAX));
     }
 
     unsafe fn wait_on_futex(&self, mutex: &SharedFutex) -> bool {
@@ -48,7 +53,7 @@ impl SharedCondvar {
 
         // Wait, but only if there hasn't been any
         // notification since we unlocked the mutex.
-        let r = shared_futex::futex_wait(&self.0, futex_value).is_ok();
+        let r = shared_futex::futex_wait(&self.0, futex_value);
 
         // Lock the mutex again.
         mutex.lock();
