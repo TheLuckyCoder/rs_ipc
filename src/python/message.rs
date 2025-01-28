@@ -149,19 +149,19 @@ impl PythonSharedMessage {
         self.shared_memory.mapped_memory_size() - SharedMessage::size_of_fields()
     }
 
-    fn is_closed(&self) -> bool {
-        self.shared_memory.is_closed()
+    fn is_stopped(&self) -> bool {
+        self.shared_memory.is_stopped()
     }
 
-    fn close(&self) {
-        self.shared_memory.close();
+    fn stop(&self) {
+        self.shared_memory.stop();
     }
 }
 
 impl PythonSharedMessage {
     fn write_sync(&self, data: &[u8]) -> Option<usize> {
         let version = if self.reader_wait_policy == ReaderWaitPolicy::Count(0) {
-            Some(self.shared_memory.write(data))
+            self.shared_memory.write(data)
         } else {
             self.shared_memory
                 .write_waiting_for_readers(data, self.reader_wait_policy.to_count())
@@ -195,7 +195,7 @@ impl PythonSharedMessage {
                     let new_version = if reader_wait_policy == ReaderWaitPolicy::Count(0) {
                         // If we are not waiting for readers, we only care about the latest data
                         let data = receiver.try_iter().last().unwrap_or(data);
-                        Some(shared_memory.write(data.bytes()))
+                        shared_memory.write(data.bytes())
                     } else {
                         shared_memory
                             .write_waiting_for_readers(data.bytes(), reader_wait_policy.to_count())
@@ -213,7 +213,7 @@ impl PythonSharedMessage {
         });
 
         sender.send(queue_data).map_err(|_| {
-            PyValueError::new_err("Failed to send data, the queue has been closed".to_string())
+            PyValueError::new_err("Failed to send data, the queue has been stopped".to_string())
         })
     }
 
@@ -276,7 +276,7 @@ impl PythonSharedMessage {
         std::thread::Builder::new()
             .name(format!("{} writer thread", name))
             .spawn(move || {
-                while !shared_memory.is_closed() {
+                while !shared_memory.is_stopped() {
                     let mut queue_data = None;
                     shared_memory.blocking_read(local_last_reader_version, |new_version, data| {
                         queue_data = Some(ReceiverQueueData {
@@ -349,8 +349,8 @@ mod tests {
         assert_eq!(version, memory.last_read_version());
 
         assert!(memory.read(false).is_none());
-        memory.close();
-        assert!(memory.is_closed());
+        memory.stop();
+        assert!(memory.is_stopped());
         assert!(memory.read(true).is_none());
         assert!(memory.read(false).is_none());
     }
@@ -374,8 +374,8 @@ mod tests {
         assert_eq!(version, memory.last_read_version());
 
         assert!(memory.read(false).is_none());
-        memory.close();
-        assert!(memory.is_closed());
+        memory.stop();
+        assert!(memory.is_stopped());
     }
 
     #[test]

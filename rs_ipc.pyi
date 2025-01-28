@@ -17,7 +17,7 @@ class ReaderWaitPolicy:
         """
 
         def __init__(self, number_of_readers: int):
-            assert number_of_readers > 0
+            assert number_of_readers >= 0
 
 
 class OperationMode(Enum):
@@ -81,7 +81,7 @@ class SharedMessage(object):
         
         This function releases the GIL, while it's executed
         
-        :returns: the version of the message that was written, or None if the shared memory is async mode or closed
+        :returns: the version of the message that was written, or None if the shared memory is async mode or stopped
         """
         pass
 
@@ -90,7 +90,7 @@ class SharedMessage(object):
         This function releases the GIL, while waiting for a new message
         
         :param block: if True, blocks until there is a new message to read, otherwise returns None if there is no new message
-        :returns: the message, or None if the shared memory is closed
+        :returns: the message, or None if the shared memory is stopped
         """
         pass
 
@@ -119,15 +119,15 @@ class SharedMessage(object):
         """
         pass
 
-    def is_closed(self) -> bool:
+    def is_stopped(self) -> bool:
         """
-        Check if the shared memory has been closed by the writer
-        :returns: true if the writer has marked this as closed
+        Check if the shared memory has been stopped by the writer
+        :returns: true if the writer has marked this as stopped
         """
 
-    def close(self) -> None:
+    def stop(self) -> None:
         """
-        Signals to the readers that they should stop reading from the shared memory
+        Signals that this shared memory must stop being used
         """
         pass
 
