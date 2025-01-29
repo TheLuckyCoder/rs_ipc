@@ -4,10 +4,11 @@ use pyo3::pyclass;
 #[pyo3(frozen)]
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub enum OperationMode {
-    ReadSync = 0,
-    ReadAsync = 1,
-    WriteSync = 2,
-    WriteAsync = 3,
+    CreateOnly = 0,
+    ReadSync = 1,
+    ReadAsync = 2,
+    WriteSync = 3,
+    WriteAsync = 4,
 }
 
 impl OperationMode {

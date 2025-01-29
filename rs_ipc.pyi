@@ -21,20 +21,21 @@ class ReaderWaitPolicy:
 
 
 class OperationMode(Enum):
-    ReadSync = 0,
+    CreateOnly = 0,
+    ReadSync = 1,
     """
     The read function will block while it reads a new message
     """
-    ReadAsync = 1,
+    ReadAsync = 2,
     """
     This starts a background thread that reads the shared memory and
     stores the message in a queue to be read through the read function
     """
-    WriteSync = 2,
+    WriteSync = 3,
     """
     The write function will block the current thread while the message is written
     """
-    WriteAsync = 3,
+    WriteAsync = 4,
     """
     The write function will send the message to a queue to be written by a background thread,
     thus the write function will never block
