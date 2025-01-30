@@ -31,7 +31,6 @@ impl PythonSharedMessage {
         shared_memory: SharedMemoryMapper<SharedMessage>,
         name: String,
         op_mode: OperationMode,
-        reader_wait_policy: ReaderWaitPolicy,
     ) -> Self {
         if op_mode.can_read() {
             shared_memory.add_reader();
@@ -39,7 +38,7 @@ impl PythonSharedMessage {
 
         let shared_memory = Arc::new(shared_memory);
         let last_read_version = Arc::new(AtomicUsize::default());
-        let receiver = (op_mode == OperationMode::ReadAsync).then(|| {
+        let receiver = (op_mode == OperationMode::ReadAsync()).then(|| {
             Self::start_reader_thread(shared_memory.clone(), &name, last_read_version.clone())
         });
 
@@ -47,7 +46,7 @@ impl PythonSharedMessage {
             shared_memory,
             name,
             op_mode,
-            reader_wait_policy,
+            reader_wait_policy: op_mode.reader_wait_policy(),
             last_written_version: Arc::default(),
             last_read_version: Arc::default(),
             sender: Mutex::default(),
@@ -59,13 +58,7 @@ impl PythonSharedMessage {
 #[pymethods]
 impl PythonSharedMessage {
     #[staticmethod]
-    #[pyo3(signature = (name, size, mode, reader_wait_policy = ReaderWaitPolicy::All()))]
-    fn create(
-        name: String,
-        size: NonZeroUsize,
-        mode: OperationMode,
-        reader_wait_policy: ReaderWaitPolicy,
-    ) -> PyResult<Self> {
+    fn create(name: String, size: NonZeroUsize, mode: OperationMode) -> PyResult<Self> {
         if name.is_empty() {
             return Err(PyValueError::new_err("Name cannot be empty"));
         }
@@ -78,16 +71,11 @@ impl PythonSharedMessage {
             )?
         };
 
-        Ok(Self::new(shared_memory, name, mode, reader_wait_policy))
+        Ok(Self::new(shared_memory, name, mode))
     }
 
     #[staticmethod]
-    #[pyo3(signature = (name, mode, reader_wait_policy = ReaderWaitPolicy::All()))]
-    fn open(
-        name: String,
-        mode: OperationMode,
-        reader_wait_policy: ReaderWaitPolicy,
-    ) -> PyResult<Self> {
+    fn open(name: String, mode: OperationMode) -> PyResult<Self> {
         if name.is_empty() {
             return Err(PyValueError::new_err("Name cannot be empty"));
         }
@@ -95,7 +83,7 @@ impl PythonSharedMessage {
         let c_name = CString::new(name.clone())?;
         let shared_memory = unsafe { SharedMemoryMapper::<SharedMessage>::open(c_name)? };
 
-        Ok(Self::new(shared_memory, name, mode, reader_wait_policy))
+        Ok(Self::new(shared_memory, name, mode))
     }
 
     fn write(&self, data: Bound<'_, PyBytes>) -> PyResult<Option<usize>> {
@@ -110,7 +98,7 @@ impl PythonSharedMessage {
             )));
         }
 
-        Ok(if self.op_mode == OperationMode::WriteAsync {
+        Ok(if let OperationMode::WriteAsync(_) = self.op_mode {
             self.write_async(data)?;
             None
         } else {
@@ -218,7 +206,7 @@ impl PythonSharedMessage {
     }
 
     pub(crate) fn read(&self, block: bool) -> Option<RustPyBytes> {
-        if self.op_mode == OperationMode::ReadAsync {
+        if self.op_mode == OperationMode::ReadAsync() {
             self.read_async(block)
         } else {
             self.read_sync(block)
@@ -315,16 +303,11 @@ mod tests {
 
     const DEFAULT_SIZE: usize = 1024;
 
-    fn init(
-        name: &str,
-        op_mode: OperationMode,
-        reader_wait_policy: ReaderWaitPolicy,
-    ) -> PythonSharedMessage {
+    fn init(name: &str, op_mode: OperationMode) -> PythonSharedMessage {
         PythonSharedMessage::create(
             name.to_string(),
             NonZero::new(DEFAULT_SIZE).unwrap(),
             op_mode,
-            reader_wait_policy,
         )
         .unwrap()
     }
@@ -335,8 +318,7 @@ mod tests {
 
         let memory = init(
             "sync_write_try_read",
-            OperationMode::WriteSync,
-            ReaderWaitPolicy::Count(0),
+            OperationMode::WriteSync(ReaderWaitPolicy::Count(0)),
         );
         let none = memory.read(false);
         assert!(none.is_none());
@@ -361,8 +343,7 @@ mod tests {
 
         let memory = init(
             "sync_write_blocking_read",
-            OperationMode::WriteSync,
-            ReaderWaitPolicy::Count(0),
+            OperationMode::WriteSync(ReaderWaitPolicy::Count(0)),
         );
         assert!(memory.read(false).is_none());
 
@@ -381,11 +362,8 @@ mod tests {
     #[test]
     fn async_write() {
         Python::with_gil(|py| {
-            let memory = init(
-                "async_write",
-                OperationMode::ReadAsync,
-                ReaderWaitPolicy::Count(0),
-            );
+            let mut memory = init("async_write", OperationMode::ReadAsync());
+            memory.reader_wait_policy = ReaderWaitPolicy::Count(0);
 
             memory.write_async(PyBytes::new(py, &[1])).unwrap();
             memory.write_async(PyBytes::new(py, &[2])).unwrap();
@@ -402,11 +380,7 @@ mod tests {
         Python::with_gil(|py| {
             let data = PyBytes::new(py, &(0u8..255u8).collect::<Vec<_>>());
 
-            let memory = init(
-                "async_write_try_read",
-                OperationMode::ReadAsync,
-                ReaderWaitPolicy::All(),
-            );
+            let memory = init("async_write_try_read", OperationMode::ReadAsync());
             let none = memory.read(false);
             assert!(none.is_none());
 
@@ -427,11 +401,7 @@ mod tests {
         Python::with_gil(|py| {
             let data = PyBytes::new(py, &(0u8..255u8).collect::<Vec<_>>());
 
-            let memory = init(
-                "async_write_blocking_read",
-                OperationMode::ReadAsync,
-                ReaderWaitPolicy::All(),
-            );
+            let memory = init("async_write_blocking_read", OperationMode::ReadAsync());
 
             memory.write_async(data.clone()).unwrap();
             thread::sleep(Duration::from_millis(200));
@@ -446,11 +416,8 @@ mod tests {
     #[test]
     fn multiple_writes() {
         Python::with_gil(|py| {
-            let memory = init(
-                "async_multiple_writes",
-                OperationMode::ReadAsync,
-                ReaderWaitPolicy::All(),
-            );
+            let mut memory = init("async_multiple_writes", OperationMode::ReadAsync());
+            memory.reader_wait_policy = ReaderWaitPolicy::All();
 
             for i in 0..255 {
                 memory.write_async(PyBytes::new(py, &[i])).unwrap();

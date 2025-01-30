@@ -86,18 +86,14 @@ impl SharedMessage {
     }
 
     pub(crate) fn try_read(&self, current_version: usize, mut read: impl FnMut(usize, &[u8])) {
-        let StoppedAndVersion { stopped, version } = self.get_version();
         // Read the version to check if there is a new one
-        if stopped || current_version == version {
+        if current_version == self.get_version().version {
             return;
         }
 
         let mut content = self.data.lock();
         // Read the version again after the lock has been acquired, as it could have changed
-        let StoppedAndVersion { stopped, version } = self.get_version();
-        if stopped {
-            return;
-        }
+        let version = self.get_version().version;
 
         read(version, &content.payload[..content.size]);
         content.read_count += 1;
@@ -112,7 +108,7 @@ impl SharedMessage {
             status = self.get_version();
             !status.stopped && status.version == current_version
         });
-        if status.stopped {
+        if status.version == current_version {
             return;
         }
 

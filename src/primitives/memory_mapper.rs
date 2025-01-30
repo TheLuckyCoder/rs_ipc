@@ -5,6 +5,7 @@ use std::ffi::{c_void, CString};
 use std::ops::Deref;
 use std::os::fd::OwnedFd;
 use std::ptr::slice_from_raw_parts_mut;
+use rustix::mm;
 
 pub trait SlicePtrCast {
     unsafe fn cast_from_void_ptr(ptr: *mut c_void, memory_size: usize) -> *const Self;
@@ -69,19 +70,23 @@ impl<T: ?Sized + SlicePtrCast> SharedMemoryMapper<T> {
 
         // Map shared memory
         let void_ptr = unsafe {
-            rustix::mm::mmap(
+            mm::mmap(
                 std::ptr::null_mut(),
                 size,
                 ProtFlags::READ | ProtFlags::WRITE,
-                MapFlags::SHARED_VALIDATE | MapFlags::POPULATE,
+                MapFlags::SHARED_VALIDATE,
                 shm,
                 0,
             )?
         };
-
+        
         if create {
-            let slice_ptr: *mut [u8] = slice_from_raw_parts_mut(void_ptr.cast(), size);
             unsafe {
+                if let Err(e) = mm::madvise(void_ptr, size, mm::Advice::LinuxHugepage) {
+                    eprintln!("Failed to set huge pages advice: {e}");
+                }
+
+                let slice_ptr: *mut [u8] = slice_from_raw_parts_mut(void_ptr.cast(), size);
                 (*slice_ptr).fill(0);
             }
         }
@@ -106,7 +111,7 @@ impl<T: ?Sized> Deref for SharedMemoryMapper<T> {
 impl<T: ?Sized> Drop for SharedMemoryMapper<T> {
     fn drop(&mut self) {
         let ptr = self.mapped_struct as *const T as *mut c_void;
-        if let Err(e) = unsafe { rustix::mm::munmap(ptr, self.mapped_size) } {
+        if let Err(e) = unsafe { mm::munmap(ptr, self.mapped_size) } {
             eprintln!("Failed to unmap shared memory: {}", e);
         }
 
