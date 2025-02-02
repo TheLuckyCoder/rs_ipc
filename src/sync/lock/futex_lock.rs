@@ -1,28 +1,20 @@
+// Portions of this code are copied from Rust's standard library.
+// Original code is dual-licensed under the MIT and Apache 2.0 licenses.
+// See the respective license files for details.
+
+use crate::sync::futex::{futex_wait, futex_wake_one, Futex, Primitive};
 use std::hint::spin_loop;
-use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
-use rustix::thread::futex;
 
-const UNLOCKED: u32 = 0;
-const LOCKED: u32 = 1; // locked, no other threads waiting
-const CONTENDED: u32 = 2; // locked, and other threads waiting (contended)
-
-#[inline]
-pub fn futex_wait(futex: &AtomicU32, state: u32) -> bool {
-    futex::wait(futex, futex::Flags::empty(), state, None).is_ok()
-}
-
-#[inline]
-pub fn futex_wake(futex: &AtomicU32, count: i32) -> bool {
-    futex::wake(futex, futex::Flags::empty(), count as u32).is_ok()
-}
+const UNLOCKED: Primitive = 0;
+const LOCKED: Primitive = 1; // locked, no other threads waiting
+const CONTENDED: Primitive = 2; // locked, and other threads waiting (contended)
 
 #[derive(Default)]
 #[repr(transparent)]
-pub struct SharedFutex(AtomicU32);
+pub struct FutexLock(Futex);
 
-/// This code is largely taken from std::sync::Mutex
-impl SharedFutex {
+impl FutexLock {
     #[inline]
     pub fn try_lock(&self) -> bool {
         self.0
@@ -48,10 +40,7 @@ impl SharedFutex {
         // If it's unlocked now, attempt to take the lock
         // without marking it as contended.
         if state == UNLOCKED {
-            match self
-                .0
-                .compare_exchange(UNLOCKED, LOCKED, Acquire, Relaxed)
-            {
+            match self.0.compare_exchange(UNLOCKED, LOCKED, Acquire, Relaxed) {
                 Ok(_) => return, // Locked!
                 Err(s) => state = s,
             }
@@ -81,7 +70,7 @@ impl SharedFutex {
             // will mark the mutex as CONTENDED (see lock_contended above),
             // which makes sure that any other waiting threads will also be
             // woken up eventually.
-            let _ = futex_wake(&self.0, 1);
+            let _ = futex_wake_one(&self.0);
         }
     }
 
@@ -102,5 +91,4 @@ impl SharedFutex {
             spin -= 1;
         }
     }
-    
 }

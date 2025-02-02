@@ -1,6 +1,6 @@
-use crate::primitives::condvar::SharedCondvar;
-use crate::primitives::memory_mapper::SlicePtrCast;
-use crate::primitives::mutex::SharedMutex;
+use crate::helpers::memory_mapper::SlicePtrCast;
+use crate::sync::condvar::SharedCondvar;
+use crate::sync::SharedMutex;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 

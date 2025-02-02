@@ -1,6 +1,6 @@
+use crate::python::bytes::RustPyBytes;
 use pyo3::types::PyBytes;
 use pyo3::{Bound, Py};
-use crate::python::bytes::RustPyBytes;
 
 pub struct ReceiverQueueData {
     pub version: usize,

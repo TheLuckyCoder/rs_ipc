@@ -1,9 +1,9 @@
-use crate::container::message::SharedMessage;
+use crate::helpers::memory_mapper::SharedMemoryMapper;
 use crate::helpers::queue_data::{ReceiverQueueData, SenderQueueData};
-use crate::primitives::memory_mapper::SharedMemoryMapper;
 use crate::python::bytes::RustPyBytes;
 use crate::python::reader_wait_policy::ReaderWaitPolicy;
 use crate::python::OperationMode;
+use crate::shared_message::SharedMessage;
 use pyo3::exceptions::PyValueError;
 use pyo3::types::{PyBytes, PyBytesMethods};
 use pyo3::{pyclass, pymethods, Bound, PyResult, Python};

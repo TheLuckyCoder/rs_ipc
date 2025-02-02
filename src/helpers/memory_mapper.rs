@@ -1,11 +1,11 @@
 use rustix::fs::Mode;
+use rustix::mm;
 use rustix::mm::{MapFlags, ProtFlags};
 use rustix::shm::ShmOFlags;
 use std::ffi::{c_void, CString};
 use std::ops::Deref;
 use std::os::fd::OwnedFd;
 use std::ptr::slice_from_raw_parts_mut;
-use rustix::mm;
 
 pub trait SlicePtrCast {
     unsafe fn cast_from_void_ptr(ptr: *mut c_void, memory_size: usize) -> *const Self;
@@ -79,7 +79,7 @@ impl<T: ?Sized + SlicePtrCast> SharedMemoryMapper<T> {
                 0,
             )?
         };
-        
+
         if create {
             unsafe {
                 if let Err(e) = mm::madvise(void_ptr, size, mm::Advice::LinuxHugepage) {

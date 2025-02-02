@@ -1,16 +1,16 @@
-use bytes::RustPyBytes;
 use crate::python::message::PythonSharedMessage;
 use crate::python::operation_mode::OperationMode;
+use crate::python::reader_wait_policy::ReaderWaitPolicy;
+use bytes::RustPyBytes;
 use pyo3::prelude::*;
 use pyo3::types::PyFunction;
 use pyo3::{pymodule, Bound, PyResult};
 use rayon::prelude::*;
-use crate::python::reader_wait_policy::ReaderWaitPolicy;
 
+pub mod bytes;
 mod message;
 mod operation_mode;
 mod reader_wait_policy;
-pub mod bytes;
 
 #[pymodule(gil_used = false)]
 fn rs_ipc(m: &Bound<'_, PyModule>) -> PyResult<()> {

@@ -1,12 +1,12 @@
-use crate::primitives::mutex::{guard_lock, SharedMutexGuard};
-use crate::primitives::shared_futex;
-use crate::primitives::shared_futex::SharedFutex;
-use std::sync::atomic::AtomicU32;
+use crate::sync::futex::Futex;
+use crate::sync::lock::futex_lock::FutexLock;
+use crate::sync::lock::mutex::guard_lock;
+use crate::sync::{futex, SharedMutexGuard};
 use std::sync::atomic::Ordering::Relaxed;
 
 #[derive(Default)]
 #[repr(transparent)]
-pub struct SharedCondvar(AtomicU32);
+pub struct SharedCondvar(Futex);
 
 impl SharedCondvar {
     pub fn wait<'a, T: ?Sized>(&self, guard: SharedMutexGuard<'a, T>) -> SharedMutexGuard<'a, T> {
@@ -33,19 +33,19 @@ impl SharedCondvar {
 
     // All the memory orderings here are `Relaxed`,
     // because synchronization is done by unlocking and locking the mutex.
-    
+
     #[allow(dead_code)]
     pub fn notify_one(&self) {
         self.0.fetch_add(1, Relaxed);
-        assert!(shared_futex::futex_wake(&self.0, 1));
+        assert!(futex::futex_wake_one(&self.0));
     }
 
     pub fn notify_all(&self) {
         self.0.fetch_add(1, Relaxed);
-        assert!(shared_futex::futex_wake(&self.0, i32::MAX));
+        assert!(futex::futex_wake_all(&self.0));
     }
 
-    unsafe fn wait_on_futex(&self, mutex: &SharedFutex) -> bool {
+    unsafe fn wait_on_futex(&self, mutex: &FutexLock) -> bool {
         // Examine the notification counter _before_ we unlock the mutex.
         let futex_value = self.0.load(Relaxed);
 
@@ -54,7 +54,7 @@ impl SharedCondvar {
 
         // Wait, but only if there hasn't been any
         // notification since we unlocked the mutex.
-        let r = shared_futex::futex_wait(&self.0, futex_value);
+        let r = futex::futex_wait(&self.0, futex_value);
 
         // Lock the mutex again.
         mutex.lock();
