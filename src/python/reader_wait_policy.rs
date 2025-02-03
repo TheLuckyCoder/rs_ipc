@@ -5,13 +5,13 @@ use pyo3::pyclass;
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ReaderWaitPolicy {
     All(),
-    Count(u32),
+    Count(u16),
 }
 
 impl ReaderWaitPolicy {
-    pub fn to_count(self) -> u32 {
+    pub fn to_count(self) -> u16 {
         match self {
-            ReaderWaitPolicy::All() => u32::MAX,
+            ReaderWaitPolicy::All() => u16::MAX,
             ReaderWaitPolicy::Count(count) => count,
         }
     }

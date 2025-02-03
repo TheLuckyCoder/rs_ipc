@@ -2,7 +2,7 @@ use crate::helpers::memory_mapper::SlicePtrCast;
 use crate::sync::condvar::SharedCondvar;
 use crate::sync::SharedMutex;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 
 const STOPPED_BIT: usize = 1 << 63;
 
@@ -16,8 +16,9 @@ pub struct SharedMessage<T: ?Sized = SharedMessageData> {
 
 #[repr(C)]
 pub struct SharedMessageData {
-    consumer_count: u32,
-    read_count: u32,
+    read_count: u16,
+    target_read_count: u16,
+    consumer_count: u16,
     size: usize,
     payload: [u8],
 }
@@ -31,6 +32,12 @@ impl SharedMessageData {
         self.size = data_len;
         self.payload[..data_len].copy_from_slice(data);
     }
+
+    #[inline]
+    fn increment_read_count(&mut self) -> bool {
+        self.read_count += 1;
+        self.read_count >= self.target_read_count.min(self.consumer_count)
+    }
 }
 
 #[derive(Default)]
@@ -43,8 +50,9 @@ impl SharedMessage {
     pub(crate) const fn size_of_fields() -> usize {
         #[repr(C)]
         struct SharedMemoryDataSized {
-            consumer_count: u32,
-            read_count: u32,
+            read_count: AtomicU16,
+            target_read_count: u16,
+            consumer_count: u16,
             size: usize,
         }
         size_of::<SharedMessage<SharedMemoryDataSized>>()
@@ -64,7 +72,7 @@ impl SharedMessage {
         Some(new_version)
     }
 
-    pub(crate) fn write_waiting_for_readers(&self, data: &[u8], wait_for: u32) -> Option<usize> {
+    pub(crate) fn write_waiting(&self, data: &[u8]) -> Option<usize> {
         let mut content = self.data.lock();
 
         let mut status = StoppedAndVersion::default();
@@ -72,8 +80,9 @@ impl SharedMessage {
             status = self.get_version();
             !status.stopped
                 && status.version != 0
-                && lock.read_count < wait_for.min(lock.consumer_count)
+                && lock.read_count < lock.target_read_count.min(lock.consumer_count)
         });
+
         if status.stopped {
             return None;
         }
@@ -91,20 +100,22 @@ impl SharedMessage {
             return;
         }
 
-        let mut content = self.data.lock();
+        let mut lock = self.data.lock();
         // Read the version again after the lock has been acquired, as it could have changed
         let version = self.get_version().version;
 
-        read(version, &content.payload[..content.size]);
-        content.read_count += 1;
-        self.read_condvar.notify_all();
+        read(version, &lock.payload[..lock.size]);
+
+        if lock.increment_read_count() {
+            self.read_condvar.notify_one();
+        }
     }
 
     pub(crate) fn blocking_read(&self, current_version: usize, mut read: impl FnMut(usize, &[u8])) {
-        let mut content = self.data.lock();
+        let mut lock = self.data.lock();
 
         let mut status = StoppedAndVersion::default();
-        content = self.write_condvar.wait_while(content, |_| {
+        lock = self.write_condvar.wait_while(lock, |_| {
             status = self.get_version();
             !status.stopped && status.version == current_version
         });
@@ -112,13 +123,25 @@ impl SharedMessage {
             return;
         }
 
-        read(status.version, &content.payload[..content.size]);
-        content.read_count += 1;
-        self.read_condvar.notify_all();
+        read(status.version, &lock.payload[..lock.size]);
+
+        if lock.increment_read_count() {
+            self.read_condvar.notify_one();
+        }
     }
 
     pub(crate) fn is_new_version_available(&self, current_version: usize) -> bool {
         self.get_version().version != current_version
+    }
+
+    pub(crate) fn set_target_read_count(&self, target_read_count: u16) {
+        let mut content = self.data.lock();
+        content.target_read_count = target_read_count;
+    }
+
+    pub(crate) fn get_target_read_count(&self) -> u16 {
+        let content = self.data.lock();
+        content.target_read_count
     }
 
     pub(crate) fn add_reader(&self) {

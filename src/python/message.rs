@@ -1,6 +1,7 @@
 use crate::helpers::memory_mapper::SharedMemoryMapper;
 use crate::helpers::queue_data::{ReceiverQueueData, SenderQueueData};
 use crate::python::bytes::RustPyBytes;
+use crate::python::operation_mode::OperationMode::WriteAsync;
 use crate::python::reader_wait_policy::ReaderWaitPolicy;
 use crate::python::OperationMode;
 use crate::shared_message::SharedMessage;
@@ -19,7 +20,6 @@ pub struct PythonSharedMessage {
     shared_memory: Arc<SharedMemoryMapper<SharedMessage>>,
     name: String,
     op_mode: OperationMode,
-    reader_wait_policy: ReaderWaitPolicy,
     last_written_version: Arc<AtomicUsize>,
     last_read_version: Arc<AtomicUsize>,
     sender: Mutex<Option<Sender<SenderQueueData>>>,
@@ -38,7 +38,7 @@ impl PythonSharedMessage {
 
         let shared_memory = Arc::new(shared_memory);
         let last_read_version = Arc::new(AtomicUsize::default());
-        let receiver = (op_mode == OperationMode::ReadAsync()).then(|| {
+        let receiver = (op_mode == OperationMode::ReadAsync).then(|| {
             Self::start_reader_thread(shared_memory.clone(), &name, last_read_version.clone())
         });
 
@@ -46,7 +46,6 @@ impl PythonSharedMessage {
             shared_memory,
             name,
             op_mode,
-            reader_wait_policy: op_mode.reader_wait_policy(),
             last_written_version: Arc::default(),
             last_read_version: Arc::default(),
             sender: Mutex::default(),
@@ -58,7 +57,12 @@ impl PythonSharedMessage {
 #[pymethods]
 impl PythonSharedMessage {
     #[staticmethod]
-    fn create(name: String, size: NonZeroUsize, mode: OperationMode) -> PyResult<Self> {
+    fn create(
+        name: String,
+        size: NonZeroUsize,
+        mode: OperationMode,
+        reader_wait_policy: ReaderWaitPolicy,
+    ) -> PyResult<Self> {
         if name.is_empty() {
             return Err(PyValueError::new_err("Name cannot be empty"));
         }
@@ -70,6 +74,8 @@ impl PythonSharedMessage {
                 SharedMessage::size_of_fields() + size.get(),
             )?
         };
+
+        shared_memory.set_target_read_count(reader_wait_policy.to_count());
 
         Ok(Self::new(shared_memory, name, mode))
     }
@@ -98,7 +104,7 @@ impl PythonSharedMessage {
             )));
         }
 
-        Ok(if let OperationMode::WriteAsync(_) = self.op_mode {
+        Ok(if self.op_mode == WriteAsync {
             self.write_async(data)?;
             None
         } else {
@@ -148,12 +154,7 @@ impl PythonSharedMessage {
 
 impl PythonSharedMessage {
     fn write_sync(&self, data: &[u8]) -> Option<usize> {
-        let version = if self.reader_wait_policy == ReaderWaitPolicy::Count(0) {
-            self.shared_memory.write(data)
-        } else {
-            self.shared_memory
-                .write_waiting_for_readers(data, self.reader_wait_policy.to_count())
-        };
+        let version = self.shared_memory.write_waiting(data);
 
         if let Some(version) = version {
             self.last_written_version.store(version, Ordering::Relaxed);
@@ -171,7 +172,7 @@ impl PythonSharedMessage {
 
             let last_written_version = self.last_written_version.clone();
             let shared_memory = self.shared_memory.clone();
-            let reader_wait_policy = self.reader_wait_policy;
+            let reader_target_count = shared_memory.get_target_read_count();
 
             std::thread::Builder::new()
                 .name(format!("{} writer thread", self.name))
@@ -179,14 +180,11 @@ impl PythonSharedMessage {
                     let Ok(data) = receiver.recv() else {
                         break;
                     };
-
-                    let new_version = if reader_wait_policy == ReaderWaitPolicy::Count(0) {
-                        // If we are not waiting for readers, we only care about the latest data
+                    let new_version = if reader_target_count == 0 {
                         let data = receiver.try_iter().last().unwrap_or(data);
                         shared_memory.write(data.bytes())
                     } else {
-                        shared_memory
-                            .write_waiting_for_readers(data.bytes(), reader_wait_policy.to_count())
+                        shared_memory.write_waiting(data.bytes())
                     };
 
                     let Some(new_version) = new_version else {
@@ -206,7 +204,7 @@ impl PythonSharedMessage {
     }
 
     pub(crate) fn read(&self, block: bool) -> Option<RustPyBytes> {
-        if self.op_mode == OperationMode::ReadAsync() {
+        if self.op_mode == OperationMode::ReadAsync {
             self.read_async(block)
         } else {
             self.read_sync(block)
@@ -301,15 +299,28 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    const DEFAULT_SIZE: usize = 1024;
+    const DEFAULT_SIZE: usize = 1024 * 1024;
 
-    fn init(name: &str, op_mode: OperationMode) -> PythonSharedMessage {
+    fn get_test_data() -> Vec<u8> {
+        let mut data = vec![0u8; 1024 * 10]; // 10 KB
+        for i in 0..data.len() {
+            data[i] = (i % 255) as u8;
+        }
+        data
+    }
+
+    fn init(
+        name: &str,
+        op_mode: OperationMode,
+        reader_wait_policy: ReaderWaitPolicy,
+    ) -> PythonSharedMessage {
         PythonSharedMessage::create(
             name.to_string(),
             NonZero::new(DEFAULT_SIZE).unwrap(),
             op_mode,
+            reader_wait_policy,
         )
-        .unwrap()
+            .unwrap()
     }
 
     #[test]
@@ -318,7 +329,8 @@ mod tests {
 
         let memory = init(
             "sync_write_try_read",
-            OperationMode::WriteSync(ReaderWaitPolicy::Count(0)),
+            OperationMode::WriteSync,
+            ReaderWaitPolicy::Count(0),
         );
         let none = memory.read(false);
         assert!(none.is_none());
@@ -343,7 +355,8 @@ mod tests {
 
         let memory = init(
             "sync_write_blocking_read",
-            OperationMode::WriteSync(ReaderWaitPolicy::Count(0)),
+            OperationMode::WriteSync,
+            ReaderWaitPolicy::Count(0),
         );
         assert!(memory.read(false).is_none());
 
@@ -362,8 +375,11 @@ mod tests {
     #[test]
     fn async_write() {
         Python::with_gil(|py| {
-            let mut memory = init("async_write", OperationMode::ReadAsync());
-            memory.reader_wait_policy = ReaderWaitPolicy::Count(0);
+            let memory = init(
+                "async_write",
+                OperationMode::ReadAsync,
+                ReaderWaitPolicy::Count(0),
+            );
 
             memory.write_async(PyBytes::new(py, &[1])).unwrap();
             memory.write_async(PyBytes::new(py, &[2])).unwrap();
@@ -372,6 +388,7 @@ mod tests {
             thread::sleep(Duration::from_millis(100));
             assert!(memory.is_new_version_available());
             assert_eq!(memory.read(true).unwrap(), RustPyBytes::new(&[4]));
+            memory.stop();
         });
     }
 
@@ -380,7 +397,11 @@ mod tests {
         Python::with_gil(|py| {
             let data = PyBytes::new(py, &(0u8..255u8).collect::<Vec<_>>());
 
-            let memory = init("async_write_try_read", OperationMode::ReadAsync());
+            let memory = init(
+                "async_write_try_read",
+                OperationMode::ReadAsync,
+                ReaderWaitPolicy::All(),
+            );
             let none = memory.read(false);
             assert!(none.is_none());
 
@@ -393,15 +414,20 @@ mod tests {
             assert_eq!(version, memory.last_read_version());
 
             assert!(memory.read(false).is_none());
+            memory.stop();
         });
     }
 
     #[test]
     fn async_write_blocking_read() {
         Python::with_gil(|py| {
-            let data = PyBytes::new(py, &(0u8..255u8).collect::<Vec<_>>());
+            let data = PyBytes::new(py, &get_test_data());
 
-            let memory = init("async_write_blocking_read", OperationMode::ReadAsync());
+            let memory = init(
+                "async_write_blocking_read",
+                OperationMode::ReadAsync,
+                ReaderWaitPolicy::All(),
+            );
 
             memory.write_async(data.clone()).unwrap();
             thread::sleep(Duration::from_millis(200));
@@ -410,14 +436,18 @@ mod tests {
             let bytes = memory.read(true).unwrap();
             assert_eq!(bytes.0.as_ref(), data);
             assert_eq!(version, memory.last_read_version());
+            memory.stop();
         });
     }
 
     #[test]
     fn multiple_writes() {
         Python::with_gil(|py| {
-            let mut memory = init("async_multiple_writes", OperationMode::ReadAsync());
-            memory.reader_wait_policy = ReaderWaitPolicy::All();
+            let memory = init(
+                "async_multiple_writes",
+                OperationMode::ReadAsync,
+                ReaderWaitPolicy::All(),
+            );
 
             for i in 0..255 {
                 memory.write_async(PyBytes::new(py, &[i])).unwrap();
