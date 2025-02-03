@@ -17,3 +17,7 @@ rayon = "1.10.0"
 
 [dev-dependencies]
 pyo3 = { version = "0.23.4", features = ["auto-initialize"] }
+
+[features]
+default = []
+nightly-features = []
