@@ -1,7 +1,7 @@
 use rustix::fs::Mode;
 use rustix::mm;
 use rustix::mm::{MapFlags, ProtFlags};
-use rustix::shm::ShmOFlags;
+use rustix::shm::OFlags;
 use std::ffi::{c_void, CString};
 use std::ops::Deref;
 use std::os::fd::OwnedFd;
@@ -22,15 +22,15 @@ pub struct SharedMemoryMapper<T: 'static + ?Sized> {
 impl<T: ?Sized + SlicePtrCast> SharedMemoryMapper<T> {
     pub unsafe fn create(name: CString, size: usize) -> std::io::Result<Self> {
         // Open shared memory
-        let shm = rustix::shm::shm_open(
+        let shm = rustix::shm::open(
             name.as_c_str(),
-            ShmOFlags::CREATE | ShmOFlags::RDWR | ShmOFlags::TRUNC,
+            OFlags::CREATE | OFlags::RDWR | OFlags::TRUNC,
             Mode::all(),
         )?;
 
         // Resize shared memory
         if let Err(e) = rustix::fs::ftruncate(&shm, size as u64) {
-            let _ = rustix::shm::shm_unlink(name.as_c_str());
+            let _ = rustix::shm::unlink(name.as_c_str());
             return Err(e.into());
         }
 
@@ -43,7 +43,7 @@ impl<T: ?Sized + SlicePtrCast> SharedMemoryMapper<T> {
                 created: true,
             }),
             Err(e) => {
-                let _ = rustix::shm::shm_unlink(name);
+                let _ = rustix::shm::unlink(name);
                 Err(e.into())
             }
         }
@@ -51,7 +51,7 @@ impl<T: ?Sized + SlicePtrCast> SharedMemoryMapper<T> {
 
     pub unsafe fn open(name: CString) -> std::io::Result<Self> {
         // Open shared memory
-        let shm = rustix::shm::shm_open(&name, ShmOFlags::RDWR, Mode::all())?;
+        let shm = rustix::shm::open(&name, OFlags::RDWR, Mode::all())?;
         let (mapped_struct, mapped_size) = unsafe { Self::map_memory(&shm, false)? };
 
         Ok(Self {
@@ -116,7 +116,7 @@ impl<T: ?Sized> Drop for SharedMemoryMapper<T> {
         }
 
         if self.created {
-            if let Err(e) = rustix::shm::shm_unlink(&self.name) {
+            if let Err(e) = rustix::shm::unlink(&self.name) {
                 eprintln!("Failed to unlink shared memory: {}", e);
             }
         }

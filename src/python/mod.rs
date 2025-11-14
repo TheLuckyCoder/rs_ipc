@@ -7,10 +7,11 @@ use pyo3::types::PyFunction;
 use pyo3::{pymodule, Bound, PyResult};
 use rayon::prelude::*;
 
-pub mod bytes;
+mod bytes;
 mod message;
 mod operation_mode;
 mod reader_wait_policy;
+mod queue_data;
 
 #[pymodule(gil_used = false)]
 fn rs_ipc(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -27,7 +28,7 @@ fn rs_ipc(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[pyfunction]
 fn read_all(readers: Vec<Py<PythonSharedMessage>>, py: Python<'_>) -> Vec<Option<RustPyBytes>> {
-    py.allow_threads(|| {
+    py.detach(|| {
         readers
             .into_par_iter()
             .map(|reader| reader.get().read(false))
@@ -41,12 +42,12 @@ fn read_all_map(
     map_operation: Py<PyFunction>,
     py: Python<'_>,
 ) -> Vec<Option<Py<PyAny>>> {
-    py.allow_threads(|| {
+    py.detach(|| {
         readers
             .into_par_iter()
             .map(|reader| reader.get().read(false))
             .map(|bytes| {
-                bytes.map(|bytes| Python::with_gil(|py| map_operation.call1(py, (bytes,)).unwrap()))
+                bytes.map(|bytes| Python::attach(|py| map_operation.call1(py, (bytes,)).unwrap()))
             })
             .collect()
     })

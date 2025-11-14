@@ -2,6 +2,8 @@ use crate::python::bytes::RustPyBytes;
 use pyo3::types::PyBytes;
 use pyo3::{Bound, Py};
 
+// Rust only helper structs
+
 pub struct ReceiverQueueData {
     pub version: usize,
     pub data: RustPyBytes,

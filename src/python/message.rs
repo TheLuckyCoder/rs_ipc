@@ -1,5 +1,5 @@
-use crate::helpers::memory_mapper::SharedMemoryMapper;
-use crate::helpers::queue_data::{ReceiverQueueData, SenderQueueData};
+use crate::memory_mapper::SharedMemoryMapper;
+use crate::python::queue_data::{ReceiverQueueData, SenderQueueData};
 use crate::python::bytes::RustPyBytes;
 use crate::python::operation_mode::OperationMode::WriteAsync;
 use crate::python::reader_wait_policy::ReaderWaitPolicy;
@@ -108,7 +108,7 @@ impl PythonSharedMessage {
             self.write_async(data)?;
             None
         } else {
-            data.py().allow_threads(|| self.write_sync(data_bytes))
+            data.py().detach(|| self.write_sync(data_bytes))
         })
     }
 
@@ -116,7 +116,7 @@ impl PythonSharedMessage {
     fn read_py(&self, block: bool, py: Python<'_>) -> Option<RustPyBytes> {
         self.op_mode.check_read_permission();
 
-        py.allow_threads(|| self.read(block))
+        py.detach(|| self.read(block))
     }
 
     fn is_new_version_available(&self) -> bool {
@@ -374,7 +374,7 @@ mod tests {
 
     #[test]
     fn async_write() {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let memory = init(
                 "async_write",
                 OperationMode::ReadAsync,
@@ -394,7 +394,7 @@ mod tests {
 
     #[test]
     fn async_write_try_read() {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let data = PyBytes::new(py, &(0u8..255u8).collect::<Vec<_>>());
 
             let memory = init(
@@ -420,7 +420,7 @@ mod tests {
 
     #[test]
     fn async_write_blocking_read() {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let data = PyBytes::new(py, &get_test_data());
 
             let memory = init(
@@ -442,7 +442,7 @@ mod tests {
 
     #[test]
     fn multiple_writes() {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let memory = init(
                 "async_multiple_writes",
                 OperationMode::ReadAsync,

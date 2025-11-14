@@ -1,4 +1,4 @@
-use crate::helpers::memory_mapper::SlicePtrCast;
+use crate::memory_mapper::SlicePtrCast;
 use crate::sync::condvar::SharedCondvar;
 use crate::sync::SharedMutex;
 use std::ffi::c_void;
@@ -58,7 +58,7 @@ impl SharedMessage {
         size_of::<SharedMessage<SharedMemoryDataSized>>()
     }
 
-    pub(crate) fn write(&self, data: &[u8]) -> Option<usize> {
+    pub fn write(&self, data: &[u8]) -> Option<usize> {
         if self.get_version().stopped {
             return None;
         }
@@ -72,7 +72,7 @@ impl SharedMessage {
         Some(new_version)
     }
 
-    pub(crate) fn write_waiting(&self, data: &[u8]) -> Option<usize> {
+    pub fn write_waiting(&self, data: &[u8]) -> Option<usize> {
         let mut content = self.data.lock();
 
         let mut status = StoppedAndVersion::default();
@@ -94,7 +94,7 @@ impl SharedMessage {
         Some(new_version)
     }
 
-    pub(crate) fn try_read(&self, current_version: usize, mut read: impl FnMut(usize, &[u8])) {
+    pub fn try_read(&self, current_version: usize, mut read: impl FnMut(usize, &[u8])) {
         // Read the version to check if there is a new one
         if current_version == self.get_version().version {
             return;
@@ -111,7 +111,7 @@ impl SharedMessage {
         }
     }
 
-    pub(crate) fn blocking_read(&self, current_version: usize, mut read: impl FnMut(usize, &[u8])) {
+    pub fn blocking_read(&self, current_version: usize, mut read: impl FnMut(usize, &[u8])) {
         let mut lock = self.data.lock();
 
         let mut status = StoppedAndVersion::default();
@@ -130,37 +130,37 @@ impl SharedMessage {
         }
     }
 
-    pub(crate) fn is_new_version_available(&self, current_version: usize) -> bool {
+    pub fn is_new_version_available(&self, current_version: usize) -> bool {
         self.get_version().version != current_version
     }
 
-    pub(crate) fn set_target_read_count(&self, target_read_count: u16) {
+    pub fn set_target_read_count(&self, target_read_count: u16) {
         let mut content = self.data.lock();
         content.target_read_count = target_read_count;
     }
 
-    pub(crate) fn get_target_read_count(&self) -> u16 {
+    pub fn get_target_read_count(&self) -> u16 {
         let content = self.data.lock();
         content.target_read_count
     }
 
-    pub(crate) fn add_reader(&self) {
+    pub fn add_reader(&self) {
         let mut content = self.data.lock();
         content.consumer_count += 1;
         self.read_condvar.notify_all();
     }
 
-    pub(crate) fn remove_reader(&self) {
+    pub fn remove_reader(&self) {
         let mut content = self.data.lock();
         content.consumer_count -= 1;
         self.read_condvar.notify_all();
     }
 
-    pub(crate) fn is_stopped(&self) -> bool {
+    pub fn is_stopped(&self) -> bool {
         self.get_version().stopped
     }
 
-    pub(crate) fn stop(&self) {
+    pub fn stop(&self) {
         let _ = self.data.lock();
         self.stopped_and_version
             .fetch_or(STOPPED_BIT, Ordering::Relaxed);
