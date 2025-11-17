@@ -12,7 +12,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 rustix = { version = "1.1.2", default-features = false, features = ["std", "mm", "shm", "thread", "linux_latest"] }
-rayon = "1.11.0"
+rayon = { version = "1.11.0", optional = true }
 pyo3 = { version = "0.27.1", optional = true }
 
 [dev-dependencies]
@@ -20,5 +20,5 @@ pyo3 = { version = "0.27.1", features = ["auto-initialize"] }
 
 [features]
 default = ["python"]
-python = ["dep:pyo3"]
+python = ["dep:pyo3", "dep:rayon"]
 nightly-features = ["python"]
