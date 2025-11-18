@@ -5,22 +5,26 @@ use rustix::shm::OFlags;
 use std::ffi::{c_void, CString};
 use std::ops::Deref;
 use std::os::fd::OwnedFd;
-use std::ptr::slice_from_raw_parts_mut;
+use std::ptr::NonNull;
 
-pub trait SlicePtrCast {
-    unsafe fn cast_from_void_ptr(ptr: *mut c_void, memory_size: usize) -> *const Self;
+pub unsafe trait SlicePtrCast {
+    /// # Safety
+    /// - `ptr` and `memory_size` must refer to a mapping that is valid for Self's layout.
+    /// - Implementation must ensure a returned pointer is valid for reads/writes.
+    unsafe fn cast_from_void_ptr(ptr: NonNull<c_void>, memory_size: usize)
+        -> Option<NonNull<Self>>;
 }
 
 pub struct SharedMemoryMapper<T: 'static + ?Sized> {
     name: CString,
     _fd: OwnedFd,
-    mapped_struct: &'static T,
+    mapped_ptr: *const T,
     mapped_size: usize,
     created: bool,
 }
 
 impl<T: ?Sized + SlicePtrCast> SharedMemoryMapper<T> {
-    pub unsafe fn create(name: CString, size: usize) -> std::io::Result<Self> {
+    pub fn create(name: CString, size: usize) -> std::io::Result<Self> {
         // Open shared memory
         let shm = rustix::shm::open(
             name.as_c_str(),
@@ -34,11 +38,11 @@ impl<T: ?Sized + SlicePtrCast> SharedMemoryMapper<T> {
             return Err(e.into());
         }
 
-        match unsafe { Self::map_memory(&shm, true) } {
+        match unsafe { Self::map_and_init(&shm, true) } {
             Ok((mapped_struct, mapped_size)) => Ok(Self {
                 name,
                 _fd: shm,
-                mapped_struct,
+                mapped_ptr: mapped_struct,
                 mapped_size,
                 created: true,
             }),
@@ -49,21 +53,21 @@ impl<T: ?Sized + SlicePtrCast> SharedMemoryMapper<T> {
         }
     }
 
-    pub unsafe fn open(name: CString) -> std::io::Result<Self> {
+    pub fn open(name: CString) -> std::io::Result<Self> {
         // Open shared memory
         let shm = rustix::shm::open(&name, OFlags::RDWR, Mode::all())?;
-        let (mapped_struct, mapped_size) = unsafe { Self::map_memory(&shm, false)? };
+        let (mapped_ptr, mapped_size) = unsafe { Self::map_and_init(&shm, false)? };
 
         Ok(Self {
             name,
-            mapped_struct,
+            mapped_ptr,
             mapped_size,
             _fd: shm,
             created: false,
         })
     }
 
-    unsafe fn map_memory(shm: &OwnedFd, create: bool) -> rustix::io::Result<(&'static T, usize)> {
+    unsafe fn map_and_init(shm: &OwnedFd, create: bool) -> rustix::io::Result<(*const T, usize)> {
         // Read actual size
         let stats = rustix::fs::fstat(shm)?;
         let size = stats.st_size as usize;
@@ -79,20 +83,22 @@ impl<T: ?Sized + SlicePtrCast> SharedMemoryMapper<T> {
                 0,
             )?
         };
+        let void_ptr = NonNull::new(void_ptr).ok_or(rustix::io::Errno::INVAL)?;
+
+        if let Err(e) = unsafe { mm::madvise(void_ptr.as_ptr(), size, mm::Advice::LinuxHugepage) } {
+            eprintln!("Failed to set huge pages advice: {e}");
+        }
 
         if create {
             unsafe {
-                if let Err(e) = mm::madvise(void_ptr, size, mm::Advice::LinuxHugepage) {
-                    eprintln!("Failed to set huge pages advice: {e}");
-                }
-
-                let slice_ptr: *mut [u8] = slice_from_raw_parts_mut(void_ptr.cast(), size);
-                (*slice_ptr).fill(0);
+                std::ptr::write_bytes(void_ptr.as_ptr(), 0, size);
             }
         }
-        let ptr = unsafe { T::cast_from_void_ptr(void_ptr, size) };
 
-        Ok((unsafe { &*ptr }, size))
+        let ptr =
+            unsafe { T::cast_from_void_ptr(void_ptr, size) }.ok_or(rustix::io::Errno::INVAL)?;
+
+        Ok((ptr.as_ptr(), size))
     }
 
     pub fn mapped_memory_size(&self) -> usize {
@@ -104,13 +110,13 @@ impl<T: ?Sized> Deref for SharedMemoryMapper<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        self.mapped_struct
+        unsafe { &*self.mapped_ptr }
     }
 }
 
 impl<T: ?Sized> Drop for SharedMemoryMapper<T> {
     fn drop(&mut self) {
-        let ptr = self.mapped_struct as *const T as *mut c_void;
+        let ptr = self.mapped_ptr as *mut c_void;
         if let Err(e) = unsafe { mm::munmap(ptr, self.mapped_size) } {
             eprintln!("Failed to unmap shared memory: {}", e);
         }
@@ -122,3 +128,6 @@ impl<T: ?Sized> Drop for SharedMemoryMapper<T> {
         }
     }
 }
+
+unsafe impl<T: ?Sized + Send> Send for SharedMemoryMapper<T> {}
+unsafe impl<T: ?Sized + Sync> Sync for SharedMemoryMapper<T> {}

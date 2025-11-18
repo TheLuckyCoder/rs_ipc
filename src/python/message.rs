@@ -1,10 +1,9 @@
-use crate::memory_mapper::SharedMemoryMapper;
-use crate::python::queue_data::{ReceiverQueueData, SenderQueueData};
 use crate::python::bytes::RustPyBytes;
 use crate::python::operation_mode::OperationMode::WriteAsync;
+use crate::python::queue_data::{ReceiverQueueData, SenderQueueData};
 use crate::python::reader_wait_policy::ReaderWaitPolicy;
 use crate::python::OperationMode;
-use crate::shared_message::SharedMessage;
+use crate::shared_message::{SharedMessage, SharedMessageMapper};
 use pyo3::exceptions::PyValueError;
 use pyo3::types::{PyBytes, PyBytesMethods};
 use pyo3::{pyclass, pymethods, Bound, PyResult, Python};
@@ -17,41 +16,13 @@ use std::sync::{Arc, Mutex};
 #[pyclass(module = "rs_ipc")]
 #[pyo3(frozen, name = "SharedMessage")]
 pub struct PythonSharedMessage {
-    shared_memory: Arc<SharedMemoryMapper<SharedMessage>>,
+    shared_memory: Arc<SharedMessageMapper>,
     name: String,
     op_mode: OperationMode,
     last_written_version: Arc<AtomicUsize>,
     last_read_version: Arc<AtomicUsize>,
     sender: Mutex<Option<Sender<SenderQueueData>>>,
     receiver: Mutex<Option<Receiver<ReceiverQueueData>>>,
-}
-
-impl PythonSharedMessage {
-    fn new(
-        shared_memory: SharedMemoryMapper<SharedMessage>,
-        name: String,
-        op_mode: OperationMode,
-    ) -> Self {
-        if op_mode.can_read() {
-            shared_memory.add_reader();
-        }
-
-        let shared_memory = Arc::new(shared_memory);
-        let last_read_version = Arc::new(AtomicUsize::default());
-        let receiver = (op_mode == OperationMode::ReadAsync).then(|| {
-            Self::start_reader_thread(shared_memory.clone(), &name, last_read_version.clone())
-        });
-
-        Self {
-            shared_memory,
-            name,
-            op_mode,
-            last_written_version: Arc::default(),
-            last_read_version: Arc::default(),
-            sender: Mutex::default(),
-            receiver: Mutex::new(receiver),
-        }
-    }
 }
 
 #[pymethods]
@@ -68,12 +39,8 @@ impl PythonSharedMessage {
         }
 
         let c_name = CString::new(name.clone())?;
-        let shared_memory = unsafe {
-            SharedMemoryMapper::<SharedMessage>::create(
-                c_name,
-                SharedMessage::size_of_fields() + size.get(),
-            )?
-        };
+        let shared_memory =
+            SharedMessageMapper::create(c_name, SharedMessage::size_of_fields() + size.get())?;
 
         shared_memory.set_target_read_count(reader_wait_policy.to_count());
 
@@ -87,7 +54,7 @@ impl PythonSharedMessage {
         }
 
         let c_name = CString::new(name.clone())?;
-        let shared_memory = unsafe { SharedMemoryMapper::<SharedMessage>::open(c_name)? };
+        let shared_memory = SharedMessageMapper::open(c_name)?;
 
         Ok(Self::new(shared_memory, name, mode))
     }
@@ -149,10 +116,35 @@ impl PythonSharedMessage {
 
     fn stop(&self) {
         self.shared_memory.stop();
+
+        // Close the writer queue so the background writer exits
+        if let Ok(mut guard) = self.sender.lock() {
+            drop(guard.take())
+        }
     }
 }
 
 impl PythonSharedMessage {
+    fn new(shared_memory: SharedMessageMapper, name: String, op_mode: OperationMode) -> Self {
+        if op_mode.can_read() {
+            shared_memory.add_reader();
+        }
+
+        let shared_memory = Arc::new(shared_memory);
+        let receiver = (op_mode == OperationMode::ReadAsync)
+            .then(|| Self::start_reader_thread(shared_memory.clone(), &name));
+
+        Self {
+            shared_memory,
+            name,
+            op_mode,
+            last_written_version: Arc::default(),
+            last_read_version: Arc::default(),
+            sender: Mutex::default(),
+            receiver: Mutex::new(receiver),
+        }
+    }
+
     fn write_sync(&self, data: &[u8]) -> Option<usize> {
         let version = self.shared_memory.write_waiting(data);
 
@@ -166,7 +158,11 @@ impl PythonSharedMessage {
     fn write_async(&self, data: Bound<'_, PyBytes>) -> PyResult<()> {
         let queue_data = SenderQueueData::new(data);
 
-        let mut guard = self.sender.lock().unwrap();
+        let mut guard = self
+            .sender
+            .lock()
+            .map_err(|_| PyValueError::new_err("Lock poisoned in SharedMessage::write_async"))?;
+
         let sender = guard.get_or_insert_with(|| {
             let (sender, receiver) = channel::<SenderQueueData>();
 
@@ -198,9 +194,9 @@ impl PythonSharedMessage {
             sender
         });
 
-        sender.send(queue_data).map_err(|_| {
-            PyValueError::new_err("Failed to send data, the queue has been stopped".to_string())
-        })
+        sender
+            .send(queue_data)
+            .map_err(|_| PyValueError::new_err("Failed to send data, the queue has been stopped"))
     }
 
     pub(crate) fn read(&self, block: bool) -> Option<RustPyBytes> {
@@ -233,7 +229,7 @@ impl PythonSharedMessage {
     }
 
     fn read_async(&self, block: bool) -> Option<RustPyBytes> {
-        let receiver_guard = self.receiver.lock().unwrap();
+        let receiver_guard = self.receiver.lock().expect("Poisoned receiver guard");
         let receiver = receiver_guard
             .as_ref()
             .expect("A reader must have a receiver");
@@ -252,19 +248,18 @@ impl PythonSharedMessage {
     }
 
     fn start_reader_thread(
-        shared_memory: Arc<SharedMemoryMapper<SharedMessage>>,
+        shared_memory: Arc<SharedMessageMapper>,
         name: &str,
-        last_read_version: Arc<AtomicUsize>,
     ) -> Receiver<ReceiverQueueData> {
         let (sender, receiver) = channel();
-        let mut local_last_reader_version = last_read_version.load(Ordering::Relaxed);
+        let mut last_reader_version = 0;
 
         std::thread::Builder::new()
-            .name(format!("{} writer thread", name))
+            .name(format!("{} reader thread", name))
             .spawn(move || {
                 while !shared_memory.is_stopped() {
                     let mut queue_data = None;
-                    shared_memory.blocking_read(local_last_reader_version, |new_version, data| {
+                    shared_memory.blocking_read(last_reader_version, |new_version, data| {
                         queue_data = Some(ReceiverQueueData {
                             version: new_version,
                             data: RustPyBytes::new(data),
@@ -272,9 +267,11 @@ impl PythonSharedMessage {
                     });
 
                     if let Some(queue_data) = queue_data {
-                        local_last_reader_version = queue_data.version;
-                        last_read_version.store(local_last_reader_version, Ordering::Relaxed);
-                        let _ = sender.send(queue_data);
+                        last_reader_version = queue_data.version;
+                        if sender.send(queue_data).is_err() {
+                            // The other side of the queue was closed
+                            break;
+                        }
                     }
                 }
             })
@@ -320,7 +317,7 @@ mod tests {
             op_mode,
             reader_wait_policy,
         )
-            .unwrap()
+        .unwrap()
     }
 
     #[test]
@@ -500,7 +497,8 @@ mod tests {
             let memory_clone = memory.clone();
             thread::spawn(move || {
                 while let Some(data) = memory_clone.read(true) {
-                    println!("Got data: {}", data.0.len());
+                    std::hint::black_box(data);
+                    // println!("Got data: {}", data.0.len());
                 }
             });
 
@@ -521,7 +519,8 @@ mod tests {
             b.iter(|| {
                 memory.write_sync(&data);
                 let data = memory.read(true).unwrap();
-                println!("Got data: {}", data.0.len());
+                std::hint::black_box(data);
+                // println!("Got data: {}", data.0.len());
             });
 
             memory.stop();
@@ -549,7 +548,8 @@ mod tests {
                                 bytes = Some(RustPyBytes::new(data));
                             });
                         if let Some(data) = bytes {
-                            println!("Got data: {}", data.0.len());
+                            let a = data.0.iter().map(|x| x & 1).count();
+                            std::hint::black_box(a);
                         } else {
                             break;
                         }

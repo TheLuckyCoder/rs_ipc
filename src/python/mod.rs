@@ -10,8 +10,8 @@ use rayon::prelude::*;
 mod bytes;
 mod message;
 mod operation_mode;
-mod reader_wait_policy;
 mod queue_data;
+mod reader_wait_policy;
 
 #[pymodule(gil_used = false)]
 fn rs_ipc(m: &Bound<'_, PyModule>) -> PyResult<()> {

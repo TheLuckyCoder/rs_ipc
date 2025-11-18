@@ -1,30 +1,49 @@
-use crate::memory_mapper::SlicePtrCast;
+use crate::memory_mapper::{SharedMemoryMapper, SlicePtrCast};
 use crate::sync::condvar::SharedCondvar;
 use crate::sync::SharedMutex;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
+use std::ptr::NonNull;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-const STOPPED_BIT: usize = 1 << 63;
+const STOPPED_BIT_MASK: usize = 1usize << (usize::BITS - 1);
+const VERSION_MASK: usize = !STOPPED_BIT_MASK;
 
 #[repr(C)]
-pub struct SharedMessage<T: ?Sized = SharedMessageData> {
+pub struct SharedMessage<T: ?Sized = [u8]> {
     stopped_and_version: AtomicUsize,
     write_condvar: SharedCondvar,
     read_condvar: SharedCondvar,
-    data: SharedMutex<T>,
+    data: SharedMutex<SharedMessageData<T>>,
 }
 
 #[repr(C)]
-pub struct SharedMessageData {
+struct SharedMessageData<T: ?Sized = [u8]> {
+    /// Number of readers that have consumed the current payload.
+    /// Reset to 0 whenever a new payload is written.
     read_count: u16,
+    /// Maximum number of readers the writer will wait for before
+    /// being allowed to write a new payload.
     target_read_count: u16,
+    /// Number of currently registered reader instances.
     consumer_count: u16,
     size: usize,
-    payload: [u8],
+    payload: T,
 }
 
 impl SharedMessageData {
-    #[inline]
+    fn payload_data(&self) -> &[u8] {
+        &self.payload[..self.size]
+    }
+
+    fn is_reading_done(&self) -> bool {
+        self.read_count >= self.target_read_count.min(self.consumer_count)
+    }
+
+    fn increment_read_count(&mut self) -> bool {
+        self.read_count += 1;
+        self.is_reading_done()
+    }
+
     fn copy(&mut self, data: &[u8]) {
         let data_len = data.len();
 
@@ -32,90 +51,83 @@ impl SharedMessageData {
         self.size = data_len;
         self.payload[..data_len].copy_from_slice(data);
     }
-
-    #[inline]
-    fn increment_read_count(&mut self) -> bool {
-        self.read_count += 1;
-        self.read_count >= self.target_read_count.min(self.consumer_count)
-    }
 }
 
 #[derive(Default)]
-pub(crate) struct StoppedAndVersion {
-    pub(crate) stopped: bool,
-    pub(crate) version: usize,
+struct StoppedAndVersion {
+    stopped: bool,
+    version: usize,
 }
 
 impl SharedMessage {
     pub(crate) const fn size_of_fields() -> usize {
-        #[repr(C)]
-        struct SharedMemoryDataSized {
-            read_count: AtomicU16,
-            target_read_count: u16,
-            consumer_count: u16,
-            size: usize,
-        }
-        size_of::<SharedMessage<SharedMemoryDataSized>>()
+        size_of::<SharedMessage<SharedMessageData<()>>>()
     }
 
     pub fn write(&self, data: &[u8]) -> Option<usize> {
-        if self.get_version().stopped {
+        if self.is_stopped() {
             return None;
         }
 
-        let mut content = self.data.lock();
+        let mut data_guard = self.data.lock();
+        if self.is_stopped() {
+            return None;
+        }
 
-        let new_version = unsafe { self.increment_version() };
-        content.copy(data);
+        let new_version = unsafe { self.increment_version(&mut data_guard) };
+        data_guard.copy(data);
         self.write_condvar.notify_all();
 
         Some(new_version)
     }
 
     pub fn write_waiting(&self, data: &[u8]) -> Option<usize> {
-        let mut content = self.data.lock();
+        if self.is_stopped() {
+            return None;
+        }
+
+        let mut data_guard = self.data.lock();
 
         let mut status = StoppedAndVersion::default();
-        content = self.read_condvar.wait_while(content, |lock| {
+        data_guard = self.read_condvar.wait_while(data_guard, |guard| {
             status = self.get_version();
-            !status.stopped
-                && status.version != 0
-                && lock.read_count < lock.target_read_count.min(lock.consumer_count)
+            !status.stopped && status.version != 0 && !guard.is_reading_done()
         });
 
         if status.stopped {
             return None;
         }
 
-        let new_version = unsafe { self.increment_version() };
-        content.copy(data);
+        let new_version = unsafe { self.increment_version(&mut data_guard) };
+        data_guard.copy(data);
         self.write_condvar.notify_all();
 
         Some(new_version)
     }
 
-    pub fn try_read(&self, current_version: usize, mut read: impl FnMut(usize, &[u8])) {
+    pub fn try_read(&self, current_version: usize, read: impl FnOnce(usize, &[u8])) {
         // Read the version to check if there is a new one
         if current_version == self.get_version().version {
             return;
         }
 
-        let mut lock = self.data.lock();
+        let mut data_guard = self.data.lock();
         // Read the version again after the lock has been acquired, as it could have changed
         let version = self.get_version().version;
 
-        read(version, &lock.payload[..lock.size]);
+        read(version, data_guard.payload_data());
 
-        if lock.increment_read_count() {
+        data_guard.increment_read_count();
+        if data_guard.is_reading_done() {
             self.read_condvar.notify_one();
         }
     }
 
-    pub fn blocking_read(&self, current_version: usize, mut read: impl FnMut(usize, &[u8])) {
-        let mut lock = self.data.lock();
+    pub fn blocking_read(&self, current_version: usize, read: impl FnOnce(usize, &[u8])) {
+        let mut data_guard = self.data.lock();
 
         let mut status = StoppedAndVersion::default();
-        lock = self.write_condvar.wait_while(lock, |_| {
+        data_guard = self.write_condvar.wait_while(data_guard, |_| {
             status = self.get_version();
             !status.stopped && status.version == current_version
         });
@@ -123,78 +135,95 @@ impl SharedMessage {
             return;
         }
 
-        read(status.version, &lock.payload[..lock.size]);
+        read(status.version, data_guard.payload_data());
 
-        if lock.increment_read_count() {
+        data_guard.increment_read_count();
+        if data_guard.is_reading_done() {
             self.read_condvar.notify_one();
         }
     }
 
+    #[inline]
     pub fn is_new_version_available(&self, current_version: usize) -> bool {
         self.get_version().version != current_version
     }
 
     pub fn set_target_read_count(&self, target_read_count: u16) {
-        let mut content = self.data.lock();
-        content.target_read_count = target_read_count;
+        let mut data_guard = self.data.lock();
+        data_guard.target_read_count = target_read_count;
     }
 
     pub fn get_target_read_count(&self) -> u16 {
-        let content = self.data.lock();
-        content.target_read_count
+        let data_guard = self.data.lock();
+        data_guard.target_read_count
     }
 
     pub fn add_reader(&self) {
-        let mut content = self.data.lock();
-        content.consumer_count += 1;
+        let mut data_guard = self.data.lock();
+        data_guard.consumer_count = data_guard.consumer_count.saturating_add(1);
         self.read_condvar.notify_all();
     }
 
     pub fn remove_reader(&self) {
-        let mut content = self.data.lock();
-        content.consumer_count -= 1;
+        let mut data_guard = self.data.lock();
+        data_guard.consumer_count = data_guard.consumer_count.saturating_sub(1);
         self.read_condvar.notify_all();
     }
 
+    #[inline]
     pub fn is_stopped(&self) -> bool {
         self.get_version().stopped
     }
 
     pub fn stop(&self) {
-        let _ = self.data.lock();
+        let _data_guard = self.data.lock();
         self.stopped_and_version
-            .fetch_or(STOPPED_BIT, Ordering::Relaxed);
+            .fetch_or(STOPPED_BIT_MASK, Ordering::Relaxed);
 
         self.write_condvar.notify_all();
         self.read_condvar.notify_all();
     }
 
-    #[inline]
     fn get_version(&self) -> StoppedAndVersion {
         let version = self.stopped_and_version.load(Ordering::Relaxed);
-        let stopped = (version & STOPPED_BIT) != 0;
-        let version = version & !STOPPED_BIT;
+        let stopped = (version & STOPPED_BIT_MASK) != 0;
+        let version = version & !STOPPED_BIT_MASK;
         StoppedAndVersion { stopped, version }
     }
 
-    /// This function must only be called when the mutex is locked and if the message not is stopped
-    unsafe fn increment_version(&self) -> usize {
-        let old_version = self.stopped_and_version.fetch_add(1, Ordering::Relaxed);
-        let new_version = old_version + 1;
-        if (old_version & STOPPED_BIT) != (new_version & STOPPED_BIT) {
-            // The value has overflowed, reset it back to 0
-            self.stopped_and_version.store(0, Ordering::Relaxed);
-            0
-        } else {
-            new_version
+    /// This function must only be called when the mutex is locked and if the message is not stopped.
+    /// A mutable reference is required to ensure that an exclusive lock is held while calling this function
+    unsafe fn increment_version(&self, _data: &mut SharedMessageData) -> usize {
+        debug_assert!(
+            !self.is_stopped(),
+            "increment_version must not be called on a stopped message"
+        );
+
+        let old = self.stopped_and_version.load(Ordering::Relaxed);
+        let mut new = (old + 1) & VERSION_MASK;
+        if new == 0 {
+            new += 1; // if it wraps around, increment to 1, as version 0 has special meaning
         }
+        self.stopped_and_version.store(new, Ordering::Relaxed);
+        new
     }
 }
 
-impl SlicePtrCast for SharedMessage {
-    unsafe fn cast_from_void_ptr(ptr: *mut c_void, memory_size: usize) -> *const Self {
-        let payload_size = memory_size - Self::size_of_fields();
-        let slice_ptr: *mut [u8] = std::ptr::slice_from_raw_parts_mut(ptr.cast(), payload_size);
-        slice_ptr as *const Self
+unsafe impl SlicePtrCast for SharedMessage {
+    unsafe fn cast_from_void_ptr(
+        ptr: NonNull<c_void>,
+        memory_size: usize,
+    ) -> Option<NonNull<Self>> {
+        let header_size = Self::size_of_fields();
+        let payload_size = memory_size.saturating_sub(header_size);
+        if payload_size == 0 {
+            return None;
+        }
+
+        let slice_ptr: *mut [u8] =
+            std::ptr::slice_from_raw_parts_mut(ptr.as_ptr().cast(), payload_size);
+        NonNull::new(slice_ptr as *mut Self)
     }
 }
+
+pub type SharedMessageMapper = SharedMemoryMapper<SharedMessage>;

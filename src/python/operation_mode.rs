@@ -17,10 +17,7 @@ impl OperationMode {
     }
 
     pub fn can_write(self) -> bool {
-        matches!(
-            self,
-            OperationMode::WriteSync | OperationMode::WriteAsync
-        )
+        matches!(self, OperationMode::WriteSync | OperationMode::WriteAsync)
     }
 
     pub fn check_read_permission(self) {

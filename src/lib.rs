@@ -1,7 +1,10 @@
 #![cfg_attr(feature = "nightly-features", feature(test))]
 
+mod memory_mapper;
 #[cfg(feature = "python")]
 mod python;
-pub mod shared_message;
+mod shared_message;
 mod sync;
-pub mod memory_mapper;
+
+pub use memory_mapper::*;
+pub use shared_message::*;
