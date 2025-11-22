@@ -1,3 +1,4 @@
+from enum import Enum, auto
 from typing import Callable
 
 
@@ -194,6 +195,7 @@ def read_all_map(readers: list[SharedMessage], map_operation: Callable[[bytes], 
     """
     return [map_operation(reader.read(False)) for reader in readers]
 
+
 class ReaderWaitPolicy:
     """
     Sait for all readers or for the specified number of readers to read the message before writing
@@ -215,65 +217,52 @@ class ReaderWaitPolicy:
             pass
 
 
-class OperationMode:
-    class CreateOnly(OperationMode):
-        """
-        Indicates that this instance will neither read nor write, just hold the memory open.
+class OperationMode(Enum):
+    """
+    Indicates that this instance will neither read nor write, just hold the memory open.
 
-        This is intended for use with `SharedMessage.create`, where
-        the creator process keeps the shared memory alive so that other
-        processes can `open` it.
-        """
-        pass
+    This is intended for use with `SharedMessage.create`, where
+    the creator process keeps the shared memory alive so that other
+    processes can `open` it.
+    """
+    CreateOnly = auto()
+    """
+    Synchronous reading mode.
 
-    class ReadSync(OperationMode):
-        """
-        Synchronous reading mode.
+    Calls to `read()` may block (when `block=True`) until a new message
+    is available.
+    """
+    ReadSync = auto()
+    """
+    Asynchronous reading mode.
 
-        Calls to `read()` may block (when `block=True`) until a new message
-        is available.
-        """
-        pass
+    Starts a background thread that reads from shared memory and stores
+    messages in an internal queue. Calls to `read()` consume from that
+    queue, and can be non-blocking (`block=False`) or blocking (`block=True`).
 
-    class ReadAsync(OperationMode):
-        """
-        Asynchronous reading mode.
+    This mode is useful when you want the read path to be non-blocking or
+    to integrate with event loops without holding the GIL.
+    """
+    ReadAsync = auto()
+    """
+    Synchronous writing mode.
 
-        Starts a background thread that reads from shared memory and stores
-        messages in an internal queue. Calls to `read()` consume from that
-        queue, and can be non-blocking (`block=False`) or blocking (`block=True`).
+    The `write()` function blocks the calling thread according to the
+    `ReaderWaitPolicy` before writing the next message, ensuring that
+    enough readers have consumed the previous one.
+    """
+    WriteSync = auto()
 
-        This mode is useful when you want the read path to be non-blocking or
-        to integrate with event loops without holding the GIL.
-        """
-        pass
+    """
+    Asynchronous writing mode.
 
-    class WriteSync(OperationMode):
-        """
-        Synchronous writing mode.
+    The `write()` function enqueues the message to a background writer
+    thread and returns immediately, never blocking the calling thread.
+    The background thread then performs the actual write, honoring the
+    configured `ReaderWaitPolicy`.
 
-        The `write()` function blocks the calling thread according to the
-        `ReaderWaitPolicy` before writing the next message, ensuring that
-        enough readers have consumed the previous one.
-        """
-
-        def __init__(self):
-            pass
-
-    class WriteAsync(OperationMode):
-        """
-        Asynchronous writing mode.
-
-        The `write()` function enqueues the message to a background writer
-        thread and returns immediately, never blocking the calling thread.
-        The background thread then performs the actual write, honoring the
-        configured `ReaderWaitPolicy`.
-
-        When used with `ReaderWaitPolicy.Count(0)` (fire-and-forget), multiple
-        queued writes may be coalesced and intermediate values dropped, so
-        only the latest enqueued message is guaranteed to be written.
-        """
-
-        def __init__(self):
-            pass
-
+    When used with `ReaderWaitPolicy.Count(0)` (fire-and-forget), multiple
+    queued writes may be coalesced and intermediate values dropped, so
+    only the latest enqueued message is guaranteed to be written.
+    """
+    WriteAsync = auto()
