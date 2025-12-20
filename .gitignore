@@ -71,3 +71,6 @@ docs/_build/
 
 # Pyenv
 .python-version
+
+# Test files
+test_zero_copy.py
