@@ -1,5 +1,5 @@
 pub mod condvar;
-mod futex;
+pub mod futex;
 mod lock;
 
 pub use lock::mutex::{SharedMutex, SharedMutexGuard};
