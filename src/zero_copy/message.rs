@@ -18,6 +18,20 @@ struct SequenceState {
     buffer_idx: u8,
 }
 
+/// Zero-copy shared message with double buffering.
+///
+/// # Concurrency Model
+/// - **Single Writer**: This implementation is designed for a single writer.
+///   Multiple concurrent writers will have undefined behavior due to races in
+///   buffer selection and reader count management.
+/// - **Multiple Readers**: Supports multiple concurrent readers through
+///   per-buffer reference counting.
+///
+/// # Memory Layout
+/// The structure uses bit packing to minimize header size:
+/// - Sequence (62 bits): Message version counter
+/// - Buffer Index (1 bit): Which buffer contains the latest data (0 or 1)
+/// - Stopped (1 bit): Termination flag
 #[repr(C)]
 pub struct ZeroCopySharedMessage<T: ?Sized = [u8]> {
     // Packed: sequence (62 bits) + buffer_idx (1 bit) + stopped (1 bit)
@@ -49,9 +63,10 @@ impl ZeroCopySharedMessage {
     }
     
     /// Unpack the combined sequence/stopped/buffer_idx value
+    /// Uses Acquire ordering to ensure visibility of prior writes
     #[inline]
     fn get_state(&self) -> SequenceState {
-        let packed = self.sequence_and_flags.load(Ordering::Relaxed);
+        let packed = self.sequence_and_flags.load(Ordering::Acquire);
         SequenceState {
             sequence: packed & SEQUENCE_MASK,
             stopped: (packed & STOPPED_BIT_MASK) != 0,
