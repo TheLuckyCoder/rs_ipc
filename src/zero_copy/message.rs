@@ -3,16 +3,26 @@ use crate::sync::LockFreeCondvar;
 use crate::zero_copy::ReadGuard;
 use std::ffi::c_void;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+
+// Bit masks for packing stopped flag and buffer index into sequence
+const STOPPED_BIT_MASK: u64 = 1u64 << 63;
+const BUFFER_IDX_BIT_MASK: u64 = 1u64 << 62;
+const SEQUENCE_MASK: u64 = !(STOPPED_BIT_MASK | BUFFER_IDX_BIT_MASK);
+
+/// Helper struct to unpack the combined sequence/stopped/buffer_idx value
+#[derive(Default, Clone, Copy)]
+struct SequenceState {
+    sequence: u64,
+    stopped: bool,
+    buffer_idx: u8,
+}
 
 #[repr(C)]
 pub struct ZeroCopySharedMessage<T: ?Sized = [u8]> {
-    // Versioning & state
-    sequence: AtomicU64,
-    stopped: AtomicU32,
+    // Packed: sequence (62 bits) + buffer_idx (1 bit) + stopped (1 bit)
+    sequence_and_flags: AtomicU64,
     
-    // Buffer management
-    latest_buffer_idx: AtomicU8,
     data_sizes: [AtomicUsize; 2],
     
     // Reader tracking (per buffer)
@@ -38,6 +48,17 @@ impl ZeroCopySharedMessage {
         size_of::<ZeroCopySharedMessage<[u8; 0]>>()
     }
     
+    /// Unpack the combined sequence/stopped/buffer_idx value
+    #[inline]
+    fn get_state(&self) -> SequenceState {
+        let packed = self.sequence_and_flags.load(Ordering::Relaxed);
+        SequenceState {
+            sequence: packed & SEQUENCE_MASK,
+            stopped: (packed & STOPPED_BIT_MASK) != 0,
+            buffer_idx: ((packed & BUFFER_IDX_BIT_MASK) >> 62) as u8,
+        }
+    }
+    
     /// Write data to shared memory with zero-copy pattern.
     /// Returns the new sequence number if successful, None if stopped.
     pub fn write(&self, data: &[u8]) -> Option<u64> {
@@ -46,7 +67,8 @@ impl ZeroCopySharedMessage {
         }
         
         // 1. Determine which buffer to write to (the non-latest one)
-        let write_idx = 1 - self.latest_buffer_idx.load(Ordering::Acquire);
+        let current_state = self.get_state();
+        let write_idx = 1 - current_state.buffer_idx;
         
         // 2. Always wait for readers to finish with this buffer
         while self.reader_counts[write_idx as usize].load(Ordering::Acquire) > 0 {
@@ -86,14 +108,36 @@ impl ZeroCopySharedMessage {
         // 5. Reset reader count for the buffer we're about to publish
         self.reader_counts[write_idx as usize].store(0, Ordering::Release);
         
-        // 6. Publish: make this the latest buffer
-        self.latest_buffer_idx.store(write_idx, Ordering::Release);
-        
-        // 7. Increment sequence and wake readers
-        let new_seq = self.sequence.fetch_add(1, Ordering::Release) + 1;
-        self.writer_futex.notify_all();
-        
-        Some(new_seq)
+        // 6. Atomically update: increment sequence, switch buffer, keep stopped flag
+        loop {
+            let old_packed = self.sequence_and_flags.load(Ordering::Acquire);
+            let old_seq = old_packed & SEQUENCE_MASK;
+            let stopped_flag = old_packed & STOPPED_BIT_MASK;
+            
+            // Check if stopped while we were preparing
+            if stopped_flag != 0 {
+                return None;
+            }
+            
+            let mut new_seq = (old_seq + 1) & SEQUENCE_MASK;
+            if new_seq == 0 {
+                new_seq = 1; // Skip 0 as it has special meaning
+            }
+            
+            let new_buffer_flag = if write_idx == 1 { BUFFER_IDX_BIT_MASK } else { 0 };
+            let new_packed = new_seq | new_buffer_flag | stopped_flag;
+            
+            // Try to atomically update
+            if self.sequence_and_flags
+                .compare_exchange(old_packed, new_packed, Ordering::Release, Ordering::Acquire)
+                .is_ok()
+            {
+                // 7. Wake readers
+                self.writer_futex.notify_all();
+                return Some(new_seq);
+            }
+            // If CAS failed, retry
+        }
     }
     
     /// Try to read the next message without blocking.
@@ -110,14 +154,14 @@ impl ZeroCopySharedMessage {
     
     fn read_internal(&self, last_seen_seq: u64, block: bool) -> Option<ReadGuard<'_>> {
         loop {
-            if self.is_stopped() && !self.has_new_data(last_seen_seq) {
+            let state = self.get_state();
+            
+            if state.stopped && state.sequence == last_seen_seq {
                 return None;
             }
             
-            let current_seq = self.sequence.load(Ordering::Acquire);
-            
             // Check if new data available
-            if current_seq == last_seen_seq {
+            if state.sequence == last_seen_seq {
                 if !block {
                     return None;
                 }
@@ -127,22 +171,22 @@ impl ZeroCopySharedMessage {
                 continue;
             }
             
-            // Get latest buffer index
-            let buffer_idx = self.latest_buffer_idx.load(Ordering::Acquire);
+            // Get latest buffer index from the state
+            let buffer_idx = state.buffer_idx;
             
             // Register as reader BEFORE accessing buffer
             self.reader_counts[buffer_idx as usize].fetch_add(1, Ordering::AcqRel);
             
             // Verify buffer didn't change while registering
-            let verify_idx = self.latest_buffer_idx.load(Ordering::Acquire);
-            if verify_idx != buffer_idx {
+            let verify_state = self.get_state();
+            if verify_state.buffer_idx != buffer_idx {
                 // Buffer changed - unregister and retry
                 self.release_reader(buffer_idx);
                 continue;
             }
             
             // Return guard with direct pointer to buffer (ZERO COPY)
-            return Some(ReadGuard::new(self, buffer_idx, current_seq));
+            return Some(ReadGuard::new(self, buffer_idx, state.sequence));
         }
     }
     
@@ -158,23 +202,24 @@ impl ZeroCopySharedMessage {
     
     /// Get the current sequence number.
     pub fn current_sequence(&self) -> u64 {
-        self.sequence.load(Ordering::Acquire)
+        self.get_state().sequence
     }
     
     /// Check if there's new data compared to the given sequence.
     pub fn has_new_data(&self, last_seen_seq: u64) -> bool {
-        self.sequence.load(Ordering::Acquire) != last_seen_seq
+        self.get_state().sequence != last_seen_seq
     }
     
     /// Check if the shared memory has been stopped.
     #[inline]
     pub fn is_stopped(&self) -> bool {
-        self.stopped.load(Ordering::Relaxed) != 0
+        self.get_state().stopped
     }
     
     /// Signal that no more writes will occur.
     pub fn stop(&self) {
-        self.stopped.store(1, Ordering::Relaxed);
+        // Set the stopped bit using fetch_or
+        self.sequence_and_flags.fetch_or(STOPPED_BIT_MASK, Ordering::Relaxed);
         
         // Wake all waiting readers and writers
         self.writer_futex.notify_all();
