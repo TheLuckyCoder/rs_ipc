@@ -1,41 +1,9 @@
 use crate::memory_mapper::{SharedMemoryMapper, SlicePtrCast};
-use crate::sync::futex::{futex_wait, futex_wake_all, Futex};
+use crate::sync::LockFreeCondvar;
 use crate::zero_copy::ReadGuard;
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-
-/// Simple condition variable for lock-free synchronization.
-/// Unlike SharedCondvar, this doesn't require a mutex.
-#[repr(transparent)]
-struct LockFreeCondvar(Futex);
-
-impl LockFreeCondvar {
-    /// Wait on the condition variable if the value matches the expected value
-    #[inline]
-    fn wait(&self, expected: u32) {
-        futex_wait(&self.0, expected);
-    }
-
-    /// Notify all threads waiting on this condition variable
-    #[inline]
-    fn notify_all(&self) {
-        self.0.fetch_add(1, Ordering::Release);
-        futex_wake_all(&self.0);
-    }
-
-    /// Load the current futex value for wait operations
-    #[inline]
-    fn load(&self, ordering: Ordering) -> u32 {
-        self.0.load(ordering)
-    }
-}
-
-impl Default for LockFreeCondvar {
-    fn default() -> Self {
-        Self(AtomicU32::new(0))
-    }
-}
 
 #[repr(C)]
 pub struct ZeroCopySharedMessage<T: ?Sized = [u8]> {
