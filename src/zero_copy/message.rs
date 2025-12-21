@@ -1,9 +1,41 @@
 use crate::memory_mapper::{SharedMemoryMapper, SlicePtrCast};
-use crate::sync::futex::{futex_wait, futex_wake_all};
+use crate::sync::futex::{futex_wait, futex_wake_all, Futex};
 use crate::zero_copy::ReadGuard;
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+
+/// Simple condition variable for lock-free synchronization.
+/// Unlike SharedCondvar, this doesn't require a mutex.
+#[repr(transparent)]
+struct LockFreeCondvar(Futex);
+
+impl LockFreeCondvar {
+    /// Wait on the condition variable if the value matches the expected value
+    #[inline]
+    fn wait(&self, expected: u32) {
+        futex_wait(&self.0, expected);
+    }
+
+    /// Notify all threads waiting on this condition variable
+    #[inline]
+    fn notify_all(&self) {
+        self.0.fetch_add(1, Ordering::Release);
+        futex_wake_all(&self.0);
+    }
+
+    /// Load the current futex value for wait operations
+    #[inline]
+    fn load(&self, ordering: Ordering) -> u32 {
+        self.0.load(ordering)
+    }
+}
+
+impl Default for LockFreeCondvar {
+    fn default() -> Self {
+        Self(AtomicU32::new(0))
+    }
+}
 
 #[repr(C)]
 pub struct ZeroCopySharedMessage<T: ?Sized = [u8]> {
@@ -13,15 +45,14 @@ pub struct ZeroCopySharedMessage<T: ?Sized = [u8]> {
     
     // Buffer management
     latest_buffer_idx: AtomicU8,
-    _padding1: [u8; 3],
     data_sizes: [AtomicUsize; 2],
     
     // Reader tracking (per buffer)
     reader_counts: [AtomicU32; 2],
     
-    // Synchronization
-    writer_futex: AtomicU32,
-    reader_done_futex: AtomicU32,
+    // Synchronization (lock-free condition variables)
+    writer_futex: LockFreeCondvar,     // Readers wait here for new data
+    reader_done_futex: LockFreeCondvar, // Writer waits here for readers to finish
     
     // Reader wait policy
     target_read_count: AtomicU16,
@@ -55,7 +86,7 @@ impl ZeroCopySharedMessage {
                 return None;
             }
             let futex_val = self.reader_done_futex.load(Ordering::Relaxed);
-            futex_wait(&self.reader_done_futex, futex_val);
+            self.reader_done_futex.wait(futex_val);
         }
         
         // 3. Optionally wait for readers to consume from the other buffer (based on policy)
@@ -72,7 +103,7 @@ impl ZeroCopySharedMessage {
                         return None;
                     }
                     let futex_val = self.writer_futex.load(Ordering::Relaxed);
-                    futex_wait(&self.writer_futex, futex_val);
+                    self.writer_futex.wait(futex_val);
                     consumed = self.reader_counts[other_idx as usize].load(Ordering::Acquire);
                 }
             }
@@ -92,8 +123,7 @@ impl ZeroCopySharedMessage {
         
         // 7. Increment sequence and wake readers
         let new_seq = self.sequence.fetch_add(1, Ordering::Release) + 1;
-        self.writer_futex.fetch_add(1, Ordering::Release);
-        futex_wake_all(&self.writer_futex);
+        self.writer_futex.notify_all();
         
         Some(new_seq)
     }
@@ -125,7 +155,7 @@ impl ZeroCopySharedMessage {
                 }
                 // Sleep until new data or stop
                 let futex_val = self.writer_futex.load(Ordering::Relaxed);
-                futex_wait(&self.writer_futex, futex_val);
+                self.writer_futex.wait(futex_val);
                 continue;
             }
             
@@ -154,8 +184,7 @@ impl ZeroCopySharedMessage {
         
         // If we were the last reader on this buffer, wake any waiting writer
         if old_count == 1 {
-            self.reader_done_futex.fetch_add(1, Ordering::Release);
-            futex_wake_all(&self.reader_done_futex);
+            self.reader_done_futex.notify_all();
         }
     }
     
@@ -180,10 +209,8 @@ impl ZeroCopySharedMessage {
         self.stopped.store(1, Ordering::Relaxed);
         
         // Wake all waiting readers and writers
-        self.writer_futex.fetch_add(1, Ordering::Release);
-        futex_wake_all(&self.writer_futex);
-        self.reader_done_futex.fetch_add(1, Ordering::Release);
-        futex_wake_all(&self.reader_done_futex);
+        self.writer_futex.notify_all();
+        self.reader_done_futex.notify_all();
     }
     
     /// Set the target read count for writer wait policy.

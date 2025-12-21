@@ -210,11 +210,12 @@ class ZeroCopySharedMessage(object):
 
     def write(self, data: bytes) -> int | None:
         """
-        Write bytes into shared memory with zero-copy pattern.
+        Write bytes into shared memory.
         
-        This copies data into the non-active buffer, then atomically switches
-        buffers. The writer waits for any readers holding the target buffer to
-        release it before writing.
+        This copies data from the parameter into the non-active buffer in shared
+        memory, then atomically switches buffers. Note: This involves two copies -
+        one to create the bytes parameter, and one into shared memory. The writer
+        waits for any readers holding the target buffer to release it before writing.
         
         This function releases the GIL while waiting and writing.
 
