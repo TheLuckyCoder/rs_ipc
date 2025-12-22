@@ -1,6 +1,6 @@
 use crate::memory_mapper::{SharedMemoryMapper, SlicePtrCast};
-use crate::sync::{FutexLock, LockFreeCondvar};
-use crate::zero_copy::{ReadGuard, WriteGuard};
+use crate::sync::{LockFreeCondvar, SharedMutex, SharedMutexGuard};
+use crate::zero_copy::{MessageReadGuard, MessageWriteGuard};
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
@@ -52,7 +52,7 @@ pub struct ZeroCopySharedMessage<T: ?Sized = [u8]> {
     reader_done_futex: LockFreeCondvar, // Writer waits here for readers to finish
 
     // Writer mutex (serializes multiple writers)
-    writer_mutex: FutexLock,
+    writer_mutex: SharedMutex<()>,
 
     // Buffer size (each buffer is half of remaining space)
     buffer_size: usize,
@@ -61,13 +61,14 @@ pub struct ZeroCopySharedMessage<T: ?Sized = [u8]> {
     buffers: T,
 }
 
+pub(crate) type WriterGuard<'a> = SharedMutexGuard<'a, ()>;
+
 impl ZeroCopySharedMessage {
     pub(crate) const fn size_of_fields() -> usize {
         size_of::<ZeroCopySharedMessage<[u8; 0]>>()
     }
 
     /// Unpack the combined sequence/stopped/buffer_idx value
-    /// Uses Acquire ordering to ensure visibility of prior writes
     #[inline]
     fn get_state(&self) -> SequenceState {
         let packed = self.sequence_and_flags.load(Ordering::Acquire);
@@ -78,13 +79,15 @@ impl ZeroCopySharedMessage {
         }
     }
 
-    /// Internal: Acquire a write buffer, waiting for any active readers to finish.
+    /// Acquire a write buffer, waiting for any active readers to finish.
     /// Returns the buffer index if successful, None if stopped.
     /// This allows the writer to prepare the next message while readers consume the current one.
-    fn acquire_write_buffer(&self) -> Option<bool> {
+    fn acquire_write_buffer(&self) -> Option<(bool, WriterGuard<'_>)> {
         if self.is_stopped() {
             return None;
         }
+
+        let writer_guard = self.writer_mutex.lock();
 
         // 1. Determine which buffer to write to (the non-latest one)
         let current_state = self.get_state();
@@ -101,15 +104,13 @@ impl ZeroCopySharedMessage {
             self.reader_done_futex.wait();
         }
 
-        Some(write_idx)
+        Some((write_idx, writer_guard))
     }
 
     /// Returns the new sequence number if successful, None if stopped.
     pub fn write(&self, data: &[u8]) -> Option<u64> {
-        // Acquire the write buffer
-        let write_idx = self.acquire_write_buffer()?;
+        let (write_idx, writer_guard) = self.acquire_write_buffer()?;
 
-        // Write to buffer (this is the ONLY copy)
         let buffer = self.buffer_mut(write_idx);
         if data.len() > buffer.len() {
             panic!(
@@ -120,41 +121,31 @@ impl ZeroCopySharedMessage {
         }
         buffer[..data.len()].copy_from_slice(data);
 
-        // Publish the buffer
-        self.publish_buffer(write_idx, data.len())
+        self.publish_buffer(write_idx, writer_guard, data.len())
     }
 
     /// Returns a WriteGuard that provides mutable access to a buffer.
     /// The buffer will be published when the guard's `publish()` method is called.
     /// The writer mutex is acquired here and will be held until the guard is published or dropped.
-    pub fn acquire_write_guard(&self) -> Option<WriteGuard<'_>> {
-        // Acquire the writer mutex first (serializes multiple writers)
-        self.writer_mutex.lock();
-        
+    pub fn acquire_write_guard(&self) -> Option<MessageWriteGuard<'_>> {
         // Then acquire the write buffer
-        match self.acquire_write_buffer() {
-            Some(write_idx) => Some(WriteGuard::new(self, write_idx)),
-            None => {
-                // Failed to acquire buffer (stopped), release mutex
-                unsafe { self.writer_mutex.unlock() };
-                None
-            }
-        }
+        let (write_idx, writer_guard) = self.acquire_write_buffer()?;
+        Some(MessageWriteGuard::new(self, writer_guard, write_idx))
     }
 
     /// Try to read the next message without blocking.
     /// Returns a ReadGuard if new data is available, None otherwise.
-    pub fn try_read(&self, last_seen_seq: u64) -> Option<ReadGuard<'_>> {
+    pub fn try_read(&self, last_seen_seq: u64) -> Option<MessageReadGuard<'_>> {
         self.read_internal(last_seen_seq, false)
     }
 
     /// Read the next message, blocking until new data is available or stopped.
     /// Returns a ReadGuard if successful, None if stopped with no new data.
-    pub fn read(&self, last_seen_seq: u64) -> Option<ReadGuard<'_>> {
+    pub fn read(&self, last_seen_seq: u64) -> Option<MessageReadGuard<'_>> {
         self.read_internal(last_seen_seq, true)
     }
 
-    fn read_internal(&self, last_seen_seq: u64, block: bool) -> Option<ReadGuard<'_>> {
+    fn read_internal(&self, last_seen_seq: u64, block: bool) -> Option<MessageReadGuard<'_>> {
         loop {
             let state = self.get_state();
 
@@ -172,7 +163,7 @@ impl ZeroCopySharedMessage {
                 continue;
             }
 
-            // Get latest buffer index from the state
+            // Get the latest buffer index from the state
             let buffer_idx = state.buffer_idx;
 
             // Register as reader BEFORE accessing buffer
@@ -186,8 +177,8 @@ impl ZeroCopySharedMessage {
                 continue;
             }
 
-            // Return guard with direct pointer to buffer (ZERO COPY)
-            return Some(ReadGuard::new(self, buffer_idx, state.sequence));
+            // Return guard with direct pointer to buffer
+            return Some(MessageReadGuard::new(self, buffer_idx, state.sequence));
         }
     }
 
@@ -272,7 +263,7 @@ impl ZeroCopySharedMessage {
 
     /// Publish a buffer that was written via WriteGuard.
     /// This is called by WriteGuard::publish().
-    pub(crate) fn publish_buffer(&self, buffer_idx: bool, size: usize) -> Option<u64> {
+    pub(crate) fn publish_buffer(&self, buffer_idx: bool, _writer_guard: WriterGuard<'_>, size: usize) -> Option<u64> {
         // Wait for readers to consume from the OLD read buffer (based on policy)
         // This happens BEFORE we publish, allowing writers to prepare the next message
         // concurrently while readers consume the current one (double buffering benefit).
@@ -333,11 +324,6 @@ impl ZeroCopySharedMessage {
                 return Some(new_seq);
             }
         }
-    }
-
-    /// Release the writer mutex. This is called by WriteGuard when it's dropped or published.
-    pub(crate) fn release_writer_mutex(&self) {
-        unsafe { self.writer_mutex.unlock() };
     }
 }
 

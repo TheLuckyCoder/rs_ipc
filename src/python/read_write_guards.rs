@@ -2,22 +2,22 @@ use std::ffi::c_int;
 use pyo3::{pyclass, pymethods, Bound, PyErr, PyRef, PyRefMut, PyResult, Python};
 use pyo3::exceptions::PyValueError;
 use pyo3::types::PyBytes;
-use crate::{ReadGuard, WriteGuard};
+use crate::{MessageReadGuard, MessageWriteGuard};
 
 /// Python wrapper for ReadGuard that implements the buffer protocol
 #[pyclass(module = "rs_ipc")]
 #[pyo3(name = "ReadGuard")]
 pub struct PythonReadGuard {
-    guard: Option<ReadGuard<'static>>,
+    guard: Option<MessageReadGuard<'static>>,
 }
 
 impl PythonReadGuard {
-    pub(crate) fn new(guard: ReadGuard<'_>) -> Self {
+    pub(crate) fn new(guard: MessageReadGuard<'_>) -> Self {
         // SAFETY: We're extending the lifetime here, but it's safe because:
         // 1. The ReadGuard holds a reference count on the buffer
         // 2. The buffer is in shared memory that persists beyond any single reference
         // 3. The guard will properly decrement the reference count when dropped
-        let guard = unsafe { std::mem::transmute::<ReadGuard<'_>, ReadGuard<'static>>(guard) };
+        let guard = unsafe { std::mem::transmute::<MessageReadGuard<'_>, MessageReadGuard<'static>>(guard) };
         Self { guard: Some(guard) }
     }
 }
@@ -92,16 +92,16 @@ impl PythonReadGuard {
 #[pyclass(module = "rs_ipc")]
 #[pyo3(name = "WriteGuard")]
 pub struct PythonWriteGuard {
-    guard: Option<WriteGuard<'static>>,
+    guard: Option<MessageWriteGuard<'static>>,
 }
 
 impl PythonWriteGuard {
-    pub(crate) fn new(guard: WriteGuard<'_>) -> Self {
+    pub(crate) fn new(guard: MessageWriteGuard<'_>) -> Self {
         // SAFETY: We're extending the lifetime here, but it's safe because:
         // 1. The WriteGuard holds exclusive access to the buffer
         // 2. The buffer is in shared memory that persists beyond any single reference
         // 3. The guard will properly publish or drop the buffer when done
-        let guard = unsafe { std::mem::transmute::<WriteGuard<'_>, WriteGuard<'static>>(guard) };
+        let guard = unsafe { std::mem::transmute::<MessageWriteGuard<'_>, MessageWriteGuard<'static>>(guard) };
         Self { guard: Some(guard) }
     }
 }

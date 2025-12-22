@@ -1,23 +1,25 @@
+use crate::zero_copy::message::WriterGuard;
 use crate::zero_copy::ZeroCopySharedMessage;
 
 /// RAII guard for zero-copy writes to shared memory.
 /// Provides mutable access to a buffer, ensuring proper publication
 /// and writer mutex release when dropped.
-pub struct WriteGuard<'a> {
+pub struct MessageWriteGuard<'a> {
     message: &'a ZeroCopySharedMessage,
+    guard: WriterGuard<'a>,
     buffer_idx: bool,
-    published: bool,
 }
 
-impl<'a> WriteGuard<'a> {
+impl<'a> MessageWriteGuard<'a> {
     pub(crate) fn new(
         message: &'a ZeroCopySharedMessage,
+        guard: WriterGuard<'a>,
         buffer_idx: bool,
     ) -> Self {
         Self {
             message,
+            guard,
             buffer_idx,
-            published: false,
         }
     }
     
@@ -34,29 +36,13 @@ impl<'a> WriteGuard<'a> {
     /// Publish the written data with the given size.
     /// Returns the new sequence number if successful, None if stopped.
     /// This consumes the guard, publishes the data atomically, and releases the writer mutex.
-    pub fn publish(mut self, size: usize) -> Option<u64> {
+    pub fn publish(self, size: usize) -> Option<u64> {
         if size > self.capacity() {
-            // Release mutex before returning
-            self.message.release_writer_mutex();
             return None;
         }
         
-        let result = self.message.publish_buffer(self.buffer_idx, size);
-        self.published = true;
-        
-        // Release the writer mutex after publishing
-        self.message.release_writer_mutex();
-        
-        result
-    }
-}
+        let result = self.message.publish_buffer(self.buffer_idx, self.guard, size);
 
-impl<'a> Drop for WriteGuard<'a> {
-    fn drop(&mut self) {
-        // If the guard is dropped without publishing, release the writer mutex
-        // The buffer won't be published and will be available for the next write
-        if !self.published {
-            self.message.release_writer_mutex();
-        }
+        result
     }
 }
