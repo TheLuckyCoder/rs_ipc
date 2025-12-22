@@ -75,8 +75,9 @@ impl ZeroCopySharedMessage {
         }
     }
 
-    /// Internal: Acquire a write buffer, waiting for readers to finish.
+    /// Internal: Acquire a write buffer, waiting for any active readers to finish.
     /// Returns the buffer index if successful, None if stopped.
+    /// This allows the writer to prepare the next message while readers consume the current one.
     fn acquire_write_buffer(&self) -> Option<u8> {
         if self.is_stopped() {
             return None;
@@ -87,7 +88,9 @@ impl ZeroCopySharedMessage {
         let read_idx = current_state.buffer_idx as usize;
         let write_idx = read_idx ^ 1;
 
-        // 2. Always wait for readers to finish with this buffer
+        // 2. Wait for active readers to finish with the write buffer
+        // (This ensures no readers are still accessing the old data in the buffer we're about to overwrite)
+        // This is necessary because the write buffer may still have readers from 2 writes ago
         while self.reader_counts[write_idx].load(Ordering::Acquire) > 0 {
             if self.is_stopped() {
                 return None;
@@ -95,23 +98,9 @@ impl ZeroCopySharedMessage {
             self.reader_done_futex.wait();
         }
 
-        // 3. Optionally wait for readers to consume from the other buffer (based on policy)
-        // Only wait if there's a previous message (sequence > 0)
-        let current_seq = self.get_state().sequence;
-        let target_count = self
-            .target_read_count
-            .load(Ordering::Relaxed)
-            .min(self.consumer_count.load(Ordering::Relaxed));
-        if target_count > 0 && current_seq > 0 {
-            let mut consumed = self.consumed_counts[read_idx].load(Ordering::Acquire);
-            while consumed < target_count {
-                if self.is_stopped() {
-                    return None;
-                }
-                self.reader_done_futex.wait();
-                consumed = self.consumed_counts[read_idx].load(Ordering::Acquire);
-            }
-        }
+        // Note: We do NOT wait for readers to consume from the read buffer here.
+        // That happens in publish_buffer(), allowing the writer to prepare the next
+        // message concurrently while readers consume the current one (double buffering).
 
         Some(write_idx as u8)
     }
@@ -281,6 +270,29 @@ impl ZeroCopySharedMessage {
     /// Publish a buffer that was written via WriteGuard.
     /// This is called by WriteGuard::publish().
     pub(crate) fn publish_buffer(&self, buffer_idx: u8, size: usize) -> Option<u64> {
+        // Wait for readers to consume from the OLD read buffer (based on policy)
+        // This happens BEFORE we publish, allowing writers to prepare the next message
+        // concurrently while readers consume the current one (double buffering benefit).
+        let current_state = self.get_state();
+        let old_read_idx = current_state.buffer_idx as usize;
+        let current_seq = current_state.sequence;
+        
+        // Only wait if there's a previous message to be consumed (sequence > 0)
+        let target_count = self
+            .target_read_count
+            .load(Ordering::Relaxed)
+            .min(self.consumer_count.load(Ordering::Relaxed));
+        if target_count > 0 && current_seq > 0 {
+            let mut consumed = self.consumed_counts[old_read_idx].load(Ordering::Acquire);
+            while consumed < target_count {
+                if self.is_stopped() {
+                    return None;
+                }
+                self.reader_done_futex.wait();
+                consumed = self.consumed_counts[old_read_idx].load(Ordering::Acquire);
+            }
+        }
+
         // Store the actual size
         self.data_sizes[buffer_idx as usize].store(size, Ordering::Release);
 
@@ -649,5 +661,41 @@ mod tests {
         // Old guards should still be valid
         assert_eq!(guard1_r1.data(), b"Message 1");
         assert_eq!(guard1_r2.data(), b"Message 1");
+    }
+
+    #[test]
+    fn concurrent_write_while_reading() {
+        // Test that the writer can write to the empty buffer while readers
+        // are still reading from the full buffer (double buffering benefit)
+        let memory = Arc::new(init("concurrent_write", 0)); // target_read_count = 0
+
+        // First write
+        memory.write(b"Message 1").unwrap();
+
+        // Reader starts reading (holds guard)
+        let guard1 = memory.try_read(0).unwrap();
+        assert_eq!(guard1.data(), b"Message 1");
+
+        // Writer should be able to write the second message WHILE reader holds guard1
+        // This demonstrates that writing to the empty buffer doesn't block on readers
+        // of the full buffer
+        let start = std::time::Instant::now();
+        let seq2 = memory.write(b"Message 2").unwrap();
+        let elapsed = start.elapsed();
+        
+        assert_eq!(seq2, 2);
+        // Writing should be very fast (< 10ms) since it doesn't wait for reader
+        assert!(elapsed.as_millis() < 10, "Write took too long: {:?}", elapsed);
+
+        // Reader 1 should still have Message 1
+        assert_eq!(guard1.data(), b"Message 1");
+
+        // New reader should get Message 2
+        let guard2 = memory.try_read(0).unwrap();
+        assert_eq!(guard2.data(), b"Message 2");
+
+        // Both guards should be valid simultaneously (double buffering)
+        assert_eq!(guard1.data(), b"Message 1");
+        assert_eq!(guard2.data(), b"Message 2");
     }
 }
