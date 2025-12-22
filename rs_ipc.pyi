@@ -248,13 +248,17 @@ class ZeroCopySharedMessage(object):
         :raises ValueError:
             - If this instance is not configured for writing
             
-        Example (truly zero-copy with pickletools):
+        Example (truly zero-copy with direct pickle.dump()):
             import pickle
-            import pickletools
             
             with shm.write_guard() as guard:
-                # Serialize directly to memoryview (truly zero-copy)
-                mv = memoryview(guard)
+                n = pickle.dump(my_object, guard)  # Writes directly to shared memory
+                guard.publish(n)
+        
+        Example (deprecated - use direct pickle.dump() instead):
+            import pickle
+            
+            with shm.write_guard() as guard:
                 # Use a file-like object that writes to memoryview
                 class MemoryViewWriter:
                     def __init__(self, mv):
@@ -266,7 +270,7 @@ class ZeroCopySharedMessage(object):
                         self.pos += n
                         return n
                 
-                writer = MemoryViewWriter(mv)
+                writer = MemoryViewWriter(memoryview(guard))
                 pickle.dump(my_object, writer)
                 guard.publish(writer.pos)
         
@@ -437,11 +441,17 @@ class WriteGuard(object):
     data to be written directly without an intermediate copy. The guard must
     call publish(size) to atomically make the data visible to readers.
     
-    Implements Python's buffer protocol with writable flag.
+    Implements Python's buffer protocol with writable flag and file-like
+    write() method for direct use with pickle.dump().
     
-    Example (truly zero-copy with file-like wrapper):
+    Example (truly zero-copy with direct pickle.dump()):
         import pickle
         
+        with shm.write_guard() as guard:
+            n = pickle.dump(my_object, guard)  # Writes directly to shared memory
+            guard.publish(n)
+    
+    Example (truly zero-copy with custom wrapper - deprecated, use write() method instead):
         class MemoryViewWriter:
             def __init__(self, mv):
                 self.mv = mv
@@ -496,6 +506,26 @@ class WriteGuard(object):
         Get the capacity of the write buffer.
         
         :returns: Maximum number of bytes that can be written
+        """
+        pass
+
+    def write(self, data: bytes) -> int:
+        """
+        Write bytes to the buffer (file-like interface).
+        
+        This enables using the guard directly with pickle.dump() without
+        needing a wrapper class:
+        
+        Example (truly zero-copy):
+            with shm.write_guard() as guard:
+                n = pickle.dump(obj, guard)  # Writes directly to shared memory
+                guard.publish(n)
+        
+        :param data: Bytes to write to the buffer
+        :returns: Number of bytes written
+        :raises ValueError: 
+            - If data is larger than buffer capacity
+            - If guard has been released or published
         """
         pass
 

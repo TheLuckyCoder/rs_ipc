@@ -778,4 +778,155 @@ mod tests {
         let final_seq = memory.current_sequence();
         assert_eq!(final_seq, num_writers as u64);
     }
+
+    #[cfg(feature = "nightly-features")]
+    mod bench {
+        extern crate test;
+        use super::*;
+        use test::Bencher;
+
+        fn get_test_data() -> Vec<u8> {
+            vec![42u8; 1024]
+        }
+
+        fn init(name: &str, target_read_count: u16) -> Arc<ZeroCopySharedMessageMapper> {
+            let c_name = std::ffi::CString::new(name).unwrap();
+            let size = ZeroCopySharedMessage::size_of_fields() + 1024 * 1024; // 1MB buffer
+            let mapper = ZeroCopySharedMessageMapper::create(c_name, size).unwrap();
+            mapper.set_target_read_count(target_read_count);
+            Arc::new(mapper)
+        }
+
+        #[bench]
+        fn pure_write(b: &mut Bencher) {
+            let data = std::hint::black_box(get_test_data());
+            let memory = init("zc_pure_write", 0);
+            b.iter(|| memory.write(&data));
+        }
+
+        #[bench]
+        fn pure_write_wait_all(b: &mut Bencher) {
+            let data = std::hint::black_box(get_test_data());
+            let memory = init("zc_pure_write_wait", u16::MAX);
+            b.iter(|| memory.write(&data));
+        }
+
+        #[bench]
+        fn write_no_wait_with_reader(b: &mut Bencher) {
+            let data = std::hint::black_box(get_test_data());
+            let memory = init("zc_write_with_reader", 0);
+            memory.add_reader();
+
+            let memory_clone = memory.clone();
+            thread::spawn(move || {
+                let mut last_seq = 0;
+                loop {
+                    if let Some(guard) = memory_clone.try_read(last_seq) {
+                        last_seq = guard.sequence();
+                        std::hint::black_box(guard.data());
+                        if last_seq > 1000 {
+                            break;
+                        }
+                    }
+                }
+            });
+
+            b.iter(|| memory.write(&data));
+
+            memory.stop();
+        }
+
+        #[bench]
+        fn write_and_read_same_thread(b: &mut Bencher) {
+            let data = std::hint::black_box(get_test_data());
+            let memory = init("zc_write_read_same", u16::MAX);
+            memory.add_reader();
+
+            b.iter(|| {
+                let seq = memory.write(&data).unwrap();
+                let guard = memory.try_read(seq - 1).unwrap();
+                std::hint::black_box(guard.data());
+            });
+
+            memory.stop();
+        }
+
+        #[bench]
+        fn write_with_write_guard(b: &mut Bencher) {
+            let data = std::hint::black_box(get_test_data());
+            let memory = init("zc_write_guard", 0);
+
+            b.iter(|| {
+                if let Some(mut guard) = memory.acquire_write_guard() {
+                    let buffer = guard.buffer_mut();
+                    buffer[..data.len()].copy_from_slice(&data);
+                    guard.publish(data.len());
+                }
+            });
+
+            memory.stop();
+        }
+
+        #[bench]
+        fn read_guard_creation(b: &mut Bencher) {
+            let data = get_test_data();
+            let memory = init("zc_read_guard", 0);
+            memory.add_reader();
+            
+            // Write initial data
+            memory.write(&data).unwrap();
+
+            b.iter(|| {
+                let guard = memory.try_read(0).unwrap();
+                std::hint::black_box(guard.data());
+            });
+
+            memory.stop();
+        }
+
+        fn write_multiple_readers(b: &mut Bencher, readers: u16) {
+            let data = std::hint::black_box(get_test_data());
+            let memory = init(&format!("zc_write_readers_{readers}"), u16::MAX);
+
+            for _ in 0..readers {
+                memory.add_reader();
+                let memory_clone = memory.clone();
+                thread::spawn(move || {
+                    let mut last_seq = 0;
+                    loop {
+                        if let Some(guard) = memory_clone.read(last_seq) {
+                            last_seq = guard.sequence();
+                            std::hint::black_box(guard.data());
+                            if last_seq > 1000 {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                });
+            }
+
+            thread::sleep(Duration::from_millis(100)); // Let readers start
+
+            b.iter(|| memory.write(&data));
+
+            memory.stop();
+        }
+
+        #[bench]
+        fn write_with_1_reader(b: &mut Bencher) {
+            write_multiple_readers(b, 1);
+        }
+
+        #[bench]
+        fn write_with_2_readers(b: &mut Bencher) {
+            write_multiple_readers(b, 2);
+        }
+
+        #[bench]
+        fn write_with_4_readers(b: &mut Bencher) {
+            write_multiple_readers(b, 4);
+        }
+    }
 }

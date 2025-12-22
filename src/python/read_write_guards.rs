@@ -1,7 +1,7 @@
 use std::ffi::c_int;
 use pyo3::{pyclass, pymethods, Bound, PyErr, PyRef, PyRefMut, PyResult, Python};
 use pyo3::exceptions::PyValueError;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyBytesMethods};
 use crate::{MessageReadGuard, MessageWriteGuard};
 
 /// Python wrapper for ReadGuard that implements the buffer protocol
@@ -173,5 +173,35 @@ impl PythonWriteGuard {
             .as_ref()
             .map(|g| g.capacity())
             .ok_or_else(|| PyValueError::new_err("Guard has been released"))
+    }
+
+    /// Write bytes to the buffer (file-like interface).
+    /// Returns the number of bytes written.
+    /// 
+    /// This enables using the guard directly with pickle.dump():
+    /// ```python
+    /// with shm.write_guard() as guard:
+    ///     n = pickle.dump(obj, guard)  # Writes directly to shared memory
+    ///     guard.publish(n)
+    /// ```
+    fn write<'py>(&mut self, data: Bound<'py, PyBytes>) -> PyResult<usize> {
+        let guard = self
+            .guard
+            .as_mut()
+            .ok_or_else(|| PyValueError::new_err("Guard has been released"))?;
+
+        let data_bytes = data.as_bytes();
+        let buffer = guard.buffer_mut();
+        
+        if data_bytes.len() > buffer.len() {
+            return Err(PyValueError::new_err(format!(
+                "Data too large: {} bytes, buffer capacity: {} bytes",
+                data_bytes.len(),
+                buffer.len()
+            )));
+        }
+
+        buffer[..data_bytes.len()].copy_from_slice(data_bytes);
+        Ok(data_bytes.len())
     }
 }
