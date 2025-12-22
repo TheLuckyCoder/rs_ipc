@@ -90,8 +90,7 @@ impl ZeroCopySharedMessage {
             if self.is_stopped() {
                 return None;
             }
-            let futex_val = self.reader_done_futex.load(Ordering::Relaxed);
-            self.reader_done_futex.wait(futex_val);
+            self.reader_done_futex.wait();
         }
         
         // 3. Optionally wait for readers to consume from the other buffer (based on policy)
@@ -107,8 +106,7 @@ impl ZeroCopySharedMessage {
                     if self.is_stopped() {
                         return None;
                     }
-                    let futex_val = self.writer_futex.load(Ordering::Relaxed);
-                    self.writer_futex.wait(futex_val);
+                    self.writer_futex.wait();
                     consumed = self.reader_counts[other_idx as usize].load(Ordering::Acquire);
                 }
             }
@@ -125,7 +123,7 @@ impl ZeroCopySharedMessage {
         
         // Write to buffer (this is the ONLY copy)
         let buffer = self.buffer_mut(write_idx);
-        let len = data.len().min(buffer.len());
+        let len = data.len().min(buffer.len()); // TODO panic
         buffer[..len].copy_from_slice(&data[..len]);
         
         // Publish the buffer
@@ -166,8 +164,7 @@ impl ZeroCopySharedMessage {
                     return None;
                 }
                 // Sleep until new data or stop
-                let futex_val = self.writer_futex.load(Ordering::Relaxed);
-                self.writer_futex.wait(futex_val);
+                self.writer_futex.wait();
                 continue;
             }
             

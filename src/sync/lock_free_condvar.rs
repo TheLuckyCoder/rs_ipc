@@ -9,8 +9,8 @@ pub struct LockFreeCondvar(Futex);
 impl LockFreeCondvar {
     /// Wait on the condition variable if the value matches the expected value
     #[inline]
-    pub fn wait(&self, expected: u32) {
-        futex_wait(&self.0, expected);
+    pub fn wait(&self) {
+        futex_wait(&self.0, self.0.load(Ordering::Relaxed));
     }
 
     /// Notify all threads waiting on this condition variable
@@ -18,12 +18,6 @@ impl LockFreeCondvar {
     pub fn notify_all(&self) {
         self.0.fetch_add(1, Ordering::Release);
         futex_wake_all(&self.0);
-    }
-
-    /// Load the current futex value for wait operations
-    #[inline]
-    pub fn load(&self, ordering: Ordering) -> u32 {
-        self.0.load(ordering)
     }
 }
 
