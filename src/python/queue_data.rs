@@ -35,3 +35,5 @@ impl SenderQueueData {
         unsafe { &*self.bytes }
     }
 }
+
+unsafe impl Send for SenderQueueData {}

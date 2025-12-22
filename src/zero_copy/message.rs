@@ -450,7 +450,6 @@ mod tests {
         // Try to write a third time - writer should wait for a buffer to be free
         let memory_clone = memory.clone();
         let handle = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(100));
             memory_clone.write(b"Third")
         });
         
