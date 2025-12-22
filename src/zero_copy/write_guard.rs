@@ -2,7 +2,7 @@ use crate::zero_copy::ZeroCopySharedMessage;
 
 /// RAII guard for zero-copy writes to shared memory.
 /// Provides mutable access to a buffer, ensuring proper publication
-/// when dropped.
+/// and writer mutex release when dropped.
 pub struct WriteGuard<'a> {
     message: &'a ZeroCopySharedMessage,
     buffer_idx: bool,
@@ -33,26 +33,30 @@ impl<'a> WriteGuard<'a> {
     
     /// Publish the written data with the given size.
     /// Returns the new sequence number if successful, None if stopped.
-    /// This consumes the guard and publishes the data atomically.
+    /// This consumes the guard, publishes the data atomically, and releases the writer mutex.
     pub fn publish(mut self, size: usize) -> Option<u64> {
         if size > self.capacity() {
+            // Release mutex before returning
+            self.message.release_writer_mutex();
             return None;
         }
         
         let result = self.message.publish_buffer(self.buffer_idx, size);
-        if result.is_some() {
-            self.published = true;
-        }
+        self.published = true;
+        
+        // Release the writer mutex after publishing
+        self.message.release_writer_mutex();
+        
         result
     }
 }
 
 impl<'a> Drop for WriteGuard<'a> {
     fn drop(&mut self) {
-        // If the guard is dropped without publishing, that's okay
+        // If the guard is dropped without publishing, release the writer mutex
         // The buffer won't be published and will be available for the next write
         if !self.published {
-            // Just drop without publishing
+            self.message.release_writer_mutex();
         }
     }
 }

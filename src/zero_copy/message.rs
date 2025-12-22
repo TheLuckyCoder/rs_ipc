@@ -1,5 +1,5 @@
 use crate::memory_mapper::{SharedMemoryMapper, SlicePtrCast};
-use crate::sync::LockFreeCondvar;
+use crate::sync::{FutexLock, LockFreeCondvar};
 use crate::zero_copy::{ReadGuard, WriteGuard};
 use std::ffi::c_void;
 use std::ptr::NonNull;
@@ -21,11 +21,11 @@ struct SequenceState {
 /// Zero-copy shared message with double buffering.
 ///
 /// # Concurrency Model
-/// - **Single Writer**: This implementation is designed for a single writer.
-///   Multiple concurrent writers will have undefined behavior due to races in
-///   buffer selection and reader count management.
+/// - **Multiple Writers**: Supports multiple concurrent writers through a write mutex.
+///   The mutex is acquired when obtaining a `WriteGuard` and released when the guard
+///   is published or dropped.
 /// - **Multiple Readers**: Supports multiple concurrent readers through
-///   per-buffer reference counting.
+///   per-buffer reference counting (completely lock-free for readers).
 ///
 /// # Memory Layout
 /// The structure uses bit packing to minimize header size:
@@ -50,6 +50,9 @@ pub struct ZeroCopySharedMessage<T: ?Sized = [u8]> {
     // Synchronization (lock-free condition variables)
     writer_futex: LockFreeCondvar, // Readers wait here for new data
     reader_done_futex: LockFreeCondvar, // Writer waits here for readers to finish
+
+    // Writer mutex (serializes multiple writers)
+    writer_mutex: FutexLock,
 
     // Buffer size (each buffer is half of remaining space)
     buffer_size: usize,
@@ -123,9 +126,20 @@ impl ZeroCopySharedMessage {
 
     /// Returns a WriteGuard that provides mutable access to a buffer.
     /// The buffer will be published when the guard's `publish()` method is called.
+    /// The writer mutex is acquired here and will be held until the guard is published or dropped.
     pub fn acquire_write_guard(&self) -> Option<WriteGuard<'_>> {
-        let write_idx = self.acquire_write_buffer()?;
-        Some(WriteGuard::new(self, write_idx))
+        // Acquire the writer mutex first (serializes multiple writers)
+        self.writer_mutex.lock();
+        
+        // Then acquire the write buffer
+        match self.acquire_write_buffer() {
+            Some(write_idx) => Some(WriteGuard::new(self, write_idx)),
+            None => {
+                // Failed to acquire buffer (stopped), release mutex
+                unsafe { self.writer_mutex.unlock() };
+                None
+            }
+        }
     }
 
     /// Try to read the next message without blocking.
@@ -319,6 +333,11 @@ impl ZeroCopySharedMessage {
                 return Some(new_seq);
             }
         }
+    }
+
+    /// Release the writer mutex. This is called by WriteGuard when it's dropped or published.
+    pub(crate) fn release_writer_mutex(&self) {
+        unsafe { self.writer_mutex.unlock() };
     }
 }
 
@@ -686,5 +705,69 @@ mod tests {
         // Both guards should be valid simultaneously (double buffering)
         assert_eq!(guard1.data(), b"Message 1");
         assert_eq!(guard2.data(), b"Message 2");
+    }
+
+    #[test]
+    fn multiple_writers() {
+        // Test that multiple writers are serialized by the writer mutex
+        let memory = Arc::new(init("multiple_writers", 0));
+        let num_writers = 5;
+        let writes_per_writer = 10;
+
+        // Spawn multiple writer threads
+        let handles: Vec<_> = (0..num_writers)
+            .map(|writer_id| {
+                let memory_clone = memory.clone();
+                thread::spawn(move || {
+                    for i in 0..writes_per_writer {
+                        let data = format!("Writer {} message {}", writer_id, i);
+                        memory_clone.write(data.as_bytes()).unwrap();
+                        // Small delay to increase chance of contention
+                        thread::sleep(Duration::from_micros(10));
+                    }
+                })
+            })
+            .collect();
+
+        // Wait for all writers to complete
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // All writes should have succeeded without data races
+        // The final sequence should be exactly num_writers * writes_per_writer
+        let final_seq = memory.current_sequence();
+        assert_eq!(final_seq, (num_writers * writes_per_writer) as u64);
+    }
+
+    #[test]
+    fn multiple_writers_with_write_guard() {
+        // Test that multiple writers using write_guard are serialized
+        let memory = Arc::new(init("multiple_writers_guard", 0));
+        let num_writers = 5;
+
+        // Spawn multiple writer threads using write_guard
+        let handles: Vec<_> = (0..num_writers)
+            .map(|writer_id| {
+                let memory_clone = memory.clone();
+                thread::spawn(move || {
+                    if let Some(mut guard) = memory_clone.acquire_write_guard() {
+                        let data = format!("Writer {} with guard", writer_id);
+                        let bytes = data.as_bytes();
+                        guard.buffer_mut()[..bytes.len()].copy_from_slice(bytes);
+                        guard.publish(bytes.len()).unwrap();
+                    }
+                })
+            })
+            .collect();
+
+        // Wait for all writers to complete
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // All writes should have succeeded
+        let final_seq = memory.current_sequence();
+        assert_eq!(final_seq, num_writers as u64);
     }
 }
