@@ -74,9 +74,9 @@ impl ZeroCopySharedMessage {
         }
     }
     
-    /// Write data to shared memory with zero-copy pattern.
-    /// Returns the new sequence number if successful, None if stopped.
-    pub fn write(&self, data: &[u8]) -> Option<u64> {
+    /// Internal: Acquire a write buffer, waiting for readers to finish.
+    /// Returns the buffer index if successful, None if stopped.
+    fn acquire_write_buffer(&self) -> Option<u8> {
         if self.is_stopped() {
             return None;
         }
@@ -114,89 +114,29 @@ impl ZeroCopySharedMessage {
             }
         }
         
-        // 4. Write to buffer (this is the ONLY copy)
+        Some(write_idx)
+    }
+    
+    /// Write data to shared memory with zero-copy pattern.
+    /// Returns the new sequence number if successful, None if stopped.
+    pub fn write(&self, data: &[u8]) -> Option<u64> {
+        // Acquire the write buffer
+        let write_idx = self.acquire_write_buffer()?;
+        
+        // Write to buffer (this is the ONLY copy)
         let buffer = self.buffer_mut(write_idx);
         let len = data.len().min(buffer.len());
         buffer[..len].copy_from_slice(&data[..len]);
-        self.data_sizes[write_idx as usize].store(len, Ordering::Release);
         
-        // 5. Reset reader count for the buffer we're about to publish
-        self.reader_counts[write_idx as usize].store(0, Ordering::Release);
-        
-        // 6. Atomically update: increment sequence, switch buffer, keep stopped flag
-        loop {
-            let old_packed = self.sequence_and_flags.load(Ordering::Acquire);
-            let old_seq = old_packed & SEQUENCE_MASK;
-            let stopped_flag = old_packed & STOPPED_BIT_MASK;
-            
-            // Check if stopped while we were preparing
-            if stopped_flag != 0 {
-                return None;
-            }
-            
-            let mut new_seq = (old_seq + 1) & SEQUENCE_MASK;
-            if new_seq == 0 {
-                new_seq = 1; // Skip 0 as it has special meaning
-            }
-            
-            let new_buffer_flag = if write_idx == 1 { BUFFER_IDX_BIT_MASK } else { 0 };
-            let new_packed = new_seq | new_buffer_flag | stopped_flag;
-            
-            // Try to atomically update
-            if self.sequence_and_flags
-                .compare_exchange(old_packed, new_packed, Ordering::Release, Ordering::Acquire)
-                .is_ok()
-            {
-                // 7. Wake readers
-                self.writer_futex.notify_all();
-                return Some(new_seq);
-            }
-            // If CAS failed, retry
-        }
+        // Publish the buffer
+        self.publish_buffer(write_idx, len)
     }
     
     /// Acquire a write guard for zero-copy writing.
     /// Returns a WriteGuard that provides mutable access to a buffer.
     /// The buffer will be published when the guard's `publish()` method is called.
     pub fn acquire_write_guard(&self) -> Option<WriteGuard<'_>> {
-        if self.is_stopped() {
-            return None;
-        }
-        
-        // 1. Determine which buffer to write to (the non-latest one)
-        let current_state = self.get_state();
-        let write_idx = 1 - current_state.buffer_idx;
-        
-        // 2. Always wait for readers to finish with this buffer
-        while self.reader_counts[write_idx as usize].load(Ordering::Acquire) > 0 {
-            if self.is_stopped() {
-                return None;
-            }
-            let futex_val = self.reader_done_futex.load(Ordering::Relaxed);
-            self.reader_done_futex.wait(futex_val);
-        }
-        
-        // 3. Optionally wait for readers to consume from the other buffer (based on policy)
-        let target_count = self.target_read_count.load(Ordering::Relaxed);
-        if target_count > 0 {
-            let other_idx = write_idx ^ 1;
-            let consumer_count = self.consumer_count.load(Ordering::Relaxed);
-            let effective_target = target_count.min(consumer_count);
-            
-            if effective_target > 0 {
-                let mut consumed = self.reader_counts[other_idx as usize].load(Ordering::Acquire);
-                while consumed < effective_target as u32 {
-                    if self.is_stopped() {
-                        return None;
-                    }
-                    let futex_val = self.writer_futex.load(Ordering::Relaxed);
-                    self.writer_futex.wait(futex_val);
-                    consumed = self.reader_counts[other_idx as usize].load(Ordering::Acquire);
-                }
-            }
-        }
-        
-        // Return the guard with access to the buffer
+        let write_idx = self.acquire_write_buffer()?;
         Some(WriteGuard::new(self, write_idx))
     }
     
