@@ -1,6 +1,7 @@
 use crate::memory_mapper::{SharedMemoryMapper, SlicePtrCast};
 use crate::sync::{LockFreeCondvar, SharedMutex, SharedMutexGuard};
 use crate::zero_copy::{MessageReadGuard, MessageWriteGuard};
+use std::cell::UnsafeCell;
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
@@ -61,7 +62,8 @@ pub struct ZeroCopySharedMessage<T: ?Sized = [u8]> {
     buffer_size: usize,
 
     // Double buffers follow the header in memory
-    buffers: T,
+    // Wrapped in UnsafeCell to allow interior mutability (required for sound *const to *mut cast)
+    buffers: UnsafeCell<T>,
 }
 
 impl ZeroCopySharedMessage {
@@ -160,14 +162,21 @@ impl ZeroCopySharedMessage {
     pub(crate) fn buffer(&self, buffer_idx: BufferIndex) -> &[u8] {
         let offset = if buffer_idx { self.buffer_size } else { 0 };
         let size = self.data_sizes[buffer_idx as usize].load(Ordering::Acquire);
-        &self.buffers[offset..offset + size]
+        unsafe {
+            let buffers = &*self.buffers.get();
+            &buffers[offset..offset + size]
+        }
     }
 
     /// Get a mutable reference to a specific buffer (for writing).
+    /// SAFETY: This is safe because:
+    /// 1. The buffers are behind UnsafeCell, which allows interior mutability
+    /// 2. The writer mutex ensures only one writer accesses this buffer at a time
+    /// 3. The reference counting ensures no readers access this buffer while being written
     pub(crate) fn buffer_mut(&self, buffer_idx: BufferIndex) -> &mut [u8] {
         let offset = buffer_idx as usize * self.buffer_size;
         unsafe {
-            let ptr = self.buffers.as_ptr().add(offset) as *mut u8;
+            let ptr = (*self.buffers.get()).as_mut_ptr().add(offset);
             std::slice::from_raw_parts_mut(ptr, self.buffer_size)
         }
     }
@@ -367,6 +376,13 @@ unsafe impl SlicePtrCast for ZeroCopySharedMessage {
         Some(msg)
     }
 }
+
+// SAFETY: ZeroCopySharedMessage is safe to share across threads because:
+// 1. All mutable access to buffers is protected by the writer mutex (serializes writers)
+// 2. Reader access is protected by reference counting (ensures no concurrent read/write)
+// 3. The UnsafeCell is only used to enable interior mutability for the buffer data,
+//    and all access is properly synchronized through atomics and the writer mutex
+unsafe impl<T: ?Sized> Sync for ZeroCopySharedMessage<T> {}
 
 pub type ZeroCopySharedMessageMapper = SharedMemoryMapper<ZeroCopySharedMessage>;
 
