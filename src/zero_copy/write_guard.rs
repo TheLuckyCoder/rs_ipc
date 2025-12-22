@@ -5,14 +5,14 @@ use crate::zero_copy::ZeroCopySharedMessage;
 /// when dropped.
 pub struct WriteGuard<'a> {
     message: &'a ZeroCopySharedMessage,
-    buffer_idx: u8,
+    buffer_idx: bool,
     published: bool,
 }
 
 impl<'a> WriteGuard<'a> {
     pub(crate) fn new(
         message: &'a ZeroCopySharedMessage,
-        buffer_idx: u8,
+        buffer_idx: bool,
     ) -> Self {
         Self {
             message,

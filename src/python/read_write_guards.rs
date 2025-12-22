@@ -25,7 +25,7 @@ impl PythonReadGuard {
 #[pymethods]
 impl PythonReadGuard {
     fn __len__(&self) -> usize {
-        self.guard.as_ref().map(|g| g.len()).unwrap_or(0)
+        self.guard.as_ref().map(|g| g.data().len()).unwrap_or(0)
     }
 
     fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {

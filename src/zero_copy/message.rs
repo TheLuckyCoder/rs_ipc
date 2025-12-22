@@ -15,7 +15,7 @@ const SEQUENCE_MASK: u64 = !(STOPPED_BIT_MASK | BUFFER_IDX_BIT_MASK);
 struct SequenceState {
     sequence: u64,
     stopped: bool,
-    buffer_idx: u8,
+    buffer_idx: bool,
 }
 
 /// Zero-copy shared message with double buffering.
@@ -71,41 +71,36 @@ impl ZeroCopySharedMessage {
         SequenceState {
             sequence: packed & SEQUENCE_MASK,
             stopped: (packed & STOPPED_BIT_MASK) != 0,
-            buffer_idx: ((packed & BUFFER_IDX_BIT_MASK) >> 62) as u8,
+            buffer_idx: ((packed & BUFFER_IDX_BIT_MASK) >> 62) != 0,
         }
     }
 
     /// Internal: Acquire a write buffer, waiting for any active readers to finish.
     /// Returns the buffer index if successful, None if stopped.
     /// This allows the writer to prepare the next message while readers consume the current one.
-    fn acquire_write_buffer(&self) -> Option<u8> {
+    fn acquire_write_buffer(&self) -> Option<bool> {
         if self.is_stopped() {
             return None;
         }
 
         // 1. Determine which buffer to write to (the non-latest one)
         let current_state = self.get_state();
-        let read_idx = current_state.buffer_idx as usize;
-        let write_idx = read_idx ^ 1;
+        let read_idx = current_state.buffer_idx;
+        let write_idx = !read_idx;
 
         // 2. Wait for active readers to finish with the write buffer
         // (This ensures no readers are still accessing the old data in the buffer we're about to overwrite)
         // This is necessary because the write buffer may still have readers from 2 writes ago
-        while self.reader_counts[write_idx].load(Ordering::Acquire) > 0 {
+        while self.reader_counts[write_idx as usize].load(Ordering::Acquire) > 0 {
             if self.is_stopped() {
                 return None;
             }
             self.reader_done_futex.wait();
         }
 
-        // Note: We do NOT wait for readers to consume from the read buffer here.
-        // That happens in publish_buffer(), allowing the writer to prepare the next
-        // message concurrently while readers consume the current one (double buffering).
-
-        Some(write_idx as u8)
+        Some(write_idx)
     }
 
-    /// Write data to shared memory with zero-copy pattern.
     /// Returns the new sequence number if successful, None if stopped.
     pub fn write(&self, data: &[u8]) -> Option<u64> {
         // Acquire the write buffer
@@ -126,7 +121,6 @@ impl ZeroCopySharedMessage {
         self.publish_buffer(write_idx, data.len())
     }
 
-    /// Acquire a write guard for zero-copy writing.
     /// Returns a WriteGuard that provides mutable access to a buffer.
     /// The buffer will be published when the guard's `publish()` method is called.
     pub fn acquire_write_guard(&self) -> Option<WriteGuard<'_>> {
@@ -184,7 +178,7 @@ impl ZeroCopySharedMessage {
     }
 
     /// Release a reader reference for the given buffer index.
-    pub(crate) fn release_reader(&self, buffer_idx: u8) {
+    pub(crate) fn release_reader(&self, buffer_idx: bool) {
         self.reader_counts[buffer_idx as usize].fetch_sub(1, Ordering::AcqRel);
 
         // Increment consumed count to signal that this reader has finished
@@ -246,20 +240,15 @@ impl ZeroCopySharedMessage {
         self.buffer_size
     }
 
-    /// Get the data size for a specific buffer.
-    pub(crate) fn data_size(&self, buffer_idx: u8) -> usize {
-        self.data_sizes[buffer_idx as usize].load(Ordering::Acquire)
-    }
-
     /// Get a reference to a specific buffer.
-    pub(crate) fn buffer(&self, buffer_idx: u8) -> &[u8] {
-        let offset = buffer_idx as usize * self.buffer_size;
-        let size = self.data_size(buffer_idx);
+    pub(crate) fn buffer(&self, buffer_idx: bool) -> &[u8] {
+        let offset = if buffer_idx { self.buffer_size } else { 0 };
+        let size = self.data_sizes[buffer_idx as usize].load(Ordering::Acquire);
         &self.buffers[offset..offset + size]
     }
 
     /// Get a mutable reference to a specific buffer (for writing).
-    pub(crate) fn buffer_mut(&self, buffer_idx: u8) -> &mut [u8] {
+    pub(crate) fn buffer_mut(&self, buffer_idx: bool) -> &mut [u8] {
         let offset = buffer_idx as usize * self.buffer_size;
         unsafe {
             let ptr = self.buffers.as_ptr().add(offset) as *mut u8;
@@ -269,14 +258,14 @@ impl ZeroCopySharedMessage {
 
     /// Publish a buffer that was written via WriteGuard.
     /// This is called by WriteGuard::publish().
-    pub(crate) fn publish_buffer(&self, buffer_idx: u8, size: usize) -> Option<u64> {
+    pub(crate) fn publish_buffer(&self, buffer_idx: bool, size: usize) -> Option<u64> {
         // Wait for readers to consume from the OLD read buffer (based on policy)
         // This happens BEFORE we publish, allowing writers to prepare the next message
         // concurrently while readers consume the current one (double buffering benefit).
         let current_state = self.get_state();
         let old_read_idx = current_state.buffer_idx as usize;
         let current_seq = current_state.sequence;
-        
+
         // Only wait if there's a previous message to be consumed (sequence > 0)
         let target_count = self
             .target_read_count
@@ -316,11 +305,7 @@ impl ZeroCopySharedMessage {
                 new_seq = 1; // Skip 0 as it has special meaning
             }
 
-            let new_buffer_flag = if buffer_idx == 1 {
-                BUFFER_IDX_BIT_MASK
-            } else {
-                0
-            };
+            let new_buffer_flag = if buffer_idx { BUFFER_IDX_BIT_MASK } else { 0 };
             let new_packed = new_seq | new_buffer_flag | stopped_flag;
 
             // Try to atomically update
@@ -682,10 +667,14 @@ mod tests {
         let start = std::time::Instant::now();
         let seq2 = memory.write(b"Message 2").unwrap();
         let elapsed = start.elapsed();
-        
+
         assert_eq!(seq2, 2);
         // Writing should be very fast (< 10ms) since it doesn't wait for reader
-        assert!(elapsed.as_millis() < 10, "Write took too long: {:?}", elapsed);
+        assert!(
+            elapsed.as_millis() < 10,
+            "Write took too long: {:?}",
+            elapsed
+        );
 
         // Reader 1 should still have Message 1
         assert_eq!(guard1.data(), b"Message 1");

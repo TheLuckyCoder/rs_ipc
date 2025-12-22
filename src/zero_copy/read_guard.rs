@@ -5,14 +5,14 @@ use crate::zero_copy::ZeroCopySharedMessage;
 /// while being read.
 pub struct ReadGuard<'a> {
     message: &'a ZeroCopySharedMessage,
-    buffer_idx: u8,
+    buffer_idx: bool,
     sequence: u64,
 }
 
 impl<'a> ReadGuard<'a> {
     pub(crate) fn new(
         message: &'a ZeroCopySharedMessage,
-        buffer_idx: u8,
+        buffer_idx: bool,
         sequence: u64,
     ) -> Self {
         Self {
@@ -30,16 +30,6 @@ impl<'a> ReadGuard<'a> {
     /// Get the data as a byte slice (zero-copy access to shared memory).
     pub fn data(&self) -> &[u8] {
         self.message.buffer(self.buffer_idx)
-    }
-    
-    /// Get the length of the data.
-    pub fn len(&self) -> usize {
-        self.message.data_size(self.buffer_idx)
-    }
-    
-    /// Check if the data is empty.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 }
 
