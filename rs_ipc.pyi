@@ -229,7 +229,34 @@ class ZeroCopySharedMessage(object):
         """
         pass
 
-    def read(self, block: bool = True) -> 'ReadGuard | None':
+    def write_guard(self) -> 'WriteGuard | None':
+        """
+        Acquire a write guard for zero-copy writing.
+        
+        Returns a WriteGuard that provides mutable memoryview access to the write buffer.
+        This eliminates the copy from Python bytes into shared memory, allowing direct
+        serialization into the buffer (e.g., pickle.dump() directly).
+        
+        The guard must call publish(size) to atomically publish the written data,
+        or the data will be discarded when the guard is dropped.
+        
+        This function releases the GIL while waiting for the buffer to become available.
+        
+        :returns:
+            - A `WriteGuard` for zero-copy writing, or
+            - ``None`` if the shared memory has been stopped
+        :raises ValueError:
+            - If this instance is not configured for writing
+            
+        Example:
+            with shm.write_guard() as buf:
+                data = pickle.dumps(obj)
+                buf[:len(data)] = data
+                buf.publish(len(data))
+        """
+        pass
+
+    def read_guard(self, block: bool = True) -> 'ReadGuard | None':
         """
         Read the next message with zero-copy access.
         
@@ -249,7 +276,7 @@ class ZeroCopySharedMessage(object):
             - If this instance is not configured for reading
             
         Example:
-            with shm.read() as buf:
+            with shm.read_guard() as buf:
                 obj = pickle.loads(buf)
                 # Process obj here while holding the guard
         """
@@ -376,6 +403,63 @@ class ReadGuard(object):
         Copy the message data to a Python bytes object.
         
         :returns: A copy of the message as bytes
+        """
+        pass
+
+
+class WriteGuard(object):
+    """
+    RAII guard for zero-copy write access to shared memory.
+    
+    This guard provides mutable access to a shared memory buffer, allowing
+    data to be written directly without an intermediate copy. The guard must
+    call publish(size) to atomically make the data visible to readers.
+    
+    Implements Python's buffer protocol with writable flag:
+        guard = shm.write_guard()
+        mv = memoryview(guard)  # Mutable memoryview
+        pickle.dump(obj, mv)     # Write directly
+        guard.publish(len(data)) # Publish atomically
+    
+    Context manager usage (recommended):
+        with shm.write_guard() as buf:
+            data = pickle.dumps(obj)
+            memoryview(buf)[:len(data)] = data
+            buf.publish(len(data))
+    """
+
+    def __enter__(self) -> 'WriteGuard':
+        """Enter context manager."""
+        pass
+
+    def __exit__(self, exc_type, exc_value, traceback) -> bool:
+        """Exit context manager. Data is discarded if not published."""
+        pass
+
+    def __len__(self) -> int:
+        """Get the capacity of the write buffer in bytes."""
+        pass
+
+    def publish(self, size: int) -> int | None:
+        """
+        Publish the written data with the given size.
+        
+        This consumes the guard and atomically makes the data visible to readers.
+        Must be called exactly once before the guard is dropped.
+        
+        :param size: Number of bytes written (must be <= capacity())
+        :returns:
+            - The sequence number of the published message
+            - ``None`` if the shared memory has been stopped
+        :raises ValueError: If size > capacity() or guard already published/released
+        """
+        pass
+
+    def capacity(self) -> int:
+        """
+        Get the capacity of the write buffer.
+        
+        :returns: Maximum number of bytes that can be written
         """
         pass
 

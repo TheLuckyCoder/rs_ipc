@@ -1,7 +1,7 @@
 use crate::python::bytes::RustPyBytes;
 use crate::python::operation_mode::OperationMode;
 use crate::python::reader_wait_policy::ReaderWaitPolicy;
-use crate::zero_copy::{ReadGuard, ZeroCopySharedMessage, ZeroCopySharedMessageMapper};
+use crate::zero_copy::{ReadGuard, WriteGuard, ZeroCopySharedMessage, ZeroCopySharedMessageMapper};
 use pyo3::exceptions::PyValueError;
 use pyo3::types::{PyBytes, PyBytesMethods};
 use pyo3::{pyclass, pymethods, Bound, PyErr, PyRef, PyRefMut, PyResult, Python};
@@ -70,8 +70,16 @@ impl PythonZeroCopySharedMessage {
         Ok(py.detach(|| self.shared_memory.write(data_bytes)))
     }
 
+    fn write_guard(&self, py: Python<'_>) -> PyResult<Option<PythonWriteGuard>> {
+        self.op_mode.check_write_permission();
+
+        let guard = py.detach(|| self.shared_memory.acquire_write_guard());
+
+        Ok(guard.map(PythonWriteGuard::new))
+    }
+
     #[pyo3(signature = (block = true))]
-    fn read(&self, block: bool, py: Python<'_>) -> PyResult<Option<PythonReadGuard>> {
+    fn read_guard(&self, block: bool, py: Python<'_>) -> PyResult<Option<PythonReadGuard>> {
         self.op_mode.check_read_permission();
 
         let last_seq = self.last_read_sequence.load(Ordering::Relaxed);
@@ -248,5 +256,92 @@ impl PythonReadGuard {
             .as_ref()
             .ok_or_else(|| PyValueError::new_err("Guard has been released"))?;
         Ok(PyBytes::new(py, guard.data()))
+    }
+}
+
+/// Python wrapper for WriteGuard that implements the buffer protocol
+#[pyclass(module = "rs_ipc")]
+pub struct PythonWriteGuard {
+    guard: Option<WriteGuard<'static>>,
+}
+
+impl PythonWriteGuard {
+    fn new(guard: WriteGuard<'_>) -> Self {
+        // SAFETY: We're extending the lifetime here, but it's safe because:
+        // 1. The WriteGuard holds exclusive access to the buffer
+        // 2. The buffer is in shared memory that persists beyond any single reference
+        // 3. The guard will properly publish or drop the buffer when done
+        let guard = unsafe { std::mem::transmute::<WriteGuard<'_>, WriteGuard<'static>>(guard) };
+        Self { guard: Some(guard) }
+    }
+}
+
+#[pymethods]
+impl PythonWriteGuard {
+    fn __len__(&self) -> usize {
+        self.guard.as_ref().map(|g| g.capacity()).unwrap_or(0)
+    }
+
+    fn __enter__(slf: PyRefMut<'_, Self>) -> PyRefMut<'_, Self> {
+        slf
+    }
+
+    fn __exit__(
+        mut slf: PyRefMut<'_, Self>,
+        _exc_type: Option<&Bound<'_, pyo3::types::PyAny>>,
+        _exc_value: Option<&Bound<'_, pyo3::types::PyAny>>,
+        _traceback: Option<&Bound<'_, pyo3::types::PyAny>>,
+    ) -> PyResult<bool> {
+        // Drop the guard without publishing if user didn't call publish()
+        drop(slf.guard.take());
+        Ok(false)
+    }
+
+    unsafe fn __getbuffer__(
+        mut slf: PyRefMut<Self>,
+        view: *mut pyo3::ffi::Py_buffer,
+        flags: c_int,
+    ) -> PyResult<()> {
+        let guard = slf
+            .guard
+            .as_mut()
+            .ok_or_else(|| PyValueError::new_err("Guard has been released"))?;
+
+        let data = guard.buffer_mut();
+        let data_ptr = data.as_mut_ptr();
+        let data_len = data.len();
+        
+        let ret = pyo3::ffi::PyBuffer_FillInfo(
+            view,
+            slf.as_ptr() as *mut _,
+            data_ptr as *mut _,
+            data_len.try_into()?,
+            0, // writable
+            flags,
+        );
+        if ret == -1 {
+            return Err(PyErr::fetch(slf.py()));
+        }
+        Ok(())
+    }
+
+    unsafe fn __releasebuffer__(&self, _view: *mut pyo3::ffi::Py_buffer) {}
+
+    /// Publish the written data with the given size.
+    /// Returns the sequence number if successful, None if stopped.
+    fn publish(mut slf: PyRefMut<'_, Self>, size: usize) -> PyResult<Option<u64>> {
+        let guard = slf
+            .guard
+            .take()
+            .ok_or_else(|| PyValueError::new_err("Guard has already been published or released"))?;
+        Ok(guard.publish(size))
+    }
+
+    /// Get the capacity of the write buffer
+    fn capacity(&self) -> PyResult<usize> {
+        self.guard
+            .as_ref()
+            .map(|g| g.capacity())
+            .ok_or_else(|| PyValueError::new_err("Guard has been released"))
     }
 }
