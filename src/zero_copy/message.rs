@@ -123,11 +123,17 @@ impl ZeroCopySharedMessage {
         
         // Write to buffer (this is the ONLY copy)
         let buffer = self.buffer_mut(write_idx);
-        let len = data.len().min(buffer.len()); // TODO panic
-        buffer[..len].copy_from_slice(&data[..len]);
+        if data.len() > buffer.len() {
+            panic!(
+                "Data size ({} bytes) exceeds buffer capacity ({} bytes)",
+                data.len(),
+                buffer.len()
+            );
+        }
+        buffer[..data.len()].copy_from_slice(data);
         
         // Publish the buffer
-        self.publish_buffer(write_idx, len)
+        self.publish_buffer(write_idx, data.len())
     }
     
     /// Acquire a write guard for zero-copy writing.

@@ -235,7 +235,7 @@ class ZeroCopySharedMessage(object):
         
         Returns a WriteGuard that provides mutable memoryview access to the write buffer.
         This eliminates the copy from Python bytes into shared memory, allowing direct
-        serialization into the buffer (e.g., pickle.dump() directly).
+        serialization into the buffer.
         
         The guard must call publish(size) to atomically publish the written data,
         or the data will be discarded when the guard is dropped.
@@ -248,11 +248,33 @@ class ZeroCopySharedMessage(object):
         :raises ValueError:
             - If this instance is not configured for writing
             
-        Example:
-            with shm.write_guard() as buf:
-                data = pickle.dumps(obj)
-                buf[:len(data)] = data
-                buf.publish(len(data))
+        Example (truly zero-copy with pickletools):
+            import pickle
+            import pickletools
+            
+            with shm.write_guard() as guard:
+                # Serialize directly to memoryview (truly zero-copy)
+                mv = memoryview(guard)
+                # Use a file-like object that writes to memoryview
+                class MemoryViewWriter:
+                    def __init__(self, mv):
+                        self.mv = mv
+                        self.pos = 0
+                    def write(self, data):
+                        n = len(data)
+                        self.mv[self.pos:self.pos+n] = data
+                        self.pos += n
+                        return n
+                
+                writer = MemoryViewWriter(mv)
+                pickle.dump(my_object, writer)
+                guard.publish(writer.pos)
+        
+        Example (simpler but has one intermediate copy):
+            with shm.write_guard() as guard:
+                data = pickle.dumps(obj)  # Creates bytes object (one copy)
+                memoryview(guard)[:len(data)] = data  # Copies to shared memory
+                guard.publish(len(data))
         """
         pass
 
@@ -415,17 +437,31 @@ class WriteGuard(object):
     data to be written directly without an intermediate copy. The guard must
     call publish(size) to atomically make the data visible to readers.
     
-    Implements Python's buffer protocol with writable flag:
-        guard = shm.write_guard()
-        mv = memoryview(guard)  # Mutable memoryview
-        pickle.dump(obj, mv)     # Write directly
-        guard.publish(len(data)) # Publish atomically
+    Implements Python's buffer protocol with writable flag.
     
-    Context manager usage (recommended):
-        with shm.write_guard() as buf:
+    Example (truly zero-copy with file-like wrapper):
+        import pickle
+        
+        class MemoryViewWriter:
+            def __init__(self, mv):
+                self.mv = mv
+                self.pos = 0
+            def write(self, data):
+                n = len(data)
+                self.mv[self.pos:self.pos+n] = data
+                self.pos += n
+                return n
+        
+        with shm.write_guard() as guard:
+            writer = MemoryViewWriter(memoryview(guard))
+            pickle.dump(my_object, writer)
+            guard.publish(writer.pos)
+    
+    Example (simpler but has one intermediate copy):
+        with shm.write_guard() as guard:
             data = pickle.dumps(obj)
-            memoryview(buf)[:len(data)] = data
-            buf.publish(len(data))
+            memoryview(guard)[:len(data)] = data
+            guard.publish(len(data))
     """
 
     def __enter__(self) -> 'WriteGuard':
