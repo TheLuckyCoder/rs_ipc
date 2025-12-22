@@ -1,12 +1,13 @@
 use crate::python::message::PythonSharedMessage;
 use crate::python::operation_mode::OperationMode;
 use crate::python::reader_wait_policy::ReaderWaitPolicy;
-use crate::python::zero_copy_message::{PythonReadGuard, PythonZeroCopySharedMessage};
 use bytes::RustPyBytes;
 use pyo3::prelude::*;
 use pyo3::types::PyFunction;
 use pyo3::{pymodule, Bound, PyResult};
 use rayon::prelude::*;
+use crate::python::read_write_guards::{PythonReadGuard, PythonWriteGuard};
+use crate::python::zero_copy_message::PythonZeroCopySharedMessage;
 
 mod bytes;
 mod message;
@@ -14,6 +15,7 @@ mod operation_mode;
 mod queue_data;
 mod reader_wait_policy;
 mod zero_copy_message;
+mod read_write_guards;
 
 #[pymodule(gil_used = false)]
 fn rs_ipc(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -23,6 +25,7 @@ fn rs_ipc(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PythonSharedMessage>()?;
     m.add_class::<PythonZeroCopySharedMessage>()?;
     m.add_class::<PythonReadGuard>()?;
+    m.add_class::<PythonWriteGuard>()?;
 
     m.add_function(wrap_pyfunction!(read_all, m)?)?;
     m.add_function(wrap_pyfunction!(read_all_map, m)?)?;
