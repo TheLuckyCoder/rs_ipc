@@ -40,7 +40,8 @@ pub struct ZeroCopySharedMessage<T: ?Sized = [u8]> {
     data_sizes: [AtomicUsize; 2],
     
     // Reader tracking (per buffer)
-    reader_counts: [AtomicU32; 2],
+    reader_counts: [AtomicU32; 2],     // Active readers (reference count)
+    consumed_counts: [AtomicU32; 2],   // Total readers that have consumed (finished reading)
     
     // Synchronization (lock-free condition variables)
     writer_futex: LockFreeCondvar,     // Readers wait here for new data
@@ -94,20 +95,22 @@ impl ZeroCopySharedMessage {
         }
         
         // 3. Optionally wait for readers to consume from the other buffer (based on policy)
+        // Only wait if there's a previous message (sequence > 0)
+        let current_seq = self.get_state().sequence;
         let target_count = self.target_read_count.load(Ordering::Relaxed);
-        if target_count > 0 {
+        if target_count > 0 && current_seq > 0 {
             let other_idx = write_idx ^ 1;
             let consumer_count = self.consumer_count.load(Ordering::Relaxed);
             let effective_target = target_count.min(consumer_count);
             
             if effective_target > 0 {
-                let mut consumed = self.reader_counts[other_idx as usize].load(Ordering::Acquire);
+                let mut consumed = self.consumed_counts[other_idx as usize].load(Ordering::Acquire);
                 while consumed < effective_target as u32 {
                     if self.is_stopped() {
                         return None;
                     }
-                    self.writer_futex.wait();
-                    consumed = self.reader_counts[other_idx as usize].load(Ordering::Acquire);
+                    self.reader_done_futex.wait();
+                    consumed = self.consumed_counts[other_idx as usize].load(Ordering::Acquire);
                 }
             }
         }
@@ -195,12 +198,13 @@ impl ZeroCopySharedMessage {
     
     /// Release a reader reference for the given buffer index.
     pub(crate) fn release_reader(&self, buffer_idx: u8) {
-        let old_count = self.reader_counts[buffer_idx as usize].fetch_sub(1, Ordering::AcqRel);
+        self.reader_counts[buffer_idx as usize].fetch_sub(1, Ordering::AcqRel);
         
-        // If we were the last reader on this buffer, wake any waiting writer
-        if old_count == 1 {
-            self.reader_done_futex.notify_all();
-        }
+        // Increment consumed count to signal that this reader has finished
+        self.consumed_counts[buffer_idx as usize].fetch_add(1, Ordering::AcqRel);
+        
+        // Wake any waiting writer (either waiting for buffer to be free or for consumption target)
+        self.reader_done_futex.notify_all();
     }
     
     /// Get the current sequence number.
@@ -281,8 +285,9 @@ impl ZeroCopySharedMessage {
         // Store the actual size
         self.data_sizes[buffer_idx as usize].store(size, Ordering::Release);
         
-        // Reset reader count for the buffer we're about to publish
+        // Reset reader count and consumed count for the buffer we're about to publish
         self.reader_counts[buffer_idx as usize].store(0, Ordering::Release);
+        self.consumed_counts[buffer_idx as usize].store(0, Ordering::Release);
         
         // Atomically update: increment sequence, switch buffer, keep stopped flag
         loop {
@@ -513,6 +518,141 @@ mod tests {
         // Both guards should be valid
         assert_eq!(guard1.data(), b"Message 1");
         assert_eq!(guard2.data(), b"Message 2");
+    }
+
+    #[test]
+    fn target_read_count_wait_for_one() {
+        let memory = Arc::new(init("target_read_count_one", 1));
+        memory.add_reader(); // Register 1 reader
+        
+        // First write
+        memory.write(b"Message 1").unwrap();
+        
+        // Reader 1 reads the message
+        let guard1 = memory.try_read(0).unwrap();
+        assert_eq!(guard1.data(), b"Message 1");
+        
+        // Start a second write in a separate thread
+        let memory_clone = memory.clone();
+        let handle = thread::spawn(move || {
+            memory_clone.write(b"Message 2")
+        });
+        
+        // Give the writer time to start waiting
+        thread::sleep(Duration::from_millis(50));
+        
+        // The writer should be blocked waiting for reader to finish
+        // Now drop the guard to signal reader has consumed
+        drop(guard1);
+        
+        // Writer should complete
+        let seq2 = handle.join().unwrap().unwrap();
+        assert_eq!(seq2, 2);
+        
+        // Verify second message
+        let guard2 = memory.try_read(1).unwrap();
+        assert_eq!(guard2.data(), b"Message 2");
+    }
+
+    #[test]
+    fn target_read_count_wait_for_all() {
+        let memory = Arc::new(init("target_read_count_all", u16::MAX)); // Wait for all
+        memory.add_reader();
+        memory.add_reader(); // Register 2 readers
+        
+        // First write
+        memory.write(b"Message 1").unwrap();
+        
+        // Both readers read the message
+        let guard1_r1 = memory.try_read(0).unwrap();
+        let guard1_r2 = memory.try_read(0).unwrap();
+        assert_eq!(guard1_r1.data(), b"Message 1");
+        assert_eq!(guard1_r2.data(), b"Message 1");
+        
+        // Start a second write in a separate thread
+        let memory_clone = memory.clone();
+        let handle = thread::spawn(move || {
+            memory_clone.write(b"Message 2")
+        });
+        
+        // Give the writer time to start waiting
+        thread::sleep(Duration::from_millis(50));
+        
+        // Drop first reader's guard
+        drop(guard1_r1);
+        
+        // Writer should still be blocked (needs all readers)
+        thread::sleep(Duration::from_millis(50));
+        
+        // Drop second reader's guard
+        drop(guard1_r2);
+        
+        // Now writer should complete
+        let seq2 = handle.join().unwrap().unwrap();
+        assert_eq!(seq2, 2);
+    }
+
+    #[test]
+    fn target_read_count_wait_for_specific() {
+        let memory = Arc::new(init("target_read_count_specific", 2)); // Wait for 2
+        memory.add_reader();
+        memory.add_reader();
+        memory.add_reader(); // Register 3 readers
+        
+        // First write
+        memory.write(b"Message 1").unwrap();
+        
+        // Three readers read the message
+        let guard1_r1 = memory.try_read(0).unwrap();
+        let guard1_r2 = memory.try_read(0).unwrap();
+        let guard1_r3 = memory.try_read(0).unwrap();
+        
+        // Start a second write in a separate thread
+        let memory_clone = memory.clone();
+        let handle = thread::spawn(move || {
+            memory_clone.write(b"Message 2")
+        });
+        
+        // Give the writer time to start waiting
+        thread::sleep(Duration::from_millis(50));
+        
+        // Drop first reader's guard
+        drop(guard1_r1);
+        
+        // Writer should still be blocked (needs 2 readers)
+        thread::sleep(Duration::from_millis(50));
+        
+        // Drop second reader's guard - now we have 2 consumed
+        drop(guard1_r2);
+        
+        // Writer should complete (doesn't need to wait for third reader)
+        let seq2 = handle.join().unwrap().unwrap();
+        assert_eq!(seq2, 2);
+        
+        // Third reader can still access the old message
+        assert_eq!(guard1_r3.data(), b"Message 1");
+    }
+
+    #[test]
+    fn target_read_count_fire_and_forget() {
+        let memory = Arc::new(init("target_read_count_zero", 0)); // Fire and forget
+        memory.add_reader();
+        memory.add_reader(); // Register 2 readers
+        
+        // First write
+        memory.write(b"Message 1").unwrap();
+        
+        // Readers read the message
+        let guard1_r1 = memory.try_read(0).unwrap();
+        let guard1_r2 = memory.try_read(0).unwrap();
+        
+        // Second write should NOT wait for readers to consume
+        let seq2 = memory.write(b"Message 2").unwrap();
+        assert_eq!(seq2, 2);
+        
+        // Old guards should still be valid
+        assert_eq!(guard1_r1.data(), b"Message 1");
+        assert_eq!(guard1_r2.data(), b"Message 1");
     }
 }
 
