@@ -10,24 +10,18 @@ pub struct MessageReadGuard<'a> {
 }
 
 impl<'a> MessageReadGuard<'a> {
-    pub(crate) fn new(
-        message: &'a ZeroCopySharedMessage,
-        buffer_idx: bool,
-        sequence: u64,
-    ) -> Self {
+    pub(crate) fn new(message: &'a ZeroCopySharedMessage, buffer_idx: bool, sequence: u64) -> Self {
         Self {
             message,
             buffer_idx,
             sequence,
         }
     }
-    
-    /// Get the sequence number of this message.
+
     pub fn sequence(&self) -> u64 {
         self.sequence
     }
-    
-    /// Get the data as a byte slice (zero-copy access to shared memory).
+
     pub fn data(&self) -> &[u8] {
         self.message.buffer(self.buffer_idx)
     }

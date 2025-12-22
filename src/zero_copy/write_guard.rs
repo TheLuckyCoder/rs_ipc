@@ -1,4 +1,4 @@
-use crate::zero_copy::message::WriterGuard;
+use crate::zero_copy::message::{BufferIndex, BufferWriteGuard};
 use crate::zero_copy::ZeroCopySharedMessage;
 
 /// RAII guard for zero-copy writes to shared memory.
@@ -6,15 +6,15 @@ use crate::zero_copy::ZeroCopySharedMessage;
 /// and writer mutex release when dropped.
 pub struct MessageWriteGuard<'a> {
     message: &'a ZeroCopySharedMessage,
-    guard: WriterGuard<'a>,
-    buffer_idx: bool,
+    guard: BufferWriteGuard<'a>,
+    buffer_idx: BufferIndex,
 }
 
 impl<'a> MessageWriteGuard<'a> {
     pub(crate) fn new(
         message: &'a ZeroCopySharedMessage,
-        guard: WriterGuard<'a>,
-        buffer_idx: bool,
+        guard: BufferWriteGuard<'a>,
+        buffer_idx: BufferIndex,
     ) -> Self {
         Self {
             message,
@@ -22,17 +22,17 @@ impl<'a> MessageWriteGuard<'a> {
             buffer_idx,
         }
     }
-    
+
     /// Get mutable access to the write buffer.
     pub fn buffer_mut(&mut self) -> &mut [u8] {
         self.message.buffer_mut(self.buffer_idx)
     }
-    
+
     /// Get the maximum buffer size.
     pub fn capacity(&self) -> usize {
         self.message.buffer_size()
     }
-    
+
     /// Publish the written data with the given size.
     /// Returns the new sequence number if successful, None if stopped.
     /// This consumes the guard, publishes the data atomically, and releases the writer mutex.
@@ -40,8 +40,10 @@ impl<'a> MessageWriteGuard<'a> {
         if size > self.capacity() {
             return None;
         }
-        
-        let result = self.message.publish_buffer(self.buffer_idx, self.guard, size);
+
+        let result = self
+            .message
+            .publish_buffer(self.guard, self.buffer_idx, size);
 
         result
     }

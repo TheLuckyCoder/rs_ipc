@@ -118,7 +118,7 @@ impl PythonZeroCopySharedMessage {
         guard.map(|guard| {
             let seq: u64 = guard.sequence();
             self.last_read_sequence.store(seq, Ordering::Relaxed);
-            RustPyBytes::new(guard.data())
+            RustPyBytes::new(guard.as_ref())
         })
     }
 

@@ -5,6 +5,9 @@ use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
 
+pub type BufferIndex = bool;
+pub(crate) type BufferWriteGuard<'a> = SharedMutexGuard<'a, ()>;
+
 // Bit masks for packing stopped flag and buffer index into sequence
 const STOPPED_BIT_MASK: u64 = 1u64 << 63;
 const BUFFER_IDX_BIT_MASK: u64 = 1u64 << 62;
@@ -22,7 +25,7 @@ struct SequenceState {
 ///
 /// # Concurrency Model
 /// - **Multiple Writers**: Supports multiple concurrent writers through a write mutex.
-///   The mutex is acquired when obtaining a `WriteGuard` and released when the guard
+///   The mutex is acquired when getting a `WriteGuard` and released when the guard
 ///   is published or dropped.
 /// - **Multiple Readers**: Supports multiple concurrent readers through
 ///   per-buffer reference counting (completely lock-free for readers).
@@ -54,14 +57,12 @@ pub struct ZeroCopySharedMessage<T: ?Sized = [u8]> {
     // Writer mutex (serializes multiple writers)
     writer_mutex: SharedMutex<()>,
 
-    // Buffer size (each buffer is half of remaining space)
+    // Buffer size (each buffer is half of the remaining space)
     buffer_size: usize,
 
     // Double buffers follow the header in memory
     buffers: T,
 }
-
-pub(crate) type WriterGuard<'a> = SharedMutexGuard<'a, ()>;
 
 impl ZeroCopySharedMessage {
     pub(crate) const fn size_of_fields() -> usize {
@@ -82,7 +83,7 @@ impl ZeroCopySharedMessage {
     /// Acquire a write buffer, waiting for any active readers to finish.
     /// Returns the buffer index if successful, None if stopped.
     /// This allows the writer to prepare the next message while readers consume the current one.
-    fn acquire_write_buffer(&self) -> Option<(bool, WriterGuard<'_>)> {
+    fn acquire_write_buffer(&self) -> Option<(BufferIndex, BufferWriteGuard<'_>)> {
         if self.is_stopped() {
             return None;
         }
@@ -105,44 +106,6 @@ impl ZeroCopySharedMessage {
         }
 
         Some((write_idx, writer_guard))
-    }
-
-    /// Returns the new sequence number if successful, None if stopped.
-    pub fn write(&self, data: &[u8]) -> Option<u64> {
-        let (write_idx, writer_guard) = self.acquire_write_buffer()?;
-
-        let buffer = self.buffer_mut(write_idx);
-        if data.len() > buffer.len() {
-            panic!(
-                "Data size ({} bytes) exceeds buffer capacity ({} bytes)",
-                data.len(),
-                buffer.len()
-            );
-        }
-        buffer[..data.len()].copy_from_slice(data);
-
-        self.publish_buffer(write_idx, writer_guard, data.len())
-    }
-
-    /// Returns a WriteGuard that provides mutable access to a buffer.
-    /// The buffer will be published when the guard's `publish()` method is called.
-    /// The writer mutex is acquired here and will be held until the guard is published or dropped.
-    pub fn acquire_write_guard(&self) -> Option<MessageWriteGuard<'_>> {
-        // Then acquire the write buffer
-        let (write_idx, writer_guard) = self.acquire_write_buffer()?;
-        Some(MessageWriteGuard::new(self, writer_guard, write_idx))
-    }
-
-    /// Try to read the next message without blocking.
-    /// Returns a ReadGuard if new data is available, None otherwise.
-    pub fn try_read(&self, last_seen_seq: u64) -> Option<MessageReadGuard<'_>> {
-        self.read_internal(last_seen_seq, false)
-    }
-
-    /// Read the next message, blocking until new data is available or stopped.
-    /// Returns a ReadGuard if successful, None if stopped with no new data.
-    pub fn read(&self, last_seen_seq: u64) -> Option<MessageReadGuard<'_>> {
-        self.read_internal(last_seen_seq, true)
     }
 
     fn read_internal(&self, last_seen_seq: u64, block: bool) -> Option<MessageReadGuard<'_>> {
@@ -183,7 +146,7 @@ impl ZeroCopySharedMessage {
     }
 
     /// Release a reader reference for the given buffer index.
-    pub(crate) fn release_reader(&self, buffer_idx: bool) {
+    pub(crate) fn release_reader(&self, buffer_idx: BufferIndex) {
         self.reader_counts[buffer_idx as usize].fetch_sub(1, Ordering::AcqRel);
 
         // Increment consumed count to signal that this reader has finished
@@ -191,6 +154,131 @@ impl ZeroCopySharedMessage {
 
         // Wake any waiting writer (either waiting for buffer to be free or for consumption target)
         self.reader_done_futex.notify_all();
+    }
+
+    /// Get a reference to a specific buffer.
+    pub(crate) fn buffer(&self, buffer_idx: BufferIndex) -> &[u8] {
+        let offset = if buffer_idx { self.buffer_size } else { 0 };
+        let size = self.data_sizes[buffer_idx as usize].load(Ordering::Acquire);
+        &self.buffers[offset..offset + size]
+    }
+
+    /// Get a mutable reference to a specific buffer (for writing).
+    pub(crate) fn buffer_mut(&self, buffer_idx: BufferIndex) -> &mut [u8] {
+        let offset = buffer_idx as usize * self.buffer_size;
+        unsafe {
+            let ptr = self.buffers.as_ptr().add(offset) as *mut u8;
+            std::slice::from_raw_parts_mut(ptr, self.buffer_size)
+        }
+    }
+
+    pub(crate) fn publish_buffer(
+        &self,
+        _writer_guard: BufferWriteGuard<'_>,
+        buffer_idx: BufferIndex,
+        size: usize,
+    ) -> Option<u64> {
+        // Wait for readers to consume from the OLD read buffer (based on policy)
+        // This happens BEFORE we publish, allowing writers to prepare the next message
+        // concurrently while readers consume the current one (double buffering benefit).
+        let current_state = self.get_state();
+        let old_read_idx = current_state.buffer_idx as usize;
+        let current_seq = current_state.sequence;
+
+        // Only wait if there's a previous message to be consumed (sequence > 0)
+        let target_count = self
+            .target_read_count
+            .load(Ordering::Relaxed)
+            .min(self.consumer_count.load(Ordering::Relaxed));
+
+        if target_count > 0 && current_seq > 0 {
+            let mut consumed = self.consumed_counts[old_read_idx].load(Ordering::Acquire);
+            while consumed < target_count {
+                if self.is_stopped() {
+                    return None;
+                }
+                self.reader_done_futex.wait();
+                consumed = self.consumed_counts[old_read_idx].load(Ordering::Acquire);
+            }
+        }
+
+        // Store the actual size
+        self.data_sizes[buffer_idx as usize].store(size, Ordering::Release);
+
+        // Reset reader count and consumed count for the buffer we're about to publish
+        self.reader_counts[buffer_idx as usize].store(0, Ordering::Release);
+        self.consumed_counts[buffer_idx as usize].store(0, Ordering::Release);
+
+        // Atomically update: increment sequence, switch buffer, keep the stopped flag
+        loop {
+            let old_packed = self.sequence_and_flags.load(Ordering::Acquire);
+            let old_seq = old_packed & SEQUENCE_MASK;
+            let stopped_flag = old_packed & STOPPED_BIT_MASK;
+
+            // Check if stopped while we were writing
+            if stopped_flag != 0 {
+                return None;
+            }
+
+            let mut new_seq = (old_seq + 1) & SEQUENCE_MASK;
+            if new_seq == 0 {
+                new_seq = 1; // Skip 0 as it has special meaning
+            }
+
+            let new_buffer_flag = if buffer_idx { BUFFER_IDX_BIT_MASK } else { 0 };
+            let new_packed = new_seq | new_buffer_flag | stopped_flag;
+
+            // Try to atomically update
+            if self
+                .sequence_and_flags
+                .compare_exchange(old_packed, new_packed, Ordering::Release, Ordering::Acquire)
+                .is_ok()
+            {
+                // Wake readers
+                self.writer_futex.notify_all();
+                return Some(new_seq);
+            }
+        }
+    }
+}
+
+impl ZeroCopySharedMessage {
+    /// Returns the new sequence number if successful, None if stopped.
+    pub fn write(&self, data: &[u8]) -> Option<u64> {
+        let (write_idx, writer_guard) = self.acquire_write_buffer()?;
+
+        let buffer = self.buffer_mut(write_idx);
+        if data.len() > buffer.len() {
+            panic!(
+                "Data size ({} bytes) exceeds buffer capacity ({} bytes)",
+                data.len(),
+                buffer.len()
+            );
+        }
+        buffer[..data.len()].copy_from_slice(data);
+
+        self.publish_buffer(writer_guard, write_idx, data.len())
+    }
+
+    /// Returns a WriteGuard that provides mutable access to a buffer.
+    /// The buffer will be published when the guard's `publish()` method is called.
+    /// The writer mutex is acquired here and will be held until the guard is published or dropped.
+    pub fn acquire_write_guard(&self) -> Option<MessageWriteGuard<'_>> {
+        // Then acquire the write buffer
+        let (write_idx, writer_guard) = self.acquire_write_buffer()?;
+        Some(MessageWriteGuard::new(self, writer_guard, write_idx))
+    }
+
+    /// Try to read the next message without blocking.
+    /// Returns a ReadGuard if new data is available, None otherwise.
+    pub fn try_read(&self, last_seen_seq: u64) -> Option<MessageReadGuard<'_>> {
+        self.read_internal(last_seen_seq, false)
+    }
+
+    /// Read the next message, blocking until new data is available or stopped.
+    /// Returns a ReadGuard if successful, None if stopped with no new data.
+    pub fn read(&self, last_seen_seq: u64) -> Option<MessageReadGuard<'_>> {
+        self.read_internal(last_seen_seq, true)
     }
 
     /// Get the current sequence number.
@@ -204,7 +292,6 @@ impl ZeroCopySharedMessage {
     }
 
     /// Check if the shared memory has been stopped.
-    #[inline]
     pub fn is_stopped(&self) -> bool {
         self.get_state().stopped
     }
@@ -243,87 +330,6 @@ impl ZeroCopySharedMessage {
     /// Get the size of a specific buffer.
     pub fn buffer_size(&self) -> usize {
         self.buffer_size
-    }
-
-    /// Get a reference to a specific buffer.
-    pub(crate) fn buffer(&self, buffer_idx: bool) -> &[u8] {
-        let offset = if buffer_idx { self.buffer_size } else { 0 };
-        let size = self.data_sizes[buffer_idx as usize].load(Ordering::Acquire);
-        &self.buffers[offset..offset + size]
-    }
-
-    /// Get a mutable reference to a specific buffer (for writing).
-    pub(crate) fn buffer_mut(&self, buffer_idx: bool) -> &mut [u8] {
-        let offset = buffer_idx as usize * self.buffer_size;
-        unsafe {
-            let ptr = self.buffers.as_ptr().add(offset) as *mut u8;
-            std::slice::from_raw_parts_mut(ptr, self.buffer_size)
-        }
-    }
-
-    /// Publish a buffer that was written via WriteGuard.
-    /// This is called by WriteGuard::publish().
-    pub(crate) fn publish_buffer(&self, buffer_idx: bool, _writer_guard: WriterGuard<'_>, size: usize) -> Option<u64> {
-        // Wait for readers to consume from the OLD read buffer (based on policy)
-        // This happens BEFORE we publish, allowing writers to prepare the next message
-        // concurrently while readers consume the current one (double buffering benefit).
-        let current_state = self.get_state();
-        let old_read_idx = current_state.buffer_idx as usize;
-        let current_seq = current_state.sequence;
-
-        // Only wait if there's a previous message to be consumed (sequence > 0)
-        let target_count = self
-            .target_read_count
-            .load(Ordering::Relaxed)
-            .min(self.consumer_count.load(Ordering::Relaxed));
-        if target_count > 0 && current_seq > 0 {
-            let mut consumed = self.consumed_counts[old_read_idx].load(Ordering::Acquire);
-            while consumed < target_count {
-                if self.is_stopped() {
-                    return None;
-                }
-                self.reader_done_futex.wait();
-                consumed = self.consumed_counts[old_read_idx].load(Ordering::Acquire);
-            }
-        }
-
-        // Store the actual size
-        self.data_sizes[buffer_idx as usize].store(size, Ordering::Release);
-
-        // Reset reader count and consumed count for the buffer we're about to publish
-        self.reader_counts[buffer_idx as usize].store(0, Ordering::Release);
-        self.consumed_counts[buffer_idx as usize].store(0, Ordering::Release);
-
-        // Atomically update: increment sequence, switch buffer, keep stopped flag
-        loop {
-            let old_packed = self.sequence_and_flags.load(Ordering::Acquire);
-            let old_seq = old_packed & SEQUENCE_MASK;
-            let stopped_flag = old_packed & STOPPED_BIT_MASK;
-
-            // Check if stopped while we were writing
-            if stopped_flag != 0 {
-                return None;
-            }
-
-            let mut new_seq = (old_seq + 1) & SEQUENCE_MASK;
-            if new_seq == 0 {
-                new_seq = 1; // Skip 0 as it has special meaning
-            }
-
-            let new_buffer_flag = if buffer_idx { BUFFER_IDX_BIT_MASK } else { 0 };
-            let new_packed = new_seq | new_buffer_flag | stopped_flag;
-
-            // Try to atomically update
-            if self
-                .sequence_and_flags
-                .compare_exchange(old_packed, new_packed, Ordering::Release, Ordering::Acquire)
-                .is_ok()
-            {
-                // Wake readers
-                self.writer_futex.notify_all();
-                return Some(new_seq);
-            }
-        }
     }
 }
 
@@ -374,7 +380,7 @@ mod tests {
 
     const DEFAULT_SIZE: usize = 1024 * 1024;
 
-    fn init(name: &str, target_read_count: u16) -> ZeroCopySharedMessageMapper {
+    fn init(name: &str, target_read_count: u16) -> Arc<ZeroCopySharedMessageMapper> {
         let c_name = CString::new(name).unwrap();
         let mapper = ZeroCopySharedMessageMapper::create(
             c_name,
@@ -382,13 +388,13 @@ mod tests {
         )
         .unwrap();
         mapper.set_target_read_count(target_read_count);
-        mapper
+        Arc::new(mapper)
     }
 
     #[test]
     fn basic_write_read() {
         let data = b"Hello, zero-copy world!";
-        let memory = Arc::new(init("basic_write_read", 0));
+        let memory = init("basic_write_read", 0);
 
         // Write data
         let seq = memory.write(data).unwrap();
@@ -406,7 +412,7 @@ mod tests {
     #[test]
     fn blocking_read() {
         let data = b"Blocking read test";
-        let memory = Arc::new(init("blocking_read", 0));
+        let memory = init("blocking_read", 0);
         let memory_clone = memory.clone();
 
         // Start a thread that will write after a delay
@@ -423,7 +429,7 @@ mod tests {
     #[test]
     fn multiple_readers() {
         let data = b"Multiple readers test";
-        let memory = Arc::new(init("multiple_readers", 0));
+        let memory = init("multiple_readers", 0);
 
         // Add readers
         memory.add_reader();
@@ -442,7 +448,7 @@ mod tests {
 
     #[test]
     fn writer_waits_for_readers() {
-        let memory = Arc::new(init("writer_waits", 0));
+        let memory = init("writer_waits", 0);
         memory.add_reader();
 
         // First write
@@ -478,7 +484,7 @@ mod tests {
 
     #[test]
     fn stop_flag() {
-        let memory = Arc::new(init("stop_flag", 0));
+        let memory = init("stop_flag", 0);
 
         // Write some data
         memory.write(b"Before stop").unwrap();
@@ -500,7 +506,7 @@ mod tests {
 
     #[test]
     fn double_buffering() {
-        let memory = Arc::new(init("double_buffering", 0));
+        let memory = init("double_buffering", 0);
 
         // Write first message
         let seq1 = memory.write(b"Message 1").unwrap();
@@ -526,7 +532,7 @@ mod tests {
 
     #[test]
     fn target_read_count_wait_for_one() {
-        let memory = Arc::new(init("target_read_count_one", 1));
+        let memory = init("target_read_count_one", 1);
         memory.add_reader(); // Register 1 reader
 
         // First write
@@ -558,7 +564,7 @@ mod tests {
 
     #[test]
     fn target_read_count_wait_for_all() {
-        let memory = Arc::new(init("target_read_count_all", u16::MAX)); // Wait for all
+        let memory = init("target_read_count_all", u16::MAX); // Wait for all
         memory.add_reader();
         memory.add_reader(); // Register 2 readers
 
@@ -594,7 +600,7 @@ mod tests {
 
     #[test]
     fn target_read_count_wait_for_specific() {
-        let memory = Arc::new(init("target_read_count_specific", 2)); // Wait for 2
+        let memory = init("target_read_count_specific", 2); // Wait for 2
         memory.add_reader();
         memory.add_reader();
         memory.add_reader(); // Register 3 readers
@@ -633,7 +639,7 @@ mod tests {
 
     #[test]
     fn target_read_count_fire_and_forget() {
-        let memory = Arc::new(init("target_read_count_zero", 0)); // Fire and forget
+        let memory = init("target_read_count_zero", 0); // Fire and forget
         memory.add_reader();
         memory.add_reader(); // Register 2 readers
 
@@ -657,7 +663,7 @@ mod tests {
     fn concurrent_write_while_reading() {
         // Test that the writer can write to the empty buffer while readers
         // are still reading from the full buffer (double buffering benefit)
-        let memory = Arc::new(init("concurrent_write", 0)); // target_read_count = 0
+        let memory = init("concurrent_write", 0); // target_read_count = 0
 
         // First write
         memory.write(b"Message 1").unwrap();
@@ -696,7 +702,7 @@ mod tests {
     #[test]
     fn multiple_writers() {
         // Test that multiple writers are serialized by the writer mutex
-        let memory = Arc::new(init("multiple_writers", 0));
+        let memory = init("multiple_writers", 0);
         let num_writers = 5;
         let writes_per_writer = 10;
 
@@ -729,7 +735,7 @@ mod tests {
     #[test]
     fn multiple_writers_with_write_guard() {
         // Test that multiple writers using write_guard are serialized
-        let memory = Arc::new(init("multiple_writers_guard", 0));
+        let memory = init("multiple_writers_guard", 0);
         let num_writers = 5;
 
         // Spawn multiple writer threads using write_guard
