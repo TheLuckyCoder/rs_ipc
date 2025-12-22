@@ -1,5 +1,4 @@
 use crate::sync::lock::futex_lock::FutexLock;
-use crate::sync::PhantomDataUnSend;
 use std::cell::UnsafeCell;
 use std::ops::{Deref, DerefMut};
 
@@ -12,19 +11,13 @@ pub struct SharedMutex<T: ?Sized> {
 impl<T: ?Sized> SharedMutex<T> {
     pub fn lock(&self) -> SharedMutexGuard<'_, T> {
         self.futex.lock();
-        SharedMutexGuard {
-            lock: self,
-            _marker: Default::default(),
-        }
+        SharedMutexGuard { lock: self }
     }
 
     #[allow(dead_code)]
     pub fn try_lock(&self) -> Option<SharedMutexGuard<'_, T>> {
         if self.futex.try_lock() {
-            Some(SharedMutexGuard {
-                lock: self,
-                _marker: Default::default(),
-            })
+            Some(SharedMutexGuard { lock: self })
         } else {
             None
         }
@@ -37,7 +30,6 @@ unsafe impl<T: ?Sized + Send> Sync for SharedMutex<T> {}
 #[must_use = "if unused the SharedMutex will immediately unlock"]
 pub struct SharedMutexGuard<'a, T: ?Sized + 'a> {
     lock: &'a SharedMutex<T>,
-    _marker: PhantomDataUnSend,
 }
 
 impl<T: ?Sized> Deref for SharedMutexGuard<'_, T> {
@@ -60,6 +52,10 @@ impl<T: ?Sized> Drop for SharedMutexGuard<'_, T> {
     }
 }
 
+// Safe because:
+// 1. Our futex-based lock doesn't require same-thread unlock
+// 2. T: Send ensures the data can be accessed from another thread
+unsafe impl<T: ?Sized + Send> Send for SharedMutexGuard<'_, T> {}
 unsafe impl<T: ?Sized + Sync> Sync for SharedMutexGuard<'_, T> {}
 
 pub(crate) fn guard_lock<'a, T: ?Sized>(guard: &SharedMutexGuard<'a, T>) -> &'a FutexLock {
