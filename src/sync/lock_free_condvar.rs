@@ -1,5 +1,5 @@
 use crate::sync::futex::{futex_wait, futex_wake_all, Futex};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::Ordering;
 
 /// Simple condition variable for lock-free synchronization.
 /// Unlike SharedCondvar, this doesn't require a mutex.
