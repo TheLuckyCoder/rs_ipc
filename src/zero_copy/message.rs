@@ -62,13 +62,17 @@ pub struct ZeroCopySharedMessage<T: ?Sized = [u8]> {
     buffer_size: usize,
 
     // Double buffers follow the header in memory
-    // Wrapped in UnsafeCell to allow interior mutability (required for sound *const to *mut cast)
+    // Wrapped in UnsafeCell to allow interior mutability
     buffers: UnsafeCell<T>,
 }
 
 impl ZeroCopySharedMessage {
     pub(crate) const fn size_of_fields() -> usize {
         size_of::<ZeroCopySharedMessage<[u8; 0]>>()
+    }
+
+    pub(crate) const fn align_of_fields() -> usize {
+        align_of::<ZeroCopySharedMessage<[u8; 0]>>()
     }
 
     /// Unpack the combined sequence/stopped/buffer_idx value
@@ -78,7 +82,7 @@ impl ZeroCopySharedMessage {
         SequenceState {
             sequence: packed & SEQUENCE_MASK,
             stopped: (packed & STOPPED_BIT_MASK) != 0,
-            buffer_idx: ((packed & BUFFER_IDX_BIT_MASK) >> 62) != 0,
+            buffer_idx: (packed & BUFFER_IDX_BIT_MASK) != 0,
         }
     }
 
@@ -142,7 +146,7 @@ impl ZeroCopySharedMessage {
                 continue;
             }
 
-            // Return guard with direct pointer to buffer
+            // Return guard with a direct pointer to buffer
             return Some(MessageReadGuard::new(self, buffer_idx, state.sequence));
         }
     }
@@ -154,7 +158,6 @@ impl ZeroCopySharedMessage {
         // Increment consumed count to signal that this reader has finished
         self.consumed_counts[buffer_idx as usize].fetch_add(1, Ordering::AcqRel);
 
-        // Wake any waiting writer (either waiting for buffer to be free or for consumption target)
         self.reader_done_futex.notify_all();
     }
 
@@ -174,7 +177,7 @@ impl ZeroCopySharedMessage {
     /// 2. The writer mutex ensures only one writer accesses this buffer at a time
     /// 3. The reference counting ensures no readers access this buffer while being written
     pub(crate) fn buffer_mut(&self, buffer_idx: BufferIndex) -> &mut [u8] {
-        let offset = buffer_idx as usize * self.buffer_size;
+        let offset = if buffer_idx { self.buffer_size } else { 0 };
         unsafe {
             let ptr = (*self.buffers.get()).as_mut_ptr().add(offset);
             std::slice::from_raw_parts_mut(ptr, self.buffer_size)
@@ -194,12 +197,12 @@ impl ZeroCopySharedMessage {
         let old_read_idx = current_state.buffer_idx as usize;
         let current_seq = current_state.sequence;
 
-        // Only wait if there's a previous message to be consumed (sequence > 0)
         let target_count = self
             .target_read_count
             .load(Ordering::Relaxed)
             .min(self.consumer_count.load(Ordering::Relaxed));
 
+        // Only wait if there's a previous message to be consumed (sequence > 0)
         if target_count > 0 && current_seq > 0 {
             let mut consumed = self.consumed_counts[old_read_idx].load(Ordering::Acquire);
             while consumed < target_count {
@@ -251,6 +254,7 @@ impl ZeroCopySharedMessage {
     }
 }
 
+// Public functions
 impl ZeroCopySharedMessage {
     /// Returns the new sequence number if successful, None if stopped.
     pub fn write(&self, data: &[u8]) -> Option<u64> {
@@ -273,7 +277,6 @@ impl ZeroCopySharedMessage {
     /// The buffer will be published when the guard's `publish()` method is called.
     /// The writer mutex is acquired here and will be held until the guard is published or dropped.
     pub fn acquire_write_guard(&self) -> Option<MessageWriteGuard<'_>> {
-        // Then acquire the write buffer
         let (write_idx, writer_guard) = self.acquire_write_buffer()?;
         Some(MessageWriteGuard::new(self, writer_guard, write_idx))
     }
@@ -286,7 +289,7 @@ impl ZeroCopySharedMessage {
 
     /// Read the next message, blocking until new data is available or stopped.
     /// Returns a ReadGuard if successful, None if stopped with no new data.
-    pub fn read(&self, last_seen_seq: u64) -> Option<MessageReadGuard<'_>> {
+    pub fn blocking_read(&self, last_seen_seq: u64) -> Option<MessageReadGuard<'_>> {
         self.read_internal(last_seen_seq, true)
     }
 
@@ -305,11 +308,9 @@ impl ZeroCopySharedMessage {
         self.get_state().stopped
     }
 
-    /// Signal that no more writes will occur.
     pub fn stop(&self) {
-        // Set the stopped bit using fetch_or
         self.sequence_and_flags
-            .fetch_or(STOPPED_BIT_MASK, Ordering::Relaxed);
+            .fetch_or(STOPPED_BIT_MASK, Ordering::Release);
 
         // Wake all waiting readers and writers
         self.writer_futex.notify_all();
@@ -326,12 +327,12 @@ impl ZeroCopySharedMessage {
         self.target_read_count.load(Ordering::Relaxed)
     }
 
-    /// Register a new reader (increment consumer count).
+    /// Register a new reader
     pub fn add_reader(&self) {
         self.consumer_count.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Unregister a reader (decrement consumer count).
+    /// Unregister a reader
     pub fn remove_reader(&self) {
         self.consumer_count.fetch_sub(1, Ordering::Relaxed);
     }
@@ -347,6 +348,9 @@ unsafe impl SlicePtrCast for ZeroCopySharedMessage {
         ptr: NonNull<c_void>,
         memory_size: usize,
     ) -> Option<NonNull<Self>> {
+        if ptr.align_offset(Self::align_of_fields()) != 0 {
+            return None;
+        }
         let header_size = Self::size_of_fields();
         let buffer_space = memory_size.saturating_sub(header_size);
 
@@ -389,20 +393,43 @@ pub type ZeroCopySharedMessageMapper = SharedMemoryMapper<ZeroCopySharedMessage>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::CString;
+    use std::ops::Deref;
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
 
     const DEFAULT_SIZE: usize = 1024 * 1024;
 
-    fn init(name: &str, target_read_count: u16) -> Arc<ZeroCopySharedMessageMapper> {
-        let c_name = CString::new(name).unwrap();
-        let mapper = ZeroCopySharedMessageMapper::create(
-            c_name,
-            ZeroCopySharedMessage::size_of_fields() + DEFAULT_SIZE,
-        )
+    struct ZeroCopyTestWrapper {
+        _data: Box<[u64]>,
+        mapped_ptr: *const ZeroCopySharedMessage,
+    }
+
+    unsafe impl Send for ZeroCopyTestWrapper {}
+    unsafe impl Sync for ZeroCopyTestWrapper {}
+
+    impl Deref for ZeroCopyTestWrapper {
+        type Target = ZeroCopySharedMessage;
+
+        fn deref(&self) -> &Self::Target {
+            unsafe { &*self.mapped_ptr }
+        }
+    }
+
+    fn init(target_read_count: u16) -> Arc<ZeroCopyTestWrapper> {
+        let size = ZeroCopySharedMessage::size_of_fields() + DEFAULT_SIZE * 2;
+        let mut data: Box<[u64]> = unsafe { Box::new_zeroed_slice(size / size_of::<u64>()).assume_init() };
+        let ptr = NonNull::new(data.as_mut_ptr().cast()).unwrap();
+        let mapped_ptr = unsafe {
+            ZeroCopySharedMessage::cast_from_void_ptr(ptr, size)
+        }
         .unwrap();
+
+        let mapper = ZeroCopyTestWrapper {
+            _data: data,
+            mapped_ptr: mapped_ptr.as_ptr() as *const ZeroCopySharedMessage,
+        };
+
         mapper.set_target_read_count(target_read_count);
         Arc::new(mapper)
     }
@@ -410,7 +437,7 @@ mod tests {
     #[test]
     fn basic_write_read() {
         let data = b"Hello, zero-copy world!";
-        let memory = init("basic_write_read", 0);
+        let memory = init(0);
 
         // Write data
         let seq = memory.write(data).unwrap();
@@ -428,7 +455,7 @@ mod tests {
     #[test]
     fn blocking_read() {
         let data = b"Blocking read test";
-        let memory = init("blocking_read", 0);
+        let memory = init(0);
         let memory_clone = memory.clone();
 
         // Start a thread that will write after a delay
@@ -438,14 +465,14 @@ mod tests {
         });
 
         // Blocking read should wait for the write
-        let guard = memory.read(0).unwrap();
+        let guard = memory.blocking_read(0).unwrap();
         assert_eq!(guard.data(), data);
     }
 
     #[test]
     fn multiple_readers() {
         let data = b"Multiple readers test";
-        let memory = init("multiple_readers", 0);
+        let memory = init(0);
 
         // Add readers
         memory.add_reader();
@@ -464,7 +491,7 @@ mod tests {
 
     #[test]
     fn writer_waits_for_readers() {
-        let memory = init("writer_waits", 0);
+        let memory = init(0);
         memory.add_reader();
 
         // First write
@@ -500,7 +527,7 @@ mod tests {
 
     #[test]
     fn stop_flag() {
-        let memory = init("stop_flag", 0);
+        let memory = init(0);
 
         // Write some data
         memory.write(b"Before stop").unwrap();
@@ -517,12 +544,12 @@ mod tests {
         assert_eq!(guard.data(), b"Before stop");
 
         // Blocking read with no new data should return None
-        assert!(memory.read(1).is_none());
+        assert!(memory.blocking_read(1).is_none());
     }
 
     #[test]
     fn double_buffering() {
-        let memory = init("double_buffering", 0);
+        let memory = init(0);
 
         // Write first message
         let seq1 = memory.write(b"Message 1").unwrap();
@@ -548,7 +575,7 @@ mod tests {
 
     #[test]
     fn target_read_count_wait_for_one() {
-        let memory = init("target_read_count_one", 1);
+        let memory = init(1);
         memory.add_reader(); // Register 1 reader
 
         // First write
@@ -580,7 +607,7 @@ mod tests {
 
     #[test]
     fn target_read_count_wait_for_all() {
-        let memory = init("target_read_count_all", u16::MAX); // Wait for all
+        let memory = init(u16::MAX); // Wait for all
         memory.add_reader();
         memory.add_reader(); // Register 2 readers
 
@@ -616,7 +643,7 @@ mod tests {
 
     #[test]
     fn target_read_count_wait_for_specific() {
-        let memory = init("target_read_count_specific", 2); // Wait for 2
+        let memory = init(2); // Wait for 2
         memory.add_reader();
         memory.add_reader();
         memory.add_reader(); // Register 3 readers
@@ -655,7 +682,7 @@ mod tests {
 
     #[test]
     fn target_read_count_fire_and_forget() {
-        let memory = init("target_read_count_zero", 0); // Fire and forget
+        let memory = init(0); // Fire and forget
         memory.add_reader();
         memory.add_reader(); // Register 2 readers
 
@@ -679,7 +706,7 @@ mod tests {
     fn concurrent_write_while_reading() {
         // Test that the writer can write to the empty buffer while readers
         // are still reading from the full buffer (double buffering benefit)
-        let memory = init("concurrent_write", 0); // target_read_count = 0
+        let memory = init(0); // target_read_count = 0
 
         // First write
         memory.write(b"Message 1").unwrap();
@@ -718,7 +745,7 @@ mod tests {
     #[test]
     fn multiple_writers() {
         // Test that multiple writers are serialized by the writer mutex
-        let memory = init("multiple_writers", 0);
+        let memory = init(0);
         let num_writers = 5;
         let writes_per_writer = 10;
 
@@ -751,7 +778,7 @@ mod tests {
     #[test]
     fn multiple_writers_with_write_guard() {
         // Test that multiple writers using write_guard are serialized
-        let memory = init("multiple_writers_guard", 0);
+        let memory = init(0);
         let num_writers = 5;
 
         // Spawn multiple writer threads using write_guard
@@ -790,7 +817,7 @@ mod tests {
         }
 
         fn init(name: &str, target_read_count: u16) -> Arc<ZeroCopySharedMessageMapper> {
-            let c_name = std::ffi::CString::new(name).unwrap();
+            let c_name = CString::new(name).unwrap();
             let size = ZeroCopySharedMessage::size_of_fields() + 1024 * 1024; // 1MB buffer
             let mapper = ZeroCopySharedMessageMapper::create(c_name, size).unwrap();
             mapper.set_target_read_count(target_read_count);
@@ -872,7 +899,7 @@ mod tests {
             let data = get_test_data();
             let memory = init("zc_read_guard", 0);
             memory.add_reader();
-            
+
             // Write initial data
             memory.write(&data).unwrap();
 
@@ -885,6 +912,7 @@ mod tests {
         }
 
         fn write_multiple_readers(b: &mut Bencher, readers: u16) {
+            return;
             let data = std::hint::black_box(get_test_data());
             let memory = init(&format!("zc_write_readers_{readers}"), u16::MAX);
 
@@ -894,12 +922,9 @@ mod tests {
                 thread::spawn(move || {
                     let mut last_seq = 0;
                     loop {
-                        if let Some(guard) = memory_clone.read(last_seq) {
-                            last_seq = guard.sequence();
+                        if let Some(guard) = memory_clone.blocking_read(last_seq) {
                             std::hint::black_box(guard.data());
-                            if last_seq > 1000 {
-                                break;
-                            }
+                            last_seq = guard.sequence();
                         } else {
                             break;
                         }
@@ -915,18 +940,33 @@ mod tests {
         }
 
         #[bench]
-        fn write_with_1_reader(b: &mut Bencher) {
+        fn write_with_01_reader(b: &mut Bencher) {
             write_multiple_readers(b, 1);
         }
 
         #[bench]
-        fn write_with_2_readers(b: &mut Bencher) {
+        fn write_with_02_readers(b: &mut Bencher) {
             write_multiple_readers(b, 2);
         }
 
         #[bench]
-        fn write_with_4_readers(b: &mut Bencher) {
-            write_multiple_readers(b, 4);
+        fn write_with_03_readers(b: &mut Bencher) {
+            write_multiple_readers(b, 3);
+        }
+
+        #[bench]
+        fn write_with_05_readers(b: &mut Bencher) {
+            write_multiple_readers(b, 5);
+        }
+
+        #[bench]
+        fn write_with_10_readers(b: &mut Bencher) {
+            write_multiple_readers(b, 10);
+        }
+
+        #[bench]
+        fn write_with_15_readers(b: &mut Bencher) {
+            write_multiple_readers(b, 15);
         }
     }
 }

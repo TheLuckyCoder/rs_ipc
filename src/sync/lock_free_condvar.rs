@@ -14,7 +14,7 @@ impl LockFreeCondvar {
     pub fn wait(&self) {
         futex_wait(&self.0, self.0.load(Ordering::Relaxed));
     }
-    
+
     /// Notify all threads waiting on this condition variable
     #[inline]
     pub fn notify_all(&self) {

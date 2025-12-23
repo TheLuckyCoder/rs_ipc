@@ -86,7 +86,7 @@ impl PythonZeroCopySharedMessage {
         let last_seq = self.last_read_sequence.load(Ordering::Relaxed);
         let guard = py.detach(|| {
             if block {
-                self.shared_memory.read(last_seq)
+                self.shared_memory.blocking_read(last_seq)
             } else {
                 self.shared_memory.try_read(last_seq)
             }
@@ -109,7 +109,7 @@ impl PythonZeroCopySharedMessage {
         let last_seq = self.last_read_sequence.load(Ordering::Relaxed);
         let guard = py.detach(|| {
             if block {
-                self.shared_memory.read(last_seq)
+                self.shared_memory.blocking_read(last_seq)
             } else {
                 self.shared_memory.try_read(last_seq)
             }

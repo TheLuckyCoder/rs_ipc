@@ -61,7 +61,11 @@ struct StoppedAndVersion {
 
 impl SharedMessage {
     pub(crate) const fn size_of_fields() -> usize {
-        size_of::<SharedMessage<SharedMessageData<()>>>()
+        size_of::<SharedMessage<SharedMessageData<[u8; 0]>>>()
+    }
+
+    pub(crate) const fn align_of_fields() -> usize {
+        align_of::<SharedMessage<SharedMessageData<[u8; 0]>>>()
     }
 
     pub fn write(&self, data: &[u8]) -> Option<usize> {
@@ -214,6 +218,9 @@ unsafe impl SlicePtrCast for SharedMessage {
         ptr: NonNull<c_void>,
         memory_size: usize,
     ) -> Option<NonNull<Self>> {
+        if ptr.align_offset(Self::align_of_fields()) != 0 {
+            return None;
+        }
         let header_size = Self::size_of_fields();
         let payload_size = memory_size.saturating_sub(header_size);
         if payload_size == 0 {
