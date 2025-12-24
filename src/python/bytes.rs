@@ -1,5 +1,5 @@
 use pyo3::types::PyBytes;
-use pyo3::{pyclass, pymethods, Bound, PyErr, PyRef, PyResult, Python};
+use pyo3::{Bound, PyErr, PyRef, PyResult, Python, pyclass, pymethods};
 use std::ffi::c_int;
 
 #[pyclass(module = "rs_ipc")]
@@ -26,14 +26,16 @@ impl RustPyBytes {
         flags: c_int,
     ) -> PyResult<()> {
         let bytes = slf.0.as_ref();
-        let ret = pyo3::ffi::PyBuffer_FillInfo(
-            view,
-            slf.as_ptr() as *mut _,
-            bytes.as_ptr() as *mut _,
-            bytes.len().try_into()?,
-            1, // read only
-            flags,
-        );
+        let ret = unsafe {
+            pyo3::ffi::PyBuffer_FillInfo(
+                view,
+                slf.as_ptr() as *mut _,
+                bytes.as_ptr() as *mut _,
+                bytes.len().try_into()?,
+                1, // read only
+                flags,
+            )
+        };
         if ret == -1 {
             return Err(PyErr::fetch(slf.py()));
         }

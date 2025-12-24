@@ -57,4 +57,3 @@ impl<T: ?Sized> Drop for SharedMutexGuard<'_, T> {
 // 2. T: Send ensures the data can be accessed from another thread
 unsafe impl<T: ?Sized + Send> Send for SharedMutexGuard<'_, T> {}
 unsafe impl<T: ?Sized + Sync> Sync for SharedMutexGuard<'_, T> {}
-

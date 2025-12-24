@@ -2,7 +2,7 @@ use rustix::fs::Mode;
 use rustix::mm;
 use rustix::mm::{MapFlags, ProtFlags};
 use rustix::shm::OFlags;
-use std::ffi::{c_void, CString};
+use std::ffi::{CString, c_void};
 use std::ops::Deref;
 use std::os::fd::OwnedFd;
 use std::ptr::NonNull;
@@ -12,7 +12,7 @@ pub unsafe trait SlicePtrCast {
     /// - `ptr` and `memory_size` must refer to a mapping that is valid for Self's layout.
     /// - Implementation must ensure a returned pointer is valid for reads/writes.
     unsafe fn cast_from_void_ptr(ptr: NonNull<c_void>, memory_size: usize)
-        -> Option<NonNull<Self>>;
+    -> Option<NonNull<Self>>;
 }
 
 pub struct SharedMemoryMapper<T: 'static + ?Sized> {

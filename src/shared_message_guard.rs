@@ -1,5 +1,5 @@
-use crate::shared_message::PayloadWriteGuard;
 use crate::SharedMessage;
+use crate::shared_message::PayloadWriteGuard;
 
 /// Holds a reference count on a buffer, ensuring it won't be overwritten
 /// while being read.

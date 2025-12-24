@@ -1,5 +1,5 @@
 use crate::sync::futex;
-use crate::sync::futex::{futex_wait, Futex};
+use crate::sync::futex::{Futex, futex_wait};
 use std::sync::atomic::Ordering;
 
 #[derive(Default)]
@@ -8,7 +8,6 @@ pub struct SharedCondvar(Futex);
 
 #[allow(dead_code)]
 impl SharedCondvar {
-
     /// Wait on the condition variable if the value matches the expected value,
     /// Remember, this can wake spontaneously
     pub fn wait(&self) {

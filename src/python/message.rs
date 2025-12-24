@@ -1,16 +1,16 @@
+use crate::python::OperationMode;
 use crate::python::bytes::RustPyBytes;
 use crate::python::operation_mode::OperationMode::WriteAsync;
 use crate::python::queue_data::{ReceiverQueueData, SenderQueueData};
 use crate::python::reader_wait_policy::ReaderWaitPolicy;
-use crate::python::OperationMode;
 use crate::shared_message::{SharedMessage, SharedMessageMapper};
 use pyo3::exceptions::PyValueError;
 use pyo3::types::{PyBytes, PyBytesMethods};
-use pyo3::{pyclass, pymethods, Bound, PyResult, Python};
+use pyo3::{Bound, PyResult, Python, pyclass, pymethods};
 use std::ffi::CString;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 
 #[pyclass(module = "rs_ipc")]
@@ -170,17 +170,19 @@ impl PythonSharedMessage {
 
             std::thread::Builder::new()
                 .name(format!("{} writer thread", self.name))
-                .spawn(move || loop {
-                    let Ok(data) = receiver.recv() else {
-                        break;
-                    };
-                    let new_version = shared_memory.write(data.bytes());
+                .spawn(move || {
+                    loop {
+                        let Ok(data) = receiver.recv() else {
+                            break;
+                        };
+                        let new_version = shared_memory.write(data.bytes());
 
-                    let Some(new_version) = new_version else {
-                        break;
-                    };
+                        let Some(new_version) = new_version else {
+                            break;
+                        };
 
-                    last_written_version.store(new_version, Ordering::Relaxed);
+                        last_written_version.store(new_version, Ordering::Relaxed);
+                    }
                 })
                 .expect("Failed to create writer thread");
 

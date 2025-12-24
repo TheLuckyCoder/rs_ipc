@@ -2,7 +2,7 @@
 // Original code is dual-licensed under the MIT and Apache 2.0 licenses.
 // See the respective license files for details.
 
-use crate::sync::futex::{futex_wait, futex_wake_one, Futex, Primitive};
+use crate::sync::futex::{Futex, Primitive, futex_wait, futex_wake_one};
 use std::hint::spin_loop;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 

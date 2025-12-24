@@ -4,7 +4,7 @@ use crate::python::reader_wait_policy::ReaderWaitPolicy;
 use bytes::RustPyBytes;
 use pyo3::prelude::*;
 use pyo3::types::PyFunction;
-use pyo3::{pymodule, Bound, PyResult};
+use pyo3::{Bound, PyResult, pymodule};
 use rayon::prelude::*;
 
 mod bytes;
