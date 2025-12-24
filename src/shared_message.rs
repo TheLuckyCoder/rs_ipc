@@ -1,219 +1,325 @@
 use crate::memory_mapper::{SharedMemoryMapper, SlicePtrCast};
+use crate::shared_message_guard::{MessageReadGuard, MessageWriteGuard};
 use crate::sync::condvar::SharedCondvar;
-use crate::sync::SharedMutex;
+use crate::sync::{SharedMutex, SharedMutexGuard};
+use std::cell::UnsafeCell;
 use std::ffi::c_void;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
 
-const STOPPED_BIT_MASK: usize = 1usize << (usize::BITS - 1);
-const VERSION_MASK: usize = !STOPPED_BIT_MASK;
+pub(crate) type PayloadWriteGuard<'a> = SharedMutexGuard<'a, ()>;
+
+// Bit masks for packing stopped flag and buffer index into sequence
+const STOPPED_BIT_MASK: u64 = 1u64 << 63;
+const WRITING_IN_PROGRESS: u64 = 1u64 << 62;
+const SEQUENCE_MASK: u64 = !(STOPPED_BIT_MASK | WRITING_IN_PROGRESS);
+
+/// Helper struct to unpack the combined sequence/stopped/buffer_idx value
+#[derive(Default, Clone, Copy)]
+struct SequenceState {
+    sequence: u64,
+    stopped: bool,
+    writing_in_progress: bool,
+}
+
+impl SequenceState {
+    #[inline]
+    fn from_packed(packed: u64) -> Self {
+        Self {
+            sequence: packed & SEQUENCE_MASK,
+            stopped: (packed & STOPPED_BIT_MASK) != 0,
+            writing_in_progress: (packed & WRITING_IN_PROGRESS) != 0,
+        }
+    }
+
+    #[inline]
+    fn to_packed(&self) -> u64 {
+        ((self.stopped as u64) << 63)
+            | ((self.writing_in_progress as u64) << 62)
+            | self.sequence & SEQUENCE_MASK
+    }
+}
 
 #[repr(C)]
 pub struct SharedMessage<T: ?Sized = [u8]> {
-    stopped_and_version: AtomicUsize,
-    write_condvar: SharedCondvar,
-    read_condvar: SharedCondvar,
-    data: SharedMutex<SharedMessageData<T>>,
-}
+    sequence_and_flags: AtomicU64,
 
-#[repr(C)]
-struct SharedMessageData<T: ?Sized = [u8]> {
-    /// Number of readers that have consumed the current payload.
-    /// Reset to 0 whenever a new payload is written.
-    read_count: u16,
-    /// Maximum number of readers the writer will wait for before
-    /// being allowed to write a new payload.
-    target_read_count: u16,
-    /// Number of currently registered reader instances.
-    consumer_count: u16,
-    size: usize,
-    payload: T,
-}
+    // Reader tracking
+    active_readers_count: AtomicU16,
+    consumed_counts: AtomicU16,
 
-impl SharedMessageData {
-    fn payload_data(&self) -> &[u8] {
-        &self.payload[..self.size]
-    }
+    // Reader wait policy
+    target_read_count: AtomicU16,
+    consumer_count: AtomicU16,
 
-    fn is_reading_done(&self) -> bool {
-        self.read_count >= self.target_read_count.min(self.consumer_count)
-    }
+    // Synchronization (lock-free condition variables)
+    writer_futex: SharedCondvar,      // Readers wait here for new data
+    reader_done_futex: SharedCondvar, // Writer waits here for readers to finish
 
-    fn increment_read_count(&mut self) -> bool {
-        self.read_count += 1;
-        self.is_reading_done()
-    }
+    // Writer mutex (serializes multiple writers)
+    writer_mutex: SharedMutex<()>,
 
-    fn copy(&mut self, data: &[u8]) {
-        let data_len = data.len();
-
-        self.read_count = 0;
-        self.size = data_len;
-        self.payload[..data_len].copy_from_slice(data);
-    }
-}
-
-#[derive(Default)]
-struct StoppedAndVersion {
-    stopped: bool,
-    version: usize,
+    data_size: AtomicUsize,
+    data: UnsafeCell<T>,
 }
 
 impl SharedMessage {
     pub(crate) const fn size_of_fields() -> usize {
-        size_of::<SharedMessage<SharedMessageData<()>>>()
+        size_of::<SharedMessage<[u8; 0]>>()
     }
 
-    pub fn write(&self, data: &[u8]) -> Option<usize> {
-        if self.is_stopped() {
-            return None;
-        }
-
-        let mut data_guard = self.data.lock();
-        if self.is_stopped() {
-            return None;
-        }
-
-        let new_version = unsafe { self.increment_version(&mut data_guard) };
-        data_guard.copy(data);
-        self.write_condvar.notify_all();
-
-        Some(new_version)
+    pub(crate) const fn align_of_fields() -> usize {
+        align_of::<SharedMessage<[u8; 0]>>()
     }
 
-    pub fn write_waiting(&self, data: &[u8]) -> Option<usize> {
-        if self.is_stopped() {
-            return None;
-        }
-
-        let mut data_guard = self.data.lock();
-
-        let mut status = StoppedAndVersion::default();
-        data_guard = self.read_condvar.wait_while(data_guard, |guard| {
-            status = self.get_version();
-            !status.stopped && status.version != 0 && !guard.is_reading_done()
-        });
-
-        if status.stopped {
-            return None;
-        }
-
-        let new_version = unsafe { self.increment_version(&mut data_guard) };
-        data_guard.copy(data);
-        self.write_condvar.notify_all();
-
-        Some(new_version)
-    }
-
-    pub fn try_read(&self, current_version: usize, read: impl FnOnce(usize, &[u8])) {
-        // Read the version to check if there is a new one
-        if current_version == self.get_version().version {
-            return;
-        }
-
-        let mut data_guard = self.data.lock();
-        // Read the version again after the lock has been acquired, as it could have changed
-        let version = self.get_version().version;
-
-        read(version, data_guard.payload_data());
-
-        data_guard.increment_read_count();
-        if data_guard.is_reading_done() {
-            self.read_condvar.notify_one();
-        }
-    }
-
-    pub fn blocking_read(&self, current_version: usize, read: impl FnOnce(usize, &[u8])) {
-        let mut data_guard = self.data.lock();
-
-        let mut status = StoppedAndVersion::default();
-        data_guard = self.write_condvar.wait_while(data_guard, |_| {
-            status = self.get_version();
-            !status.stopped && status.version == current_version
-        });
-        if status.version == current_version {
-            return;
-        }
-
-        read(status.version, data_guard.payload_data());
-
-        data_guard.increment_read_count();
-        if data_guard.is_reading_done() {
-            self.read_condvar.notify_one();
-        }
-    }
-
+    /// Unpack the combined sequence/stopped/buffer_idx value
     #[inline]
-    pub fn is_new_version_available(&self, current_version: usize) -> bool {
-        self.get_version().version != current_version
+    fn get_state(&self) -> SequenceState {
+        SequenceState::from_packed(self.sequence_and_flags.load(Ordering::Acquire))
     }
 
-    pub fn set_target_read_count(&self, target_read_count: u16) {
-        let mut data_guard = self.data.lock();
-        data_guard.target_read_count = target_read_count;
+    /// Acquire a write buffer, waiting for any active readers to finish.
+    /// Returns the buffer index if successful, None if stopped.
+    /// This allows the writer to prepare the next message while readers consume the current one.
+    fn acquire_write_buffer(&self) -> Option<PayloadWriteGuard<'_>> {
+        if self.is_stopped() {
+            return None;
+        }
+
+        let writer_guard = self.writer_mutex.lock();
+
+        // Wait for readers to consume the already existing data (based on policy)
+        let current_seq = self.get_state().sequence;
+
+        let mut target_count = self
+            .target_read_count
+            .load(Ordering::Acquire)
+            .min(self.consumer_count.load(Ordering::Acquire));
+
+        // Only wait if there's a previous message to be consumed (sequence > 0)
+        if target_count > 0 && current_seq > 0 {
+            let mut consumed = self.consumed_counts.load(Ordering::Acquire);
+            while consumed < target_count {
+                if self.is_stopped() {
+                    return None;
+                }
+                self.reader_done_futex.wait();
+                consumed = self.consumed_counts.load(Ordering::Acquire);
+                target_count = target_count.min(self.consumer_count.load(Ordering::Acquire));
+            }
+        }
+
+        // Mark in progress so no one new will try to write
+        self.sequence_and_flags
+            .fetch_or(WRITING_IN_PROGRESS, Ordering::Release);
+
+        // Wait for active readers to finish
+        while self.active_readers_count.load(Ordering::Acquire) > 0 {
+            if self.is_stopped() {
+                self.sequence_and_flags
+                    .fetch_and(!WRITING_IN_PROGRESS, Ordering::Release);
+                return None;
+            }
+            self.reader_done_futex.wait();
+        }
+
+        Some(writer_guard)
     }
 
-    pub fn get_target_read_count(&self) -> u16 {
-        let data_guard = self.data.lock();
-        data_guard.target_read_count
+    /// Release a reader reference
+    pub(crate) fn release_active_reader(&self) {
+        self.active_readers_count.fetch_sub(1, Ordering::AcqRel);
+
+        // Increment consumed count to signal that this reader has finished
+        self.consumed_counts.fetch_add(1, Ordering::AcqRel);
+
+        self.reader_done_futex.notify_all();
     }
 
-    pub fn add_reader(&self) {
-        let mut data_guard = self.data.lock();
-        data_guard.consumer_count = data_guard.consumer_count.saturating_add(1);
-        self.read_condvar.notify_all();
+    pub(crate) fn capacity(&self) -> usize {
+        let data = unsafe { &*(self.data.get()) };
+        data.len()
     }
 
-    pub fn remove_reader(&self) {
-        let mut data_guard = self.data.lock();
-        data_guard.consumer_count = data_guard.consumer_count.saturating_sub(1);
-        self.read_condvar.notify_all();
+    pub(crate) fn payload_ref(&self) -> &[u8] {
+        let data = unsafe { &*(self.data.get()) };
+        let size = self.data_size.load(Ordering::Acquire);
+        &data[..size]
     }
 
-    #[inline]
+    /// Get a mutable reference to a specific buffer (for writing).
+    /// SAFETY: This is safe because:
+    /// 1. The buffers are behind UnsafeCell, which allows interior mutability
+    /// 2. The writer mutex ensures only one writer accesses this buffer at a time
+    /// 3. The reference counting ensures no readers access this buffer while being written
+    pub(crate) fn payload_mut(&self, _write_guard: &PayloadWriteGuard) -> &mut [u8] {
+        unsafe { &mut *self.data.get() }
+    }
+
+    pub(crate) fn publish_write(
+        &self,
+        _write_guard: PayloadWriteGuard<'_>,
+        size: usize,
+    ) -> Option<u64> {
+        // Store the actual size
+        self.data_size.store(size, Ordering::Release);
+        // Reset consumed count for the buffer we're about to publish
+        self.consumed_counts.store(0, Ordering::Release);
+
+        // Atomically update: increment sequence, remove in_writing flag, keep the stopped flag
+        loop {
+            let old_packed = self.sequence_and_flags.load(Ordering::Acquire);
+            let old_state = SequenceState::from_packed(old_packed);
+
+            let mut new_seq = (old_state.sequence + 1) & SEQUENCE_MASK;
+            if new_seq == 0 {
+                new_seq = 1; // Skip 0 as it has special meaning
+            }
+
+            let new_packed = SequenceState {
+                sequence: new_seq,
+                stopped: old_state.stopped,
+                writing_in_progress: false,
+            }
+            .to_packed();
+
+            // Try to atomically update
+            if self
+                .sequence_and_flags
+                .compare_exchange(old_packed, new_packed, Ordering::Release, Ordering::Acquire)
+                .is_ok()
+            {
+                // Wake readers
+                self.writer_futex.notify_all();
+                return Some(new_seq);
+            }
+        }
+    }
+}
+
+// Public functions
+impl SharedMessage {
+    /// Returns the new sequence number if successful, None if stopped.
+    pub fn write(&self, data: &[u8]) -> Option<u64> {
+        let writer_guard = self.acquire_write_buffer()?;
+
+        let buffer = self.payload_mut(&writer_guard);
+        if data.len() > buffer.len() {
+            panic!(
+                "Data size ({} bytes) exceeds buffer capacity ({} bytes)",
+                data.len(),
+                buffer.len()
+            );
+        }
+        buffer[..data.len()].copy_from_slice(data);
+
+        self.publish_write(writer_guard, data.len())
+    }
+
+    /// Returns a WriteGuard that provides mutable access to a buffer.
+    /// The buffer will be published when the guard's `publish()` method is called.
+    /// The writer mutex is acquired here and will be held until the guard is published or dropped.
+    pub fn acquire_write_guard(&self) -> Option<MessageWriteGuard<'_>> {
+        let write_guard = self.acquire_write_buffer()?;
+        Some(MessageWriteGuard::new(self, write_guard))
+    }
+
+    /// Returns a ReadGuard if new data is available, None otherwise.
+    pub fn read(&self, last_seen_seq: u64, block: bool) -> Option<MessageReadGuard<'_>> {
+        loop {
+            let state = self.get_state();
+
+            if state.stopped && state.sequence == last_seen_seq {
+                return None;
+            }
+
+            // Check if new data available
+            if state.sequence == last_seen_seq {
+                if !block {
+                    return None;
+                }
+                // Sleep until new data or stop
+                self.writer_futex.wait();
+                continue;
+            }
+
+            if state.writing_in_progress {
+                // Wait until it's finished writing
+                self.writer_futex.wait();
+                continue;
+            }
+
+            // Register as a reader BEFORE accessing buffer
+            self.active_readers_count.fetch_add(1, Ordering::AcqRel);
+
+            // Verify that the state didn't change while registering
+            let verify_state = self.get_state();
+            if verify_state.writing_in_progress || verify_state.sequence != state.sequence {
+                // Buffer changed - unregister and retry
+                self.active_readers_count.fetch_sub(1, Ordering::AcqRel);
+                continue;
+            }
+
+            return Some(MessageReadGuard::new(self, state.sequence));
+        }
+    }
+
+    /// Get the current sequence number.
+    pub fn current_sequence(&self) -> u64 {
+        self.get_state().sequence
+    }
+
+    /// Check if there's new data compared to the given sequence.
+    pub fn has_new_data(&self, last_seen_seq: u64) -> bool {
+        self.get_state().sequence != last_seen_seq
+    }
+
+    /// Check if the shared memory has been stopped.
     pub fn is_stopped(&self) -> bool {
-        self.get_version().stopped
+        self.get_state().stopped
     }
 
     pub fn stop(&self) {
-        let _data_guard = self.data.lock();
-        self.stopped_and_version
-            .fetch_or(STOPPED_BIT_MASK, Ordering::Relaxed);
+        self.sequence_and_flags
+            .fetch_or(STOPPED_BIT_MASK, Ordering::AcqRel);
 
-        self.write_condvar.notify_all();
-        self.read_condvar.notify_all();
+        // Wake all waiting readers and writers
+        self.writer_futex.notify_all();
+        self.reader_done_futex.notify_all();
     }
 
-    fn get_version(&self) -> StoppedAndVersion {
-        let version = self.stopped_and_version.load(Ordering::Relaxed);
-        let stopped = (version & STOPPED_BIT_MASK) != 0;
-        let version = version & !STOPPED_BIT_MASK;
-        StoppedAndVersion { stopped, version }
+    /// Set the target read count for writer wait policy.
+    pub fn set_target_read_count(&self, count: u16) {
+        self.target_read_count.store(count, Ordering::Relaxed);
     }
 
-    /// This function must only be called when the mutex is locked and if the message is not stopped.
-    /// A mutable reference is required to ensure that an exclusive lock is held while calling this function
-    unsafe fn increment_version(&self, _data: &mut SharedMessageData) -> usize {
-        debug_assert!(
-            !self.is_stopped(),
-            "increment_version must not be called on a stopped message"
-        );
+    /// Register a new reader
+    pub fn add_reader(&self) {
+        self.consumer_count.fetch_add(1, Ordering::Release);
+    }
 
-        let old = self.stopped_and_version.load(Ordering::Relaxed);
-        let mut new = (old + 1) & VERSION_MASK;
-        if new == 0 {
-            new += 1; // if it wraps around, increment to 1, as version 0 has special meaning
-        }
-        self.stopped_and_version.store(new, Ordering::Relaxed);
-        new
+    /// Unregister a reader
+    pub fn remove_reader(&self) {
+        self.consumer_count.fetch_sub(1, Ordering::Release);
     }
 }
+
+// SAFETY: SharedMessage is safe to share across threads because:
+// 1. All mutable access to data is protected by the writer mutex (serializes writers)
+// 2. Reader access is protected by reference counting (ensures no concurrent read/write)
+// 3. The UnsafeCell is only used to enable interior mutability for the buffer data,
+//    and all access is properly synchronized through atomics and the writer mutex
+unsafe impl<T: ?Sized> Sync for SharedMessage<T> {}
 
 unsafe impl SlicePtrCast for SharedMessage {
     unsafe fn cast_from_void_ptr(
         ptr: NonNull<c_void>,
         memory_size: usize,
     ) -> Option<NonNull<Self>> {
+        if ptr.align_offset(Self::align_of_fields()) != 0 {
+            return None;
+        }
+
         let header_size = Self::size_of_fields();
         let payload_size = memory_size.saturating_sub(header_size);
         if payload_size == 0 {

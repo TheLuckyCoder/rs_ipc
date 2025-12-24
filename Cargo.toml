@@ -11,12 +11,12 @@ name = "rs_ipc"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-rustix = { version = "1.1.2", default-features = false, features = ["std", "mm", "shm", "thread", "linux_latest"] }
+rustix = { version = "1.1.3", default-features = false, features = ["std", "mm", "shm", "thread", "linux_latest"] }
 rayon = { version = "1.11.0", optional = true }
-pyo3 = { version = "0.27.1", optional = true }
+pyo3 = { version = "0.27.2", optional = true }
 
 [dev-dependencies]
-pyo3 = { version = "0.27.1", features = ["auto-initialize"] }
+pyo3 = { version = "0.27.2", features = ["auto-initialize"] }
 
 [features]
 default = ["python"]

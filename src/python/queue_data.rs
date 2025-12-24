@@ -5,13 +5,13 @@ use pyo3::{Bound, Py};
 // Rust only helper structs
 
 pub struct ReceiverQueueData {
-    pub version: usize,
+    pub sequence: u64,
     pub data: RustPyBytes,
 }
 
 pub struct SenderQueueData {
     _py_bytes: Py<PyBytes>,
-    bytes: &'static [u8],
+    bytes: *const [u8],
 }
 
 impl SenderQueueData {
@@ -22,12 +22,18 @@ impl SenderQueueData {
 
         Self {
             // bypass the rust borrow checker
-            bytes: unsafe { &*(bytes as *const [u8]) },
+            bytes: bytes as *const [u8],
             _py_bytes: py_bytes,
         }
     }
 
     pub fn bytes(&self) -> &[u8] {
-        self.bytes
+        // SAFETY:
+        // the [PyBytes::as_bytes] mentions the following:
+        //     "the result may be used for as long as the reference to
+        //      `self` is held, including when the GIL is released"
+        unsafe { &*self.bytes }
     }
 }
+
+unsafe impl Send for SenderQueueData {}

@@ -9,7 +9,7 @@ use pyo3::types::{PyBytes, PyBytesMethods};
 use pyo3::{pyclass, pymethods, Bound, PyResult, Python};
 use std::ffi::CString;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
@@ -19,8 +19,8 @@ pub struct PythonSharedMessage {
     shared_memory: Arc<SharedMessageMapper>,
     name: String,
     op_mode: OperationMode,
-    last_written_version: Arc<AtomicUsize>,
-    last_read_version: Arc<AtomicUsize>,
+    last_written_version: Arc<AtomicU64>,
+    last_read_version: Arc<AtomicU64>,
     sender: Mutex<Option<Sender<SenderQueueData>>>,
     receiver: Mutex<Option<Receiver<ReceiverQueueData>>>,
 }
@@ -59,7 +59,7 @@ impl PythonSharedMessage {
         Ok(Self::new(shared_memory, name, mode))
     }
 
-    fn write(&self, data: Bound<'_, PyBytes>) -> PyResult<Option<usize>> {
+    fn write(&self, data: Bound<'_, PyBytes>) -> PyResult<Option<u64>> {
         self.op_mode.check_write_permission();
 
         let data_bytes = data.as_bytes();
@@ -90,15 +90,14 @@ impl PythonSharedMessage {
         self.op_mode.check_read_permission();
 
         let last_read_version = self.last_read_version.load(Ordering::Relaxed);
-        self.shared_memory
-            .is_new_version_available(last_read_version)
+        self.shared_memory.has_new_data(last_read_version)
     }
 
-    fn last_written_version(&self) -> usize {
+    fn last_written_version(&self) -> u64 {
         self.last_written_version.load(Ordering::Relaxed)
     }
 
-    fn last_read_version(&self) -> usize {
+    fn last_read_version(&self) -> u64 {
         self.last_read_version.load(Ordering::Relaxed)
     }
 
@@ -145,14 +144,14 @@ impl PythonSharedMessage {
         }
     }
 
-    fn write_sync(&self, data: &[u8]) -> Option<usize> {
-        let version = self.shared_memory.write_waiting(data);
+    fn write_sync(&self, data: &[u8]) -> Option<u64> {
+        let sequence = self.shared_memory.write(data);
 
-        if let Some(version) = version {
-            self.last_written_version.store(version, Ordering::Relaxed);
+        if let Some(sequence) = sequence {
+            self.last_written_version.store(sequence, Ordering::Relaxed);
         }
 
-        version
+        sequence
     }
 
     fn write_async(&self, data: Bound<'_, PyBytes>) -> PyResult<()> {
@@ -168,7 +167,6 @@ impl PythonSharedMessage {
 
             let last_written_version = self.last_written_version.clone();
             let shared_memory = self.shared_memory.clone();
-            let reader_target_count = shared_memory.get_target_read_count();
 
             std::thread::Builder::new()
                 .name(format!("{} writer thread", self.name))
@@ -176,12 +174,7 @@ impl PythonSharedMessage {
                     let Ok(data) = receiver.recv() else {
                         break;
                     };
-                    let new_version = if reader_target_count == 0 {
-                        let data = receiver.try_iter().last().unwrap_or(data);
-                        shared_memory.write(data.bytes())
-                    } else {
-                        shared_memory.write_waiting(data.bytes())
-                    };
+                    let new_version = shared_memory.write(data.bytes());
 
                     let Some(new_version) = new_version else {
                         break;
@@ -209,23 +202,11 @@ impl PythonSharedMessage {
 
     fn read_sync(&self, block: bool) -> Option<RustPyBytes> {
         let last_read_version = self.last_read_version.load(Ordering::Relaxed);
-        let mut result = None;
 
-        if block {
-            self.shared_memory
-                .blocking_read(last_read_version, |new_version, data| {
-                    self.last_read_version.store(new_version, Ordering::Relaxed);
-                    result = Some(RustPyBytes::new(data));
-                });
-        } else {
-            self.shared_memory
-                .try_read(last_read_version, |new_version, data| {
-                    self.last_read_version.store(new_version, Ordering::Relaxed);
-                    result = Some(RustPyBytes::new(data));
-                });
-        }
-
-        result
+        let guard = self.shared_memory.read(last_read_version, block)?;
+        self.last_read_version
+            .store(guard.sequence(), Ordering::Relaxed);
+        Some(RustPyBytes::new(guard.data()))
     }
 
     fn read_async(&self, block: bool) -> Option<RustPyBytes> {
@@ -242,7 +223,7 @@ impl PythonSharedMessage {
 
         message.map(|message| {
             self.last_read_version
-                .store(message.version, Ordering::Relaxed);
+                .store(message.sequence, Ordering::Relaxed);
             message.data
         })
     }
@@ -258,20 +239,19 @@ impl PythonSharedMessage {
             .name(format!("{} reader thread", name))
             .spawn(move || {
                 while !shared_memory.is_stopped() {
-                    let mut queue_data = None;
-                    shared_memory.blocking_read(last_reader_version, |new_version, data| {
-                        queue_data = Some(ReceiverQueueData {
-                            version: new_version,
-                            data: RustPyBytes::new(data),
-                        });
-                    });
+                    let Some(guard) = shared_memory.read(last_reader_version, true) else {
+                        continue;
+                    };
+                    let queue_data = ReceiverQueueData {
+                        sequence: guard.sequence(),
+                        data: RustPyBytes::new(guard.data()),
+                    };
+                    drop(guard);
 
-                    if let Some(queue_data) = queue_data {
-                        last_reader_version = queue_data.version;
-                        if sender.send(queue_data).is_err() {
-                            // The other side of the queue was closed
-                            break;
-                        }
+                    last_reader_version = queue_data.sequence;
+                    if sender.send(queue_data).is_err() {
+                        // The other side of the queue was closed
+                        break;
                     }
                 }
             })
@@ -299,7 +279,7 @@ mod tests {
     const DEFAULT_SIZE: usize = 1024 * 1024;
 
     fn get_test_data() -> Vec<u8> {
-        let mut data = vec![0u8; 1024 * 10]; // 10 KB
+        let mut data = vec![0u8; 1024 * 100]; // 100 KB
         for i in 0..data.len() {
             data[i] = (i % 255) as u8;
         }
@@ -374,7 +354,7 @@ mod tests {
         Python::attach(|py| {
             let memory = init(
                 "async_write",
-                OperationMode::ReadAsync,
+                OperationMode::ReadSync,
                 ReaderWaitPolicy::Count(0),
             );
 
@@ -396,7 +376,7 @@ mod tests {
 
             let memory = init(
                 "async_write_try_read",
-                OperationMode::ReadAsync,
+                OperationMode::ReadSync,
                 ReaderWaitPolicy::All(),
             );
             let none = memory.read(false);
@@ -422,7 +402,7 @@ mod tests {
 
             let memory = init(
                 "async_write_blocking_read",
-                OperationMode::ReadAsync,
+                OperationMode::ReadSync,
                 ReaderWaitPolicy::All(),
             );
 
@@ -442,7 +422,7 @@ mod tests {
         Python::attach(|py| {
             let memory = init(
                 "async_multiple_writes",
-                OperationMode::ReadAsync,
+                OperationMode::ReadSync,
                 ReaderWaitPolicy::All(),
             );
 
@@ -451,7 +431,7 @@ mod tests {
             }
 
             for i in 0..255 {
-                assert_eq!(memory.read(true).unwrap(), RustPyBytes::new(&[i]));
+                assert_eq!(memory.read(true).unwrap().0.as_ref(), &[i]);
             }
 
             memory.stop();
@@ -496,9 +476,8 @@ mod tests {
 
             let memory_clone = memory.clone();
             thread::spawn(move || {
-                while let Some(data) = memory_clone.read(true) {
-                    std::hint::black_box(data);
-                    // println!("Got data: {}", data.0.len());
+                while let Some(read_data) = memory_clone.read(true) {
+                    std::hint::black_box(read_data);
                 }
             });
 
@@ -540,15 +519,12 @@ mod tests {
                 thread::spawn(move || {
                     let mut version = 0;
                     loop {
-                        let mut bytes = None;
-                        memory
-                            .shared_memory
-                            .blocking_read(version, |new_version, data| {
-                                version = new_version;
-                                bytes = Some(RustPyBytes::new(data));
-                            });
-                        if let Some(data) = bytes {
-                            let a = data.0.iter().map(|x| x & 1).count();
+                        let guard = memory.shared_memory.read(version, true);
+                        if let Some(guard) = guard {
+                            let bytes = RustPyBytes::new(guard.data());
+                            version = guard.sequence();
+                            drop(guard);
+                            let a = bytes.0.iter().map(|x| x & 1).count();
                             std::hint::black_box(a);
                         } else {
                             break;
