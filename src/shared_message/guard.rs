@@ -18,7 +18,7 @@ impl<'a> MessageReadGuard<'a> {
     }
 
     pub fn data(&self) -> &[u8] {
-        self.message.payload_ref()
+        self.message.data_ref()
     }
 }
 
@@ -35,8 +35,6 @@ impl<'a> Drop for MessageReadGuard<'a> {
 }
 
 /// RAII guard for zero-copy writes to shared memory.
-/// Provides mutable access to a buffer, ensuring proper publication
-/// and writer mutex release when dropped.
 pub struct MessageWriteGuard<'a> {
     message: &'a SharedMessage,
     guard: PayloadWriteGuard<'a>,
@@ -47,11 +45,10 @@ impl<'a> MessageWriteGuard<'a> {
         Self { message, guard }
     }
 
-    pub fn buffer_mut(&mut self) -> &mut [u8] {
-        self.message.payload_mut(&self.guard)
+    pub fn data_mut(&mut self) -> &mut [u8] {
+        self.message.data_mut(&self.guard)
     }
 
-    /// Get the maximum buffer size.
     pub fn capacity(&self) -> usize {
         self.message.capacity()
     }

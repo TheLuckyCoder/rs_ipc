@@ -457,17 +457,6 @@ mod tests {
         }
 
         #[bench]
-        fn pure_write_wait(b: &mut Bencher) {
-            let data = std::hint::black_box(get_test_data());
-            let memory = init(
-                "pure_write",
-                OperationMode::WriteSync,
-                ReaderWaitPolicy::All(),
-            );
-            b.iter(|| memory.write_sync(&data));
-        }
-
-        #[bench]
         fn write_no_wait_with_reader(b: &mut Bencher) {
             let data = std::hint::black_box(get_test_data());
             let memory = Arc::new(init(
