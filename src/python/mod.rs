@@ -12,6 +12,7 @@ mod message;
 mod operation_mode;
 mod queue_data;
 mod reader_wait_policy;
+mod guards;
 
 #[pymodule(gil_used = false)]
 fn rs_ipc(m: &Bound<'_, PyModule>) -> PyResult<()> {

@@ -1,268 +1,269 @@
 from enum import Enum, auto
-from typing import Callable
-
-
-class SharedMessage(object):
-    """
-    A shared memory object that can be used to communicate between processes
-
-    This can be used to communicate in various scenarios, based on `ReaderWaitPolicy` and the number of writer/readers:
-        - SPSC (Single Producer Single Consumer): `ReaderWaitPolicy` set to `All` or `Count(1)`
-        - SPMC (Single Producer Multi Consumer) Broadcast : 1 writer, N readers, `ReaderWaitPolicy` set to `All`
-        - MPSC (Multi Producer Single Consumer): N writers, 1 reader, `ReaderWaitPolicy` set to `All` or `Count(1)`
-        - Fire-and-Forget: `ReaderWaitPolicy` set to `Count(0)` - No waiting for readers, the writer will write the message
-
-    To operate like a FIFO queue, use any 'OperationMode' for writer(s), `OperationMode.ReadAsync` for the reader(s) and `ReaderWaitPolicy.All()`.
-    """
-
-    @staticmethod
-    def create(name: str, size: int, mode: OperationMode, reader_wait_policy: ReaderWaitPolicy) -> 'SharedMessage':
-        """
-        :param name: the name of the shared memory file
-        :param size: cannot be 0
-        :param mode: See `OperationMode`
-        :param reader_wait_policy: See `ReaderWaitPolicy`
-        """
-        pass
-
-    @staticmethod
-    def open(name: str, mode: OperationMode) -> 'SharedMessage':
-        """
-        Open an existing shared memory segment.
-
-        :param name: Name of the shared memory file (must be non-empty)
-        :param mode: See `OperationMode` for allowed combinations
-        :returns: a `SharedMessage` bound to an existing shared memory segment
-        """
-        pass
-
-    def write(self, data: bytes) -> int | None:
-        """
-        Write bytes into the shared memory.
-
-        The behavior depends on both `OperationMode` and `ReaderWaitPolicy`.
-
-        This function releases the GIL while the underlying write operation
-        is performed (from the current thread or the background writer).
-
-        :param data: Bytes to write; must be at most `size` bytes given at `create()`
-        :returns:
-            - The version of the message that was written, if the write happened
-            - ``None`` if:
-                * the AsyncWrite mode, or
-                * the shared memory has been stopped before the write could occur
-        :raises ValueError:
-            - If `data` is larger than the configured maximum payload size
-            - if this instance is configured as create or read
-            - if the background writer queue has been stopped / closed
-        """
-        pass
-
-    def read(self, block: bool = True) -> bytes | None:
-        """
-        Read the next message from shared memory.
-
-        The exact behavior depends on `OperationMode`.
-
-        This function releases the GIL while waiting for a new message.
-
-        :param block:
-            If True, blocks until there is a new message to read (or the
-            shared memory is stopped with no newer message).
-            If False, returns immediately with a message if available, or
-            ``None`` otherwise.
-        :returns:
-            The message bytes, or ``None`` if:
-                - there is no new message and ``block=False``, or
-                - the shared memory is stopped and there is no newer message
-        :raises ValueError:
-            - If this instance is configured as create or write
-        """
-        pass
-
-    def is_new_version_available(self) -> bool:
-        """
-        Check if the next `read()` call would return a newer message.
-
-        This is a non-blocking hint based on comparing the last read version
-        for this instance with the current version in the shared memory.
-
-        Note that:
-            - Another process or reader could consume messages concurrently.
-            - Stopping the shared memory does not reset the version.
-              A stopped but newer version still counts as "available".
-
-        :returns: True if a version newer than `last_read_version()` is available.
-        """
-        pass
-
-    def last_written_version(self) -> int:
-        """
-        Get the last version number written *by this instance*.
-
-        In synchronous write mode, this is updated directly in the calling
-        thread as soon as the write completes.
-
-        In asynchronous write mode, this is updated by the background writer
-        thread once the message is actually written to shared memory.
-
-        :returns: The latest version that was written by this instance
-        """
-        pass
-
-    def last_read_version(self) -> int:
-        """
-        Get the last version number successfully read by this instance.
-
-        This is updated whenever `read()` returns a non-None value.
-
-        :returns: The latest version that was read by this instance
-        """
-        pass
-
-    def name(self) -> str:
-        """
-        :returns: the name of this shared memory file
-        """
-        pass
-
-    def payload_max_size(self) -> int:
-        """
-        Return the maximum payload size (in bytes) that can be written.
-
-        This approximately corresponds to the `size` argument passed to `create()`
-        (or the configured size of the opened shared memory), and is the
-        upper bound on the length of the `data` argument to `write()`.
-
-        :returns: Maximum number of bytes allowed for a single message payload
-        """
-        pass
-
-    def is_stopped(self) -> bool:
-        """
-        Check if the writer(s) have stopped the shared memory.
-
-        Once stopped: See `stop()`
-
-        :returns: True if the shared memory has been marked as stopped
-        """
-
-    def stop(self) -> None:
-        """
-        Signal that writers will stop writing to this `SharedMessage`.
-
-        Effects:
-            - No new writes are allowed.
-            - Any threads blocked in `read(block=True)` are woken; if there
-              is no newer message available, those reads will return ``None``.
-            - Background writer/reader threads associated with this instance
-              will eventually exit once they observe the stop flag.
-
-        This also works when there are multiple writers, as none will be
-        allowed to write after the shared memory is stopped.
-        """
-        pass
-
-
-def read_all(readers: list[SharedMessage]) -> list[bytes | None]:
-    """
-    Read in parallel from all readers and return a list of messages.
-
-    The GIL is released while performing the blocking reads.
-
-    Each reader behaves as if `reader.read(False)` were called, but reads
-    may run in parallel at the native level.
-
-    :param readers: Iterable of readers
-    :return: list of messages (or ``None`` for readers with no new message)
-    """
-    return [reader.read(False) for reader in readers]
-
-
-def read_all_map(readers: list[SharedMessage], map_operation: Callable[[bytes], object]) -> list[object | None]:
-    """
-    Read in parallel from all readers and apply a mapping function.
-
-    The GIL is released while reading the messages but re-acquired on each
-    thread while calling the `map_operation` function.
-
-    :param readers: Iterable of readers
-    :param map_operation: function to apply to each non-None message
-    :return:
-        List of mapped messages, where each element is either:
-            - ``map_operation(message)`` if a message was read, or
-            - ``None`` if that reader returned no new message
-    """
-    return [map_operation(reader.read(False)) for reader in readers]
-
-
-class ReaderWaitPolicy:
-    """
-    Sait for all readers or for the specified number of readers to read the message before writing
-    See `OperationMode.WriteSync` and `OperationMode.WriteAsync`
-    """
-
-    class All(ReaderWaitPolicy):
-        """
-        Wait for all readers to read the message before writing
-        """
-        pass
-
-    class Count(ReaderWaitPolicy):
-        """
-        Wait for the specified number of readers to read the message before writing
-        """
-
-        def __init__(self, number_of_readers: int):
-            pass
-
+from typing import Callable, Iterable, List, Optional, Union, final
 
 class OperationMode(Enum):
     """
-    Indicates that this instance will neither read nor write, just hold the memory open.
-
-    This is intended for use with `SharedMessage.create`, where
-    the creator process keeps the shared memory alive so that other
-    processes can `open` it.
+    Defines the operation mode for the SharedMessage instance.
     """
     CreateOnly = auto()
     """
-    Synchronous reading mode.
-
-    Calls to `read()` may block (when `block=True`) until a new message
-    is available.
+    Indicates that this instance will neither read nor write, just hold the memory open.
+    Intended for use with `SharedMessage.create` to keep shared memory alive for other processes.
     """
+
     ReadSync = auto()
     """
-    Asynchronous reading mode.
-
-    Starts a background thread that reads from shared memory and stores
-    messages in an internal queue. Calls to `read()` consume from that
-    queue, and can be non-blocking (`block=False`) or blocking (`block=True`).
-
-    This mode is useful when you want the read path to be non-blocking or
-    to integrate with event loops without holding the GIL.
+    Synchronous reading mode. Calls to `read(block=True)` block until a new message is available.
     """
+
     ReadAsync = auto()
     """
-    Synchronous writing mode.
-
-    The `write()` function blocks the calling thread according to the
-    `ReaderWaitPolicy` before writing the next message, ensuring that
-    enough readers have consumed the previous one.
+    Asynchronous reading mode. Starts a background thread that reads from shared memory into
+    an internal queue. Allows integrating with event loops without holding the GIL.
     """
+
     WriteSync = auto()
-
     """
-    Asynchronous writing mode.
-
-    The `write()` function enqueues the message to a background writer
-    thread and returns immediately, never blocking the calling thread.
-    The background thread then performs the actual write, honoring the
-    configured `ReaderWaitPolicy`.
-
-    When used with `ReaderWaitPolicy.Count(0)` (fire-and-forget), multiple
-    queued writes may be coalesced and intermediate values dropped, so
-    only the latest enqueued message is guaranteed to be written.
+    Synchronous writing mode. The `write()` function blocks until the readers have consumed
+    the previous message, according to the `ReaderWaitPolicy`.
     """
+
     WriteAsync = auto()
+    """
+    Asynchronous writing mode. The `write()` function enqueues the message to a background
+    thread and returns immediately.
+    """
+
+class ReaderWaitPolicy:
+    """
+    Policy determining how the writer waits for readers.
+    Used in conjunction with `OperationMode.WriteSync` and `OperationMode.WriteAsync`.
+    """
+    @final
+    class All:
+        """Wait for all readers to read the message before writing."""
+        def __init__(self) -> None: ...
+
+    @final
+    class Count:
+        """Wait for a specific number of readers to read the message before writing."""
+        def __init__(self, count: int) -> None: ...
+
+class ReadGuard:
+    """
+    RAII guard for zero-copy read access to shared memory.
+
+    This object behaves like a file-like object (implementing `read`, `seek`, `tell`)
+    and supports the buffer protocol, making it compatible with `pickle.load`.
+    """
+    def __enter__(self) -> "ReadGuard": ...
+    def __exit__(self, exc_type, exc_value, traceback) -> None: ...
+    def __len__(self) -> int: ...
+
+    def sequence(self) -> int:
+        """Get the sequence number of this message."""
+        ...
+
+    def to_bytes(self) -> bytes:
+        """Copy the message data to a Python bytes object."""
+        ...
+
+    def read(self, size: Optional[int] = None) -> bytes:
+        """
+        Read bytes from the buffer (file-like interface).
+
+        :param size: Number of bytes to read. If None or negative, reads until the end.
+        """
+        ...
+
+    def tell(self) -> int:
+        """Return the current cursor position."""
+        ...
+
+    def seek(self, pos: int) -> int:
+        """Set the cursor position."""
+        ...
+
+class WriteGuard:
+    """
+    RAII guard for zero-copy write access to shared memory.
+
+    This object behaves like a file-like object (implementing `write`, `seek`, `tell`)
+    and supports the buffer protocol, making it compatible with `pickle.dump`.
+
+    The data must be published via `publish()` to be visible to readers.
+    """
+    def __enter__(self) -> "WriteGuard": ...
+    def __exit__(self, exc_type, exc_value, traceback) -> None: ...
+    def __len__(self) -> int: ...
+
+    def write(self, data: bytes) -> int:
+        """
+        Write bytes to the buffer (file-like interface).
+
+        :param data: Bytes to write to the buffer.
+        :return: Number of bytes written.
+        :raises ValueError: If data is larger than buffer capacity.
+        """
+        ...
+
+    def tell(self) -> int:
+        """Return the current cursor position."""
+        ...
+
+    def seek(self, pos: int) -> int:
+        """Set the cursor position."""
+        ...
+
+    def publish(self, size: Optional[int] = None) -> Optional[int]:
+        """
+        Atomically publish the written data.
+
+        This consumes the guard. It must be called exactly once before the guard is dropped
+        or the context manager exits, otherwise the data is discarded.
+
+        :param size: Number of bytes to publish. If None, uses the current cursor position.
+        :return: The sequence number of the published message, or None if stopped.
+        """
+        ...
+
+class SharedMessage:
+    """
+    A shared memory object for inter-process communication.
+
+    Supports various topologies based on `ReaderWaitPolicy`:
+    - **SPSC/MPSC**: `ReaderWaitPolicy.All()` or `ReaderWaitPolicy.Count(1)`
+    - **Broadcast (SPMC)**: `ReaderWaitPolicy.All()`
+    - **Fire-and-Forget**: `ReaderWaitPolicy.Count(0)`
+    """
+
+    @staticmethod
+    def create(
+            name: str,
+            size: int,
+            mode: OperationMode,
+            reader_wait_policy: Union[ReaderWaitPolicy.All, ReaderWaitPolicy.Count]
+    ) -> "SharedMessage":
+        """
+        Create a new shared memory segment.
+
+        :param name: The name of the shared memory file.
+        :param size: The size of the payload buffer (cannot be 0).
+        :param mode: The operation mode for this instance.
+        :param reader_wait_policy: The policy for waiting on readers.
+        """
+        ...
+
+    @staticmethod
+    def open(name: str, mode: OperationMode) -> "SharedMessage":
+        """
+        Open an existing shared memory segment.
+
+        :param name: Name of the shared memory file.
+        :param mode: The operation mode for this instance.
+        """
+        ...
+
+    def write(self, data: bytes) -> Optional[int]:
+        """
+        Write bytes into the shared memory.
+
+        Releases the GIL during operation.
+
+        :param data: Bytes to write. Must not exceed capacity.
+        :return: The version of the message written, or None if AsyncWrite or stopped.
+        :raises ValueError: If data is too large or instance is not a writer.
+        """
+        ...
+
+    def read(self, block: bool = True) -> Optional[bytes]:
+        """
+        Read the next message from shared memory.
+
+        Releases the GIL while waiting.
+
+        :param block: If True, blocks until a new message is available.
+        :return: The message bytes, or None if no new message is available (non-blocking) or stopped.
+        """
+        ...
+
+    def write_guard(self) -> Optional[WriteGuard]:
+        """
+        Acquire a zero-copy write guard.
+
+        The guard provides a buffer that can be written to directly (e.g., via `pickle.dump`).
+        Use in a context manager to ensure cleanup.
+
+        :return: A `WriteGuard` or None if the shared memory is stopped.
+        """
+        ...
+
+    def read_guard(self, block: bool = True) -> Optional[ReadGuard]:
+        """
+        Acquire a zero-copy read guard.
+
+        The guard provides a view of the shared memory (e.g., for `pickle.load`).
+        Use in a context manager to ensure cleanup.
+
+        :param block: If True, blocks until new data is available.
+        :return: A `ReadGuard` or None if no data is available.
+        """
+        ...
+
+    def is_new_version_available(self) -> bool:
+        """
+        Check if a newer message is available compared to the last read version.
+        This is a non-blocking hint.
+        """
+        ...
+
+    def last_written_version(self) -> int:
+        """Get the last version number written by this instance."""
+        ...
+
+    def last_read_version(self) -> int:
+        """Get the last version number successfully read by this instance."""
+        ...
+
+    def name(self) -> str:
+        """Return the name of the shared memory file."""
+        ...
+
+    def capacity(self) -> int:
+        """Return the maximum payload size in bytes."""
+        ...
+
+    def is_stopped(self) -> bool:
+        """Check if the shared memory has been marked as stopped."""
+        ...
+
+    def stop(self) -> None:
+        """
+        Signal that no further writes will occur.
+        Wakes up blocked readers and eventually stops background threads.
+        """
+        ...
+
+def read_all(readers: Iterable[SharedMessage]) -> List[Optional[bytes]]:
+    """
+    Read from multiple readers in parallel.
+
+    :param readers: Iterable of SharedMessage instances.
+    :return: A list of messages (bytes) or None for readers with no new data.
+    """
+    ...
+
+def read_all_map(
+        readers: Iterable[SharedMessage],
+        map_operation: Callable[[bytes], object]
+) -> List[Optional[object]]:
+    """
+    Read from multiple readers in parallel and apply a mapping function.
+
+    The GIL is released during the read, but re-acquired for the map operation.
+
+    :param readers: Iterable of SharedMessage instances.
+    :param map_operation: Function to apply to the bytes.
+    :return: List of mapped objects or None.
+    """
+    ...

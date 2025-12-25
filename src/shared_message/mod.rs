@@ -197,8 +197,16 @@ impl SharedMessage {
 
 // Public functions
 impl SharedMessage {
+    /// Returns a WriteGuard that provides mutable access, or None if stopped
+    /// The data will be published when the guard's `publish()` method is called.
+    /// The writer mutex is acquired here and will be held until the guard is published or dropped.
+    pub fn write(&self) -> Option<MessageWriteGuard<'_>> {
+        let write_guard = self.start_write()?;
+        Some(MessageWriteGuard::new(self, write_guard))
+    }
+    
     /// Returns the new sequence number if successful, None if stopped.
-    pub fn write(&self, new_data: &[u8]) -> Option<u64> {
+    pub fn write_slice(&self, new_data: &[u8]) -> Option<u64> {
         let writer_guard = self.start_write()?;
 
         let data = self.data_mut(&writer_guard);
@@ -214,13 +222,6 @@ impl SharedMessage {
         self.publish_write(writer_guard, new_data.len())
     }
 
-    /// Returns a WriteGuard that provides mutable access
-    /// The data will be published when the guard's `publish()` method is called.
-    /// The writer mutex is acquired here and will be held until the guard is published or dropped.
-    pub fn acquire_write_guard(&self) -> Option<MessageWriteGuard<'_>> {
-        let write_guard = self.start_write()?;
-        Some(MessageWriteGuard::new(self, write_guard))
-    }
 
     /// Returns a ReadGuard if new data is available, None otherwise.
     pub fn read(&self, last_seen_seq: u64, block: bool) -> Option<MessageReadGuard<'_>> {

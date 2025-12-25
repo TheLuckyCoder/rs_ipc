@@ -1,5 +1,6 @@
 use crate::python::OperationMode;
 use crate::python::bytes::RustPyBytes;
+use crate::python::guards::{PythonReadGuard, PythonWriteGuard};
 use crate::python::operation_mode::OperationMode::WriteAsync;
 use crate::python::queue_data::{ReceiverQueueData, SenderQueueData};
 use crate::python::reader_wait_policy::ReaderWaitPolicy;
@@ -19,8 +20,8 @@ pub struct PythonSharedMessage {
     shared_memory: Arc<SharedMessageMapper>,
     name: String,
     op_mode: OperationMode,
-    last_written_version: Arc<AtomicU64>,
-    last_read_version: Arc<AtomicU64>,
+    pub(crate) last_written_sequence: Arc<AtomicU64>,
+    last_read_sequence: Arc<AtomicU64>,
     sender: Mutex<Option<Sender<SenderQueueData>>>,
     receiver: Mutex<Option<Receiver<ReceiverQueueData>>>,
 }
@@ -52,6 +53,9 @@ impl PythonSharedMessage {
         if name.is_empty() {
             return Err(PyValueError::new_err("Name cannot be empty"));
         }
+        if mode == OperationMode::CreateOnly {
+            return Err(PyValueError::new_err("Mode cannot be create"));
+        }
 
         let c_name = CString::new(name.clone())?;
         let shared_memory = SharedMessageMapper::open(c_name)?;
@@ -63,10 +67,11 @@ impl PythonSharedMessage {
         self.op_mode.check_write_permission();
 
         let data_bytes = data.as_bytes();
-        if data_bytes.len() > self.payload_max_size() {
+        let capacity = self.capacity();
+        if data_bytes.len() > capacity {
             return Err(PyValueError::new_err(format!(
                 "Message is too large to be sent! Max size: {}. Current message size: {}",
-                self.payload_max_size(),
+                capacity,
                 data_bytes.len()
             )));
         }
@@ -79,6 +84,18 @@ impl PythonSharedMessage {
         })
     }
 
+    fn write_guard(slf: &Bound<'_, Self>) -> PyResult<Option<PythonWriteGuard>> {
+        let shared_message = slf.get();
+        shared_message.op_mode.check_write_permission();
+
+        let guard = slf
+            .py()
+            .detach(|| shared_message.shared_memory.write());
+        let object = slf.clone().unbind();
+
+        Ok(guard.map(|guard| PythonWriteGuard::new(object, guard)))
+    }
+
     #[pyo3(name = "read", signature = (block = true))]
     fn read_py(&self, block: bool, py: Python<'_>) -> Option<RustPyBytes> {
         self.op_mode.check_read_permission();
@@ -86,27 +103,45 @@ impl PythonSharedMessage {
         py.detach(|| self.read(block))
     }
 
+    fn read_guard(slf: &Bound<'_, Self>, block: bool) -> PyResult<Option<PythonReadGuard>> {
+        let shared_message = slf.get();
+        shared_message.op_mode.check_read_permission();
+
+        let last_read = shared_message.last_read_sequence.load(Ordering::Relaxed);
+        let guard = slf
+            .py()
+            .detach(|| shared_message.shared_memory.read(last_read, block));
+        let object = slf.clone().unbind();
+
+        if let Some(guard) = guard {
+            shared_message.last_read_sequence.store(guard.sequence(), Ordering::Relaxed);
+            return Ok(Some(PythonReadGuard::new(object, guard)));
+        }
+
+        Ok(None)
+    }
+
     fn is_new_version_available(&self) -> bool {
         self.op_mode.check_read_permission();
 
-        let last_read_version = self.last_read_version.load(Ordering::Relaxed);
-        self.shared_memory.has_new_data(last_read_version)
+        let last_sequence = self.last_read_sequence.load(Ordering::Relaxed);
+        self.shared_memory.has_new_data(last_sequence)
     }
 
     fn last_written_version(&self) -> u64 {
-        self.last_written_version.load(Ordering::Relaxed)
+        self.last_written_sequence.load(Ordering::Relaxed)
     }
 
     fn last_read_version(&self) -> u64 {
-        self.last_read_version.load(Ordering::Relaxed)
+        self.last_read_sequence.load(Ordering::Relaxed)
     }
 
     fn name(&self) -> &str {
         &self.name
     }
 
-    fn payload_max_size(&self) -> usize {
-        self.shared_memory.mapped_memory_size() - SharedMessage::size_of_fields()
+    fn capacity(&self) -> usize {
+        self.shared_memory.capacity()
     }
 
     fn is_stopped(&self) -> bool {
@@ -137,18 +172,19 @@ impl PythonSharedMessage {
             shared_memory,
             name,
             op_mode,
-            last_written_version: Arc::default(),
-            last_read_version: Arc::default(),
+            last_written_sequence: Arc::default(),
+            last_read_sequence: Arc::default(),
             sender: Mutex::default(),
             receiver: Mutex::new(receiver),
         }
     }
 
     fn write_sync(&self, data: &[u8]) -> Option<u64> {
-        let sequence = self.shared_memory.write(data);
+        let sequence = self.shared_memory.write_slice(data);
 
         if let Some(sequence) = sequence {
-            self.last_written_version.store(sequence, Ordering::Relaxed);
+            self.last_written_sequence
+                .store(sequence, Ordering::Relaxed);
         }
 
         sequence
@@ -165,7 +201,7 @@ impl PythonSharedMessage {
         let sender = guard.get_or_insert_with(|| {
             let (sender, receiver) = channel::<SenderQueueData>();
 
-            let last_written_version = self.last_written_version.clone();
+            let last_written = self.last_written_sequence.clone();
             let shared_memory = self.shared_memory.clone();
 
             std::thread::Builder::new()
@@ -175,13 +211,13 @@ impl PythonSharedMessage {
                         let Ok(data) = receiver.recv() else {
                             break;
                         };
-                        let new_version = shared_memory.write(data.bytes());
+                        let new_version = shared_memory.write_slice(data.bytes());
 
                         let Some(new_version) = new_version else {
                             break;
                         };
 
-                        last_written_version.store(new_version, Ordering::Relaxed);
+                        last_written.store(new_version, Ordering::Relaxed);
                     }
                 })
                 .expect("Failed to create writer thread");
@@ -203,10 +239,10 @@ impl PythonSharedMessage {
     }
 
     fn read_sync(&self, block: bool) -> Option<RustPyBytes> {
-        let last_read_version = self.last_read_version.load(Ordering::Relaxed);
+        let last_read_version = self.last_read_sequence.load(Ordering::Relaxed);
 
         let guard = self.shared_memory.read(last_read_version, block)?;
-        self.last_read_version
+        self.last_read_sequence
             .store(guard.sequence(), Ordering::Relaxed);
         Some(RustPyBytes::new(guard.data()))
     }
@@ -224,7 +260,7 @@ impl PythonSharedMessage {
         };
 
         message.map(|message| {
-            self.last_read_version
+            self.last_read_sequence
                 .store(message.sequence, Ordering::Relaxed);
             message.data
         })
