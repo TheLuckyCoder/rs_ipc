@@ -1,0 +1,184 @@
+%\documentclass[12pt]{scrreprt}
+\documentclass[12pt]{report}
+
+% language may be romanian or english (default is english)
+% type may be bachelor or master (default is bachelor)
+\usepackage[language=english, type=master]{style}
+
+%\geometry{a4paper,top=2.5cm,left=3cm,right=2.5cm,bottom=2.5cm}
+%in style
+%controlling the appearance of your headers and footers
+\usepackage{fancyhdr}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\pagestyle{fancy}
+\lhead{}
+\chead{}
+\renewcommand{\headrulewidth}{0.2pt}
+\renewcommand{\footrulewidth}{0.2pt}
+
+\begin{document}
+
+% ============================================================================
+% ENGLISH TITLE PAGE
+% ============================================================================
+\begin{titlepage}
+\begin{center}
+{\Large\textbf{BABEŞ-BOLYAI UNIVERSITY CLUJ-NAPOCA}\\[1em]
+\textbf{FACULTY OF MATHEMATICS AND COMPUTER SCIENCE}\\[1em]
+\textbf{SPECIALIZATION: ADVANCED INFORMATION SYSTEMS}}
+\end{center}
+
+\vspace{8em}
+
+\begin{center}
+    \Huge\textbf{MASTER'S THESIS}
+\end{center}
+
+\vspace{2em}
+
+\begin{center}
+    \Large\textbf{Efficient Inter-Process Communication with Zero-Copy Semantics:\\[0.5em] A Rust-Based Shared Memory Library for Python}
+\end{center}
+
+\vspace{9em}
+
+\begin{flushleft}
+{\Large\textbf{Scientific Supervisor \\ Lect. Dr. Eng. Bența Kuderna-Iulian}}
+\end{flushleft}
+
+\vspace{3em}
+
+\begin{flushright}
+{\Large\textit{Absolvent\\ Filea Răzvan-Gheorghe}}
+\end{flushright}
+
+\vfill
+
+\begin{center}
+{\Large{2026}}
+\end{center}
+\end{titlepage}
+
+% ============================================================================
+% GERMAN TITLE PAGE
+% ============================================================================
+\begin{titlepage}
+\begin{center}
+{\Large\textbf{BABEŞ-BOLYAI UNIVERSITÄT CLUJ-NAPOCA}\\[1em]
+\textbf{FAKULTÄT FÜR MATHEMATIK UND INFORMATIK}\\[1em]
+\textbf{SPEZIALISIERUNG: FORTGESCHRITTENE INFORMATIONSSYSTEME}}
+\end{center}
+
+\vspace{10em}
+
+\begin{center}
+    \Huge\textbf{MASTERARBEIT}
+\end{center}
+
+\vspace{2em}
+
+\begin{center}
+    \Large\textbf{Effiziente Interprozesskommunikation mit Zero-Copy-Semantik:\\[0.5em] Eine Rust-basierte Shared-Memory-Bibliothek für Python}
+\end{center}
+
+\vspace{7em}
+
+\begin{flushleft}
+{\Large\textbf{Wissenschaftlicher Betreuer \\ Lekt. Dr. Ing. Bența Kuderna-Iulian}}
+\end{flushleft}
+
+\vspace{3em}
+
+\begin{flushright}
+{\Large\textit{Absolvent\\ Filea Răzvan-Gheorghe}}
+\end{flushright}
+
+\vfill
+
+\begin{center}
+{\Large{2026}}
+\end{center}
+\end{titlepage}
+
+% ============================================================================
+% ROMANIAN TITLE PAGE
+% ============================================================================
+\begin{titlepage}
+\begin{center}
+{\Large\textbf{UNIVERSITATEA BABEŞ-BOLYAI CLUJ-NAPOCA}\\[1em]
+\textbf{FACULTATEA DE MATEMATICĂ ŞI INFORMATICĂ}\\[1em]
+\textbf{SPECIALIZAREA: SISTEME INFORMATICE AVANSATE}}
+\end{center}
+
+\vspace{10em}
+
+\begin{center}
+    \Huge\textbf{LUCRARE DE DISERTAŢIE}
+\end{center}
+
+\vspace{2em}
+
+\begin{center}
+    \Large\textbf{Comunicare Eficientă între Procese cu Semantică Zero-Copy:\\[0.5em] O Bibliotecă Bazată pe Rust pentru Comunicare prin Memorie Partajată în Python}
+\end{center}
+
+\vspace{7em}
+
+\begin{flushleft}
+{\Large\textbf{Conducător ştiinţific \\ Lect. Dr. Ing. Bența Kuderna-Iulian}}
+\end{flushleft}
+
+\vspace{3em}
+
+\begin{flushright}
+{\Large\textit{Absolvent\\ Filea Răzvan-Gheorghe}}
+\end{flushright}
+
+\vfill
+
+\begin{center}
+{\Large{2026}}
+\end{center}
+\end{titlepage}
+
+\newpage
+\thispagestyle{empty}
+\mbox{}
+\newpage
+\pagenumbering{roman}
+
+\cleardoublepage
+\textbf{ABSTRACT}
+\vspace{0.5cm}
+\hrule
+\vspace{0.5cm}
+%\cleardoublepage
+
+Python's native inter-process communication mechanisms exhibit significant performance limitations in data-intensive applications requiring low-latency data transfer. This thesis presents \texttt{rs\_ipc}, a high-performance IPC library implemented in Rust that achieves zero-copy communication through POSIX shared memory.
+
+The library introduces a \texttt{SharedMessage} abstraction with futex-based synchronization, enabling efficient producer-consumer patterns without pthread FFI overhead. Key design features include direct shared memory access eliminating redundant copies, version checking without lock acquisition, flexible blocking strategies (non-blocking, partial-blocking, full-blocking), and GIL-free operations for Python multithreading.
+
+Benchmarks across embedded platforms and workstations demonstrate significant speedups over Python's \texttt{multiprocessing} primitives. The partial-blocking communication strategy enables faster processing pipelines to proceed without waiting on slower ones, substantially improving overall throughput in concurrent applications. Validation on a 1:10 scale autonomous vehicle confirms applicability to real-time computer vision systems.
+
+
+\tableofcontents
+
+
+\newpage
+\pagenumbering{arabic}
+
+\input{chapters/chapter1_introduction}
+
+\input{chapters/chapter2}
+\input{chapters/chapter3}
+\input{chapters/chapter4}
+\input{chapters/chapter5}
+
+\input{chapters/chapter_conclusions}
+%\addcontentsline{toc}{chapter}{Concluzii}
+%\addcontentsline{toc}{chapter}{Conclusions}
+
+\bibliography{references}
+
+\end{document}

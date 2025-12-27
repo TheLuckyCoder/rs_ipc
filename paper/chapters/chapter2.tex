@@ -1,0 +1,311 @@
+\chapter{Foundations and Requirements}
+\label{chap:ch2}
+
+This chapter presents the theoretical foundations underlying the design and implementation of the \texttt{rs\_ipc} library. Each section introduces a concept or mechanism that is directly utilized in the architecture described in Chapter~\ref{chap:ch3}: POSIX shared memory provides the transport layer, synchronization primitives ensure data consistency, Linux futexes enable efficient cross-process locking, Python's concurrency model motivates the GIL release strategy, and Rust's type system guarantees memory safety across the foreign function boundary.
+
+\section{POSIX Shared Memory and Memory Mapping}
+\label{sec:shm}
+
+Shared memory represents the fastest form of inter-process communication available on modern operating systems. Unlike pipe-based or socket-based mechanisms, shared memory allows multiple processes to access the same physical memory region without copying data through the kernel. This section describes the POSIX interfaces that enable this capability.
+
+\subsection{Shared Memory Objects}
+
+The POSIX shared memory API provides two primary functions for managing shared memory objects: \texttt{shm\_open} and \texttt{shm\_unlink}~\cite{posix2017}. The \texttt{shm\_open} function creates or opens a named shared memory object, returning a file descriptor that can be used with standard file operations. On Linux, these objects reside in a \texttt{tmpfs} filesystem mounted at \texttt{/dev/shm}, backed entirely by RAM and swap rather than persistent storage.
+
+The lifecycle of a shared memory object follows a create-size-map-use-unmap-unlink pattern:
+
+\begin{enumerate}
+    \item \texttt{shm\_open} creates the object and returns a file descriptor.
+    \item \texttt{ftruncate} sets the size of the memory region.
+    \item \texttt{mmap} maps the region into the process address space.
+    \item Processes read and write directly to the mapped region.
+    \item \texttt{munmap} removes the mapping from the process.
+    \item \texttt{shm\_unlink} removes the named object from the filesystem.
+\end{enumerate}
+
+Named shared memory objects persist in the filesystem namespace until explicitly unlinked, independent of the processes that created them. This property enables communication patterns where the producer and consumer processes do not share a parent-child relationship, unlike anonymous mappings created via \texttt{fork}.
+
+\subsection{Memory-Mapped I/O}
+
+The \texttt{mmap} system call maps a file descriptor (including shared memory objects) into the virtual address space of the calling process~\cite{kerrisk2010}. When invoked with the \texttt{MAP\_SHARED} flag, modifications made by one process become visible to all other processes that have mapped the same underlying object. The kernel ensures coherence through the page table mechanism: all mappings of the same physical page share the same underlying memory, so writes are immediately visible without explicit synchronization at the memory level.
+
+However, visibility at the memory level does not imply ordering guarantees at the instruction level. Modern processors may reorder memory operations for performance, meaning that a write performed by one process may not be observed in the expected order by another process. This gap between memory coherence and memory consistency motivates the synchronization mechanisms described in Section~\ref{sec:sync}.
+
+\subsection{Translation Lookaside Buffer Considerations}
+
+When a process accesses a mapped memory region, the CPU must translate virtual addresses to physical addresses. The Translation Lookaside Buffer (TLB) caches recent translations to avoid costly page table walks. With the default page size of 4~KiB on x86\_64 architectures, a 4~MiB shared memory region spans 1024 pages, each requiring a TLB entry for efficient access.
+
+For large data transfers---such as video frames or tensor buffers---the number of required TLB entries may exceed the available capacity, causing TLB misses that degrade performance. Explicit huge pages (2~MiB or 1~GiB on x86\_64) reduce this pressure by covering larger address ranges with fewer entries. However, explicit huge pages require memory backed by \texttt{hugetlbfs}, which is incompatible with POSIX shared memory objects created via \texttt{shm\_open}. The alternative---Linux Transparent Huge Pages (THP)---can be requested via \texttt{madvise} with the \texttt{MADV\_HUGEPAGE} hint, but the kernel treats this as advisory: allocation depends on the availability of contiguous physical memory and is not guaranteed~\cite{kerrisk2010}. In practice, THP is unreliable for shared memory regions that are frequently created and destroyed, limiting its applicability to long-lived mappings with favorable allocation timing.
+
+\subsection{Shared Memory versus Message Passing}
+
+The fundamental trade-off between shared memory and message-passing IPC lies in the division of responsibility. Message-passing mechanisms (pipes, sockets, message queues) handle serialization, buffering, and delivery on behalf of the application, introducing at least one memory copy per transfer---from the sender's buffer into kernel space, and from kernel space into the receiver's buffer. Shared memory eliminates these copies entirely: both processes operate on the same physical memory, achieving true zero-copy semantics.
+
+The cost of this efficiency is complexity. Shared memory provides no inherent ordering, synchronization, or notification mechanism. The application must explicitly coordinate access to prevent data races, detect when new data is available, and ensure that readers do not observe partially written messages. These requirements motivate the synchronization primitives described in the following section.
+
+
+\section{Synchronization Primitives}
+\label{sec:sync}
+
+When multiple processes share a memory region, concurrent access to the same data without coordination leads to data races: outcomes that depend on the relative timing of operations across processes. This section introduces the synchronization mechanisms that prevent such races, ordered from hardware-level primitives to higher-level abstractions.
+
+\subsection{Atomic Operations}
+\label{subsec:atomics}
+
+Modern processors provide instructions that execute indivisibly with respect to other cores. These atomic operations form the foundation of all higher-level synchronization~\cite{herlihy2012}. The two most relevant to this work are Compare-And-Swap (CAS), which conditionally updates a memory location only if it holds an expected value, and Fetch-And-Add, which atomically increments a value and returns the previous one. CAS enables the fast path of lock acquisition (attempting to claim an uncontended lock without kernel involvement), while Fetch-And-Add drives sequence counters and notification mechanisms where multiple writers must produce distinct values without coordination.
+
+\subsection{Memory Ordering}
+\label{subsec:memory_ordering}
+
+Atomic operations alone do not suffice for correct synchronization. Modern CPUs and compilers reorder memory operations to improve throughput, subject to per-thread consistency but not cross-thread visibility guarantees. Memory ordering constraints specify how operations on atomic variables relate to operations on other memory locations~\cite{herlihy2012}.
+
+The C++11 memory model, adopted by Rust through its \texttt{std::sync::atomic} module, defines several ordering levels:
+
+\begin{itemize}
+    \item \textbf{Relaxed}: No ordering guarantees beyond atomicity. The operation cannot be torn (partially observed), but surrounding reads and writes may be reordered freely. Suitable for counters where only the final value matters.
+
+    \item \textbf{Acquire}: When a load operation uses Acquire ordering, it guarantees that all subsequent reads and writes (in program order) will observe effects that were visible before the corresponding Release store. Conceptually, it ``acquires'' the data published by a Release.
+
+    \item \textbf{Release}: When a store operation uses Release ordering, it guarantees that all preceding reads and writes (in program order) are visible to any thread that performs an Acquire load of the same atomic variable. Conceptually, it ``releases'' or publishes accumulated state.
+
+    \item \textbf{SeqCst} (Sequentially Consistent): The strongest ordering, establishing a single total order of all SeqCst operations across all threads. This prevents subtle reordering issues but limits hardware optimization.
+\end{itemize}
+
+The Acquire-Release pair is fundamental to producer-consumer patterns: a producer writes data and then performs a Release store to a flag variable; a consumer performs an Acquire load of the same flag and is guaranteed to observe the producer's data writes. This pattern appears directly in the version-checking mechanism of the \texttt{SharedMessage} implementation.
+
+\subsection{Cache Coherence and False Sharing}
+\label{subsec:false_sharing}
+
+Multi-core processors maintain cache coherence through protocols such as MESI (Modified, Exclusive, Shared, Invalid)~\cite{herlihy2012}. When one core modifies a cache line, the protocol invalidates copies held by other cores, forcing them to re-fetch the updated data from a shared cache level or main memory.
+
+Cache coherence operates at the granularity of cache lines, typically 64 bytes on x86\_64 processors. This granularity introduces a subtle performance pathology known as \textit{false sharing}: when two logically independent variables reside on the same cache line, a write to one variable invalidates the other variable's cache entry on remote cores, even though the second variable was not modified.
+
+In the context of shared memory IPC, false sharing is particularly damaging. Consider a structure where a write-mostly field (such as a sequence counter incremented by the producer) and a read-mostly field (such as a consumer count) occupy the same cache line. Every producer write would invalidate the cache line on all consumer cores, forcing them to re-fetch data they are only reading---not because the data changed, but because an adjacent field did.
+
+The standard mitigation is to separate frequently accessed fields into distinct cache lines through explicit padding. Using 128-byte separation (two cache lines) provides additional protection against hardware prefetching, which may speculatively load adjacent cache lines.
+
+\subsection{Mutexes}
+\label{subsec:mutexes}
+
+A mutex (mutual exclusion lock) ensures that at most one thread or process executes a critical section at any given time. Conceptually, a mutex provides two operations: \texttt{lock} (acquire exclusive access, blocking if unavailable) and \texttt{unlock} (release exclusive access, potentially waking a blocked waiter).
+
+Mutex implementations occupy a spectrum between two extremes:
+
+\begin{itemize}
+    \item \textbf{Spin locks}: The acquiring thread repeatedly tests the lock state in a tight loop. This avoids the overhead of context switches but wastes CPU cycles during contention. Spin locks perform well when critical sections are short and contention is rare.
+
+    \item \textbf{Blocking locks}: When the lock is unavailable, the acquiring thread yields the CPU to the operating system scheduler. This eliminates busy-waiting but incurs the cost of context switches (typically 1--10 microseconds). Blocking locks are appropriate when critical sections are long or contention is frequent.
+\end{itemize}
+
+A hybrid approach combines both strategies: spin briefly (optimistic that the lock will be released quickly), then fall back to blocking if the spin phase fails. This approach, described in detail in Section~\ref{sec:futex}, forms the basis of the futex-based lock used in \texttt{rs\_ipc}.
+
+\subsection{Condition Variables}
+\label{subsec:condvars}
+
+While mutexes protect shared state, they do not provide a mechanism for threads to efficiently wait for state changes. A thread that needs to wait for a particular condition (e.g., ``new data is available'') could repeatedly acquire the lock, check the condition, release the lock, and retry---a pattern called busy-waiting that wastes CPU resources.
+
+Condition variables solve this problem by allowing a thread to atomically release a lock and suspend execution until another thread signals that the condition may have changed. The fundamental operations are:
+
+\begin{itemize}
+    \item \textbf{wait(lock, condition)}: Atomically releases the lock and suspends the calling thread. When the thread is awakened, it re-acquires the lock before returning.
+
+    \item \textbf{notify\_one}: Wakes one suspended thread waiting on the condition variable.
+
+    \item \textbf{notify\_all}: Wakes all suspended threads waiting on the condition variable.
+\end{itemize}
+
+In a producer-consumer system, the producer signals the condition variable after writing new data, waking consumers that were waiting for fresh input. The atomicity of the release-and-suspend operation in \texttt{wait} prevents a race condition where a notification arrives between releasing the lock and entering the wait state (the ``lost wakeup'' problem).
+
+
+\section{The Linux Futex Subsystem}
+\label{sec:futex}
+
+Traditional Unix synchronization primitives such as System~V semaphores require a system call for every lock and unlock operation, regardless of whether contention exists. The POSIX threads (pthread) library improves upon this with userspace fast paths, but its use across process boundaries introduces complexity: \texttt{pthread\_mutex\_t} must be initialized with the \texttt{PTHREAD\_PROCESS\_SHARED} attribute, placed in shared memory, and accessed through the same library version in all processes.
+
+The \textit{futex} (Fast Userspace Mutex) subsystem, introduced in Linux 2.5.7~\cite{franke2002}, provides a more fundamental building block that addresses these limitations.
+
+\subsection{Architecture}
+
+A futex operates on a single 32-bit integer in userspace memory. The kernel associates a wait queue with the physical address of this integer, enabling cross-process synchronization without any shared library state. The two core operations are:
+
+\begin{itemize}
+    \item \texttt{futex\_wait(addr, expected)}: If the value at \texttt{addr} equals \texttt{expected}, the calling thread is added to the kernel wait queue and suspended. If the values differ, the call returns immediately. This atomic check-and-sleep prevents lost wakeups.
+
+    \item \texttt{futex\_wake(addr, count)}: Wakes up to \texttt{count} threads waiting on the queue associated with \texttt{addr}.
+\end{itemize}
+
+The critical insight is that the common case---acquiring an uncontended lock---requires only a userspace atomic CAS operation with no system call. The kernel is involved only when a thread must actually sleep (contended lock) or wake a sleeper (unlock with waiters). This asymmetry makes futexes highly efficient for workloads where contention is infrequent.
+
+\subsection{The Three-State Lock Pattern}
+
+Drepper~\cite{drepper2005} describes an efficient mutex implementation using three states rather than the naive two-state (locked/unlocked) approach:
+
+\begin{itemize}
+    \item \textbf{State 0 (Unlocked)}: The lock is available.
+    \item \textbf{State 1 (Locked, no waiters)}: The lock is held but no other thread is waiting for it.
+    \item \textbf{State 2 (Locked, with waiters)}: The lock is held and at least one thread is blocked in the kernel waiting for it.
+\end{itemize}
+
+The distinction between states 1 and 2 is an optimization. When unlocking from state 1, the implementation knows that no threads are waiting and can skip the \texttt{futex\_wake} system call entirely. Only when unlocking from state 2 must the implementation invoke the kernel to wake a waiter. This optimization eliminates a system call on every uncontended unlock operation.
+
+The lock acquisition sequence follows:
+
+\begin{enumerate}
+    \item Attempt a CAS from state 0 to state 1 (fast path, no syscall).
+    \item If the CAS fails, spin briefly with relaxed loads, hoping the lock is released quickly.
+    \item If spinning fails, transition the state to 2 (signaling that waiters exist) and call \texttt{futex\_wait}.
+    \item Upon waking, retry acquisition from step 1.
+\end{enumerate}
+
+The spin phase (step 2) uses relaxed loads rather than CAS operations to avoid generating cache-line invalidations during the spin. This reduces coherence traffic when multiple threads contend for the same lock.
+
+\subsection{Cross-Process Synchronization}
+
+A key property of the futex subsystem is that wait queues are keyed by physical memory address, not by virtual address or process identity~\cite{franke2002}. Because \texttt{mmap} with \texttt{MAP\_SHARED} causes distinct virtual addresses in separate processes to resolve to identical physical frames, a 32-bit futex variable placed in such a region is inherently cross-process: a \texttt{futex\_wake} issued by the producer resolves to the same kernel wait queue that the consumer's \texttt{futex\_wait} registered against.
+
+This property eliminates the initialization complexity of \texttt{PTHREAD\_PROCESS\_SHARED} mutexes. A futex-based lock in shared memory works correctly as soon as the memory is mapped---no constructor, no attribute configuration, no shared library dependency. The lock's state is entirely represented by the 4-byte integer, making it trivially relocatable within shared memory.
+
+\subsection{Comparison with pthread}
+
+Table~\ref{tab:futex_vs_pthread} summarizes the practical differences between futex-based and pthread-based synchronization for cross-process use.
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{|l|l|l|}
+\hline
+\textbf{Aspect} & \textbf{pthread} & \textbf{Futex} \\
+\hline
+Size & 40+ bytes & 4 bytes \\
+\hline
+Initialization & Attribute setup required & Zero-initialization \\
+\hline
+Cross-process & \texttt{PTHREAD\_PROCESS\_SHARED} & Automatic (physical addr) \\
+\hline
+FFI overhead & ctypes marshalling & Direct syscall \\
+\hline
+Library dependency & libpthread & None (kernel ABI) \\
+\hline
+Spin-then-block & Implementation-defined & Fully customizable \\
+\hline
+\end{tabular}
+\caption{Comparison of pthread and futex-based synchronization for cross-process IPC.}
+\label{tab:futex_vs_pthread}
+\end{table}
+
+For a Rust library targeting Linux and interoperating with Python through FFI, futexes offer a clear advantage: smaller memory footprint, no external library dependencies, no complex initialization, and full control over the spin-then-block strategy.
+
+
+\section{The Python Concurrency Model}
+\label{sec:python_concurrency}
+
+Python's concurrency model presents unique challenges and opportunities for native extension libraries. Understanding these constraints is essential to designing an IPC library that integrates efficiently with Python applications.
+
+\subsection{The Global Interpreter Lock}
+
+CPython, the reference implementation of Python, employs a Global Interpreter Lock (GIL) that permits only one thread to execute Python bytecode at any given time~\cite{python_gil}. The GIL exists primarily to protect CPython's memory management system: Python objects use reference counting for memory deallocation, and the reference count updates are not atomic. Without the GIL, concurrent increments and decrements could corrupt reference counts, leading to memory leaks or use-after-free errors.
+
+The GIL's impact on performance depends on the nature of the workload:
+
+\begin{itemize}
+    \item \textbf{I/O-bound tasks}: The GIL is released during blocking I/O operations (file reads, network calls), allowing other threads to execute. Multithreading remains effective for I/O-bound workloads.
+
+    \item \textbf{CPU-bound tasks}: Threads contend for the GIL, effectively serializing execution. A multi-threaded CPU-bound program may perform worse than a single-threaded version due to the overhead of GIL acquisition and release.
+\end{itemize}
+
+For data-intensive applications that require both computation and inter-process communication, the GIL creates a tension: the application uses multiple processes to achieve parallelism (circumventing the GIL), but then requires efficient IPC to coordinate between those processes.
+
+\subsection{Releasing the GIL from Native Extensions}
+
+Native extensions written in C, C++, or Rust can release the GIL while executing code that does not interact with Python objects. The CPython C~API provides the macros \texttt{Py\_BEGIN\_ALLOW\_THREADS} and \texttt{Py\_END\_ALLOW\_THREADS} for this purpose. In the Rust ecosystem, the PyO3 framework provides an equivalent mechanism through the \texttt{Python::detach} method, which releases the GIL for the duration of a closure~\cite{pyo3}.
+
+The safety invariant for GIL release is straightforward: no Python objects may be accessed while the GIL is released. This means:
+
+\begin{itemize}
+    \item No reading or writing Python object attributes.
+    \item No calling Python functions or methods.
+    \item No incrementing or decrementing Python reference counts.
+\end{itemize}
+
+Code that operates exclusively on Rust-owned data structures---such as shared memory regions managed by Rust---satisfies this invariant trivially. This property makes IPC operations ideal candidates for GIL release: the blocking wait for new data can proceed without holding the GIL, allowing other Python threads to execute concurrently.
+
+\subsection{Free-Threading in Python 3.13+}
+
+Python 3.13 introduced an experimental build configuration that makes the GIL optional (PEP~703)~\cite{pep703}. In this free-threaded build, the GIL is disabled entirely, and CPython relies on biased reference counting and fine-grained per-object locks to maintain thread safety.
+
+Python 3.14 elevated free-threading from experimental to officially supported status (PEP~779), with the full implementation described in PEP~703 now complete. The single-threaded performance penalty has been reduced to 5--10\% through enabling the specializing adaptive interpreter in free-threaded builds~\cite{pep703}. Nevertheless, practical adoption faces a significant barrier: every C extension module must explicitly declare free-threading compatibility via the \texttt{Py\_mod\_gil} slot. Extensions that lack this declaration cause the interpreter to silently re-enable the GIL, negating the concurrency benefits. Given the breadth of Python's extension ecosystem---including critical libraries for scientific computing and machine learning---widespread compatibility is expected to require several years. PEP~703 proposes a phased transition spanning four to six CPython releases before the GIL is disabled by default.
+
+Regardless of free-threading's eventual maturity, it addresses only \textit{intra-process} parallelism. Applications that use multiple processes---whether for fault isolation, security boundaries, or deployment across separate hosts---still require efficient inter-process communication. The shared memory approach solves a fundamentally different problem: moving data between address spaces without copying. The GIL release patterns described in this work remain beneficial even in a free-threaded interpreter, as they allow IPC blocking operations to proceed without holding Python-internal locks that could delay object finalization or other interpreter bookkeeping.
+
+\subsection{Standard Library IPC Limitations}
+
+Python's \texttt{multiprocessing} module provides several IPC mechanisms, each with trade-offs that motivate a native extension approach:
+
+\begin{itemize}
+    \item \textbf{multiprocessing.Queue}: Built on pipes with pickle serialization. Every transfer requires serializing the object in the sender, copying it through the kernel, and deserializing in the receiver. For a 4~MiB NumPy array, this process can take milliseconds---orders of magnitude slower than a pointer exchange.
+
+    \item \textbf{multiprocessing.Pipe}: Lower overhead than Queue (no internal locking), but still requires serialization and kernel copies. Not suitable for large binary data.
+
+    \item \textbf{multiprocessing.shared\_memory}: Provides raw shared memory access without serialization, but offers no synchronization. Applications must implement their own locking and signaling, typically using \texttt{multiprocessing.Lock} objects that cannot reside in the shared region itself.
+\end{itemize}
+
+The gap between these options---fast but unsafe (raw shared memory) or safe but slow (pipes and queues)---defines the design space that \texttt{rs\_ipc} occupies: providing both zero-copy performance and built-in synchronization through a safe Python API.
+
+
+\section{Rust for Safe Systems Programming}
+\label{sec:rust}
+
+Rust is a systems programming language that provides memory safety and thread safety guarantees at compile time, without requiring a garbage collector or runtime~\cite{rustbook}. These properties make it particularly suitable for implementing shared memory data structures that must be correct across process boundaries.
+
+\subsection{Ownership and Borrowing}
+
+Rust's ownership system enforces three rules at compile time:
+
+\begin{enumerate}
+    \item Each value has exactly one owner at any time.
+    \item When the owner goes out of scope, the value is dropped (freed).
+    \item A value may be borrowed as either one mutable reference \textit{or} any number of immutable references, but not both simultaneously.
+\end{enumerate}
+
+These rules prevent, at compile time, entire categories of bugs common in C and C++: use-after-free, double-free, dangling pointers, and data races. The type system encodes these guarantees through two marker traits relevant to concurrent programming:
+
+\begin{itemize}
+    \item \textbf{Send}: A type is \texttt{Send} if it can be safely transferred to another thread. Most types are \texttt{Send}; notable exceptions include raw pointers and types containing thread-local references.
+
+    \item \textbf{Sync}: A type is \texttt{Sync} if it can be safely shared between threads (i.e., if \texttt{\&T} is \texttt{Send}). A type containing interior mutability (such as \texttt{Cell<T>}) is not \texttt{Sync} unless it uses atomic operations or locks.
+\end{itemize}
+
+For shared memory structures, implementing \texttt{Sync} (and documenting why it is safe to do so) is the mechanism by which Rust verifies that concurrent access is correctly synchronized.
+
+\subsection{Zero-Cost Abstractions}
+
+Rust's design philosophy guarantees that high-level abstractions compile to code equivalent to hand-written low-level implementations~\cite{rustbook}. Iterators, generics, and trait objects incur no runtime overhead beyond what a manually optimized C implementation would require. This property is critical for a low-latency IPC library: the safety guarantees provided by the type system do not come at the cost of additional instructions in the generated machine code.
+
+\subsection{Unsafe Code and Safety Contracts}
+
+Certain operations---raw pointer dereferencing, calling foreign functions, implementing \texttt{Send} or \texttt{Sync} for types with interior mutability---cannot be verified by the compiler and require the \texttt{unsafe} keyword~\cite{rustonomicon}. Unsafe code does not disable Rust's safety guarantees; rather, it shifts the burden of proof from the compiler to the programmer for specific, delimited operations.
+
+The convention in Rust is to encapsulate unsafe operations within safe abstractions. The unsafe implementation maintains documented invariants, and the public API ensures that callers cannot violate those invariants regardless of how they use the interface. For a shared memory library, common unsafe operations include:
+
+\begin{itemize}
+    \item Constructing references from raw pointers obtained via \texttt{mmap}.
+    \item Implementing \texttt{Sync} for structures containing \texttt{UnsafeCell} (required for interior mutability across shared memory).
+    \item Calling operating system interfaces (\texttt{shm\_open}, \texttt{mmap}, \texttt{futex}) through FFI.
+\end{itemize}
+
+Each \texttt{unsafe} block carries an implicit contract: the surrounding code must uphold the invariants that make the operation sound. Documenting these contracts---what must be true for the unsafe code to be correct---is a standard practice that enables reasoning about safety at module boundaries rather than at every individual memory access.
+
+\subsection{PyO3 and Foreign Function Interface}
+
+PyO3 is a Rust framework for creating native Python extensions~\cite{pyo3}. It provides procedural macros that generate the CPython C~API boilerplate required to expose Rust functions, structures, and methods to Python. Key capabilities relevant to IPC include:
+
+\begin{itemize}
+    \item \textbf{GIL management}: The \texttt{Python<'py>} token represents GIL ownership. The \texttt{detach} method releases it for a closure's duration, enabling concurrent Python threads during blocking operations.
+
+    \item \textbf{Module-level GIL declaration}: The \texttt{\#[pymodule(gil\_used = false)]} attribute declares that the module does not require the GIL for internal state access, enabling the Python runtime to optimize GIL management for the module's methods.
+
+    \item \textbf{Buffer protocol}: Rust types can implement Python's buffer protocol, allowing Python code to access Rust-owned memory directly (e.g., through \texttt{memoryview}) without copying.
+
+    \item \textbf{Type conversions}: Automatic conversion between Python and Rust types at the FFI boundary, with zero-copy paths for bytes-like objects through \texttt{Py<PyBytes>} or custom buffer types.
+\end{itemize}
+
+The combination of PyO3's safe Rust API, explicit GIL management, and the buffer protocol enables a library architecture where Python code interacts with shared memory through safe, idiomatic interfaces while the underlying implementation operates at native speed without GIL contention.

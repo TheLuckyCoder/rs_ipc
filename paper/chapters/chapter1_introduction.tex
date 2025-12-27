@@ -1,0 +1,74 @@
+\chapter{Introduction}
+\label{chap:intro}
+
+\section{Context and Motivation}
+
+Python has established itself as the dominant language for data-intensive applications, particularly in domains such as computer vision, machine learning, and scientific computing. Its rich ecosystem of libraries---including OpenCV~\cite{opencv_library}, TensorFlow~\cite{tensorflow}, and PyTorch~\cite{pytorch}---enables rapid prototyping and deployment of complex algorithms. However, Python's design presents fundamental challenges for high-performance concurrent applications.
+
+The Global Interpreter Lock (GIL) prevents multiple threads from executing Python bytecode simultaneously, effectively limiting CPU-bound tasks to single-threaded execution. While multiprocessing circumvents this limitation by spawning separate processes, it introduces a new challenge: efficient inter-process communication. When processes must exchange large data structures---such as video frames in a vision pipeline or tensors in a machine learning workflow---the performance of IPC mechanisms becomes critical.
+
+Real-time applications impose particularly stringent requirements. Autonomous driving systems, for instance, must process multiple camera feeds simultaneously while maintaining low latency for safety-critical decisions. Industrial automation, robotics, and video processing pipelines face similar constraints: data must flow between processes with minimal overhead to meet timing requirements.
+
+\newpage
+\section{Problem Statement}
+
+Python's standard library offers several IPC mechanisms, each with significant limitations for high-performance applications:
+
+\begin{itemize}
+    \item \textbf{multiprocessing.Pipe}: Provides bidirectional communication but requires serialization (pickling) of data. For large objects, the serialization overhead and memory copies impose substantial latency.
+
+    \item \textbf{multiprocessing.Queue}: Built on pipes with additional synchronization, introducing further overhead. The internal buffer size is limited and platform-dependent, often causing blocking behavior when transferring large data.
+
+    \item \textbf{multiprocessing.shared\_memory}: Introduced in Python 3.8, this module provides raw shared memory access but lacks built-in synchronization. Developers must implement their own locking mechanisms, and Python's lack of atomic operations complicates safe concurrent access.
+\end{itemize}
+
+Furthermore, Python's synchronization primitives exhibit limitations when used across processes. The \texttt{multiprocessing.Lock} cannot be stored in shared memory and must be passed through the parent-child process relationship. Condition variables are conflated with locks, preventing the efficient use of separate read and write notifications. These constraints make it difficult to implement sophisticated producer-consumer patterns efficiently in pure Python.
+
+\section{Proposed Solution}
+
+This thesis presents \texttt{rs\_ipc}, a high-performance inter-process communication library that addresses these limitations through a hybrid Python-Rust architecture. The library provides a \texttt{SharedMessage} abstraction built on POSIX shared memory primitives (\texttt{shm\_open}, \texttt{mmap}), offering:
+
+\begin{itemize}
+    \item \textbf{Zero-copy semantics}: Processes read and write directly to shared memory, eliminating the serialization and memory copy overhead inherent in pipe-based communication.
+
+    \item \textbf{Futex-based synchronization}: Direct Linux futex system calls replace pthread FFI, reducing latency and simplifying cross-process synchronization.
+
+    \item \textbf{Flexible blocking strategies}: Support for non-blocking, partial-blocking, and full-blocking communication modes enables adaptation to diverse application requirements.
+
+    \item \textbf{GIL-free operations}: Rust's thread safety guarantees allow blocking IPC operations to release Python's GIL, enabling true concurrency in multithreaded Python applications.
+\end{itemize}
+
+By implementing the performance-critical components in Rust and exposing them through PyO3 bindings, the library combines Python's accessibility with systems-level performance.
+
+\section{Contributions}
+
+The primary contributions of this thesis are:
+
+\begin{enumerate}
+    \item \textbf{SharedMessage abstraction}: A cache-aligned shared memory data structure with bit-packed atomic fields for efficient producer-consumer communication.
+
+    \item \textbf{Futex-based synchronization primitives}: Custom mutex and condition variable implementations using raw futex system calls, avoiding pthread FFI overhead.
+
+    \item \textbf{Partial-blocking communication}: A novel blocking strategy where producers wait for a configurable subset of consumers, balancing throughput and consistency.
+
+    \item \textbf{Asynchronous operation modes}: Background threads for non-blocking read and write operations from the Python caller's perspective.
+
+    \item \textbf{Safe GIL release patterns}: Demonstrated techniques for releasing Python's GIL during Rust operations while maintaining memory safety.
+
+    \item \textbf{Comprehensive benchmarking}: Performance evaluation across embedded and workstation platforms, comparing against Python's native IPC mechanisms.
+\end{enumerate}
+
+This work extends the conference paper ``Accelerating Intelligent Vehicle Vision: A Hybrid Python-Rust Architecture with Partial-Blocking IPC,'' which introduced the initial SharedMessage specification and demonstrated its application to autonomous vehicle vision pipelines.
+
+\newpage
+\section{Thesis Structure}
+
+The remainder of this thesis is organized as follows:
+
+\textbf{Chapter~\ref{chap:ch2}} provides the theoretical foundations necessary to understand the implementation. This includes an overview of POSIX shared memory, memory-mapped I/O, synchronization primitives, and the Linux futex subsystem.
+
+\textbf{Chapter~\ref{chap:ch3}} details the architecture and implementation of the \texttt{rs\_ipc} library. This chapter covers the \texttt{SharedMessage} data structure, the custom synchronization primitives, the PyO3 integration layer, and the asynchronous operation modes.
+
+\textbf{Chapter~\ref{chap:ch4}} presents the performance evaluation methodology and results. Benchmarks compare the library against Python's native IPC mechanisms across various data sizes and hardware configurations.
+
+\textbf{Chapter~\ref{chap:conclusions}} summarizes the contributions, discusses limitations, and identifies directions for future work.

@@ -120,6 +120,7 @@ impl<T: ?Sized> Drop for SharedMemoryMapper<T> {
 
         if self.created
             && let Err(e) = rustix::shm::unlink(&self.name)
+            && e != rustix::io::Errno::NOENT
         {
             eprintln!("Failed to unlink shared memory: {}", e);
         }

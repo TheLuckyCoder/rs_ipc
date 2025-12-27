@@ -83,12 +83,11 @@ impl SharedMessage {
         // Wait for readers to consume the already existing data (based on policy)
         let current_seq = self.get_sequence_state().sequence;
 
+        let mut ticket = self.reader_done_condvar.value();
         let mut reader_state = self.get_reader_state();
 
         // Only wait if there's a previous message to be consumed (sequence > 0)
         if reader_state.get_target_consumed() > 0 && current_seq > 0 {
-            let mut ticket = self.reader_done_condvar.value();
-
             while reader_state.data_consumed < reader_state.get_target_consumed() {
                 if self.is_stopped() {
                     return None;

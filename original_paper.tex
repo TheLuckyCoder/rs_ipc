@@ -1,0 +1,684 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{multirow}
+
+
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+\begin{document}
+
+%\title{Real-Time Concurrent Vision Architecture leveraging Shared Memory}
+\title{
+Accelerating Intelligent Vehicle Vision: A Hybrid Python-Rust Architecture with Partial-Blocking IPC
+}
+
+\author{\IEEEauthorblockN{Dávid Szilágyi\IEEEauthorrefmark{1},
+Răzvan Filea \IEEEauthorrefmark{2}, Kuderna-Iulian Ben\c ta\IEEEauthorrefmark{3}}
+\IEEEauthorblockA{Faculty of Mathematics and Computer Science,
+Babes-Bolyai University, Cluj-Napoca, Cluj, Romania\\
+Email: \IEEEauthorrefmark{1}davtszi@gmail.com,
+\IEEEauthorrefmark{2}razvan.filea@stud.ubbcluj.ro,
+\IEEEauthorrefmark{3}kuderna.benta@ubbcluj.ro,}}
+
+\maketitle
+
+\begin{abstract}
+
+Modern autonomous driving systems require real-time, high-throughput vision pipelines.
+In this paper, we present a modular, concurrent vision architecture that integrates Python for its rich computer vision ecosystem with Rust for efficient, safe concurrency.
+By employing synchronized shared memory, our design eliminates frequent data copies and overcomes the inherent limitations of Python’s GIL\@.
+Through partial-blocking communication, faster pipelines can execute without waiting on slower ones, delivering up to a 4.3× speedup over simpler multiprocessing solutions.
+Benchmarking across embedded platforms and workstations reveals significant performance gains and reduced memory overhead compared to Python multiprocessing IPC solutions.
+A real-world test on a 1:10 scale autonomous vehicle validates the system’s practicality, demonstrating its adaptability for deployment in autonomous driving scenarios.
+This approach thus provides a scalable, high-performance foundation for researchers and engineers developing real-time perception pipelines for intelligent vehicles.
+
+\end{abstract}
+
+\begin{IEEEkeywords}
+Autonomous Vehicles, Real-Time Computer Vision, Shared Memory IPC, Python-Rust Integration, Partial-Blocking Communication
+\end{IEEEkeywords}
+
+\section{Introduction}
+
+%High Performance Perception Systems are a critical component of modern autonomous systems.
+%These systems are responsible for processing sensor data and generating high-level information about the environment and require a high degree of parallelism and efficiency to operate in real-time.
+%
+%These systems require expertise not only in computer vision and machine learning but also in software engineering to ensure that the system is scalable, maintainable, and efficient.
+%These traits are usually not found in a single individual, and hence, it is essential to design a system the allows for rapid prototyping of individual components and easy integration of these components into a larger system.
+%
+%In this paper, we propose an architecture that provides a modular design for individual vision components using high-level languages and libraries such as Python and OpenCV, a framework that allows for combining these components into a full perception pipeline at runtime based on configuration files and an insanely fast and efficient transport layer implemented in a systems level language and imported as a library into the main framework.
+
+High-performance perception systems are pivotal components of modern autonomous systems, such as self-driving cars and advanced driver-assistance systems (ADAS). These systems are tasked with processing vast amounts of sensor data in real-time to generate high-level environmental insights, necessitating exceptional parallelism and efficiency~\cite{rosique2019systematic}.
+Achieving real-time performance is critical, especially in applications where delays can have significant safety implications.
+
+Developing these systems requires a multifaceted skill set that spans computer vision, machine learning, and software engineering.
+Ensuring scalability, maintainability, and efficiency often demands expertise that is rarely consolidated within a single individual.
+Consequently, there is a pressing need for architectures that facilitate rapid prototyping of individual components and seamless integration into comprehensive perception pipelines.
+
+In this paper, we propose a modular concurrent vision architecture that combines high-level languages and libraries for individual vision components, and a synchronized shared memory IPC mechanism to efficiently transport video data between these components.
+Recognizing the limitations of Python's concurrency and inter-process communication (IPC) capabilities in delivering the required performance, our approach integrates Rust—a systems-level programming language known for its speed and safety—with Python.
+
+\section{Architecture Requirements \& Related Work}
+
+Designing an effective Real-Time Computer Vision (CV) architecture specifically for intelligent vehicle and robotics necessitates addressing several critical requirements to ensure both high performance and developer accessibility.
+Foremost, the system must operate in real-time, processing video data with minimal latency to support applications such as Autonomous Driving and Advanced Driver-Assistance Systems (ADAS).
+
+Given the prevalent use of Python in modern CV development due to its rich ecosystem of libraries and tools like OpenCV~\cite{opencv_library}, TensorFlow~\cite{tensorflow}, and PyTorch~\cite{pytorch}, any architecture that aims to facilitate both research, development and deployment must be compatible with Python.
+
+Additionally, the system should function seamlessly in both on-board live computing~\cite{online1},~\cite{online-offline},~\cite{rthysensorfusion} and offline R\&D environments.
+Live mode is vital for real-time applications in autonomous vehicles, where immediate processing of capture camera frame is required~\cite{rtvision}, while offline mode facilitates debugging, development, and analysis by allowing the processing of pre-recorded video data.
+This dual capability ensures that the architecture is versatile and can cater to various stages of development and deployment.
+
+Efficient handling of video data is another essential requirement.
+The architecture must implement mechanisms to save both initial and final video streams with minimal performance overhead.
+Recording raw video data is crucial for debugging and offline analysis, whereas saving the processed output is important for evaluation and record-keeping.
+
+Real-time visualization capabilities are a necessity for safety critical applications like autonomous driving, where monitoring plays a crucial role both in the development stage for testing and debugging, and in the deployment stage for real-time monitoring and user reassurance.
+The need for real-time visualization is further emphasized by the overwhelming adoption of \textit{rviz}~\cite{kam2015rviz} in the robotics community, which provides a real-time 3D visualization tool intelligent systems built with ROS/ROS2 (Robot Operating System)~\cite{ros2}.
+
+These design requirements can be summarized as follows:
+\begin{enumerate}
+    \item \textbf{Operate in Real-Time and Offline Modes:} Support both live processing (e.g., in autonomous vehicles) and offline analysis (e.g., pre-recorded video) without compromising performance.
+    \item \textbf{Combine Blocking and Non-Blocking Strategies:} Enable asynchronous merging of processing pipeline results with varying frequencies, facilitating efficient feature transport to multiple consumers with minimal performance impact.
+    \item \textbf{Provide Real-Time Visualization and Debugging:} Allow real-time visualization of results, essential for debugging and monitoring, while minimizing performance degradation.
+    \item \textbf{Efficiently Save Video Data:} Implement mechanisms to save initial and final video streams with minimal impact on overall system performance.
+    \item \textbf{Benchmark Performance:} Evaluate the time performance of each architectural component to ensure that the system meets real-time processing requirements.
+\end{enumerate}
+
+\subsection{Producer-Consumer Model}
+\label{sec:producer-consumer}
+
+A fundamental component of any Real-Time Vision architecture is the Producer-Consumer model, which orchestrates the flow of data from a producer to one or more consumers.
+Our model employs 3 distinct methods, the standard non-blocking and (full)blocking strategies, and our own contribution, the partial-blocking strategy.
+
+The most straightforward approach is the non-blocking strategy, where the producer continuously publishes new frames without waiting for consumers to complete processing.
+This allows consumers to operate independently, processing frames at their own pace and consuming the most recent data available.
+While this strategy maximizes system throughput, it may lead to inconsistencies in the processing results, as consumers may operate on different frames simultaneously, potentially causing synchronization issues.
+It is suitable for applications like real-time monitoring, where the latest data is prioritized over consistency.
+
+Using the full-blocking method, the producer waits to publish until every consumer has read and processed the current data to ensure that every frame is uniformly handled by all consumers, maintaining consistency across the processing pipeline.
+This approach guarantees synchronization, but impacts performance, a trade-off that is ideal for Pipeline Development and Testing, where consistency is paramount.
+
+Conversely, the partial-blocking strategy allows the producer to release new data as soon as at least one consumer has begun processing the previous data.
+This increases system throughput by reducing waiting times, ensuring continuous frame flow even if some consumers are slower.
+Consequently, each frame is guaranteed to be processed by at least one consumer, though not necessarily by all.
+This strategy is well-suited for real-time applications, especially autonomous driving, where safety critical, fast processing tasks are running concurrently with slower planning and control tasks.
+
+By combining these three processing strategies, the producer-consumer model can effectively manage data flow in the Real-Time CV architecture, balancing performance, consistency, and throughput to meet the diverse requirements of modern autonomous systems.
+
+\section{Methodology}
+
+\subsubsection{Pipeline and Filter Architecture}
+
+The Pipes and Filters architectural pattern~\cite{meunier1995pipes} is a well-known design pattern that is commonly used to build complex systems.
+It is based on the idea of breaking down a system into a series of independent processing units called filters, which are connected by pipes that carry data between them.
+This pattern is particularly well-suited for building processing pipelines, as it allows for the modularization of different processing tasks.
+Our architecture is loosely based on this pattern, with some key modifications to better suit the requirements of real-time perception systems.
+
+\texttt{PipeData} is a complex but efficient data structure that stores the currently processed frame, the initial unprocessed frame and all features extracted during processing, such as bounding boxes for detected objects or lane heading \& lateral offsets for lane tracking.
+The PipeData also provides a \texttt{merge} method that facilitates the merging of multiple \texttt{PipeData} instances into a single instance by keeping the most recent frame and aggregating all new features extracted from the different pipelines.
+
+In our architecture, we define a \texttt{Filter} as individual operations that we apply to a given camera frame, such as region-of-interest extraction, different image processing techniques such as grayscale conversion, edge detection, deep learning-based object detection, and high-level tasks such as lane detection and object tracking.
+
+Each of these filters must implement a common interface that defines a \texttt{process\_data} method which takes a \texttt{PipeData} instance as input, performs the required operation on the current frame, and returns an updated \texttt{PipeData} instance with an updated frame and extracted features.
+
+Filters can be combined both sequentially and in parallel to form complex processing pipelines.
+
+\begin{figure}[ht]
+\centering
+\includegraphics[scale=0.25]{../../common/figures/figures_cv/Full_MP_Pipeline}
+\caption{Parallel Pipeline for Lane and Object Detection}
+\label{fig:mp_pipeline}
+\end{figure}
+
+Figure~\ref{fig:mp_pipeline} shows a pipeline, focusing on Lane and Traffic Sign, Traffic Light, and Pedestrian Detection.
+Given that these operations can be performed independently, these 4 sequential pipelines are grouped into one parallel pipeline, each starting with defining the region of interest (ROI) and merging into a single \texttt{PipeData} instance by the end.
+
+Systems that can accommodate pipelines like the one in Figure~\ref{fig:mp_pipeline} require several key components:
+
+\begin{itemize}
+    \item \textbf{Frame Requisition:} Responsible for acquiring frames from a camera or a pre-recorded video.
+    \item \textbf{Pipeline Management} Focuses on managing instantiating the PipeData and controlling the flow of frames through the pipelines.
+    \item \textbf{Filter Processing:} Contains the individual filters that process the frames and extract features.
+    \item \textbf{PipeData Merge:} Merges the results from the parallel pipelines into a single PipeData instance.
+    \item \textbf{Decision Making:} A high level abstraction that represents the Sensor Fusion, Planning, and Control modules in a full autonomous system.
+    \item \textbf{Visualization:} Responsible for drawing the extracted information on the unprocessed frame and displaying it to the user.
+\end{itemize}
+and optionally:
+\begin{itemize}
+    \item \textbf{Save Input Video:} Responsible for saving the initial frame (live recording).
+    \item \textbf{Save Output Video:} Responsible for saving the final processed frame (results recording).
+\end{itemize}
+
+\begin{figure}[ht]
+\centering
+\includegraphics[scale=0.25]{../../common/figures/figures_cv/ArcSecvProc}
+\caption{Sequential Processing Architecture}
+\label{fig:secv_proc_arch}
+\end{figure}
+The order and interaction of these components are shown in Figure~\ref{fig:secv_proc_arch} for a simple sequential processing architecture.
+
+\subsection{Concurrency and Parallelism}
+
+The main issue with the architecture shown in Figure~\ref{fig:secv_proc_arch} is that each module processes the frame in sequence, leading to significant delays in the system.
+
+A more efficient approach is use concurrent and/or parallel processing to handle all required tasks in a timely manner.
+Multiple strategies can be employed to achieve this, such as multi-threading, multi-processing, or a combination of both.
+
+\textbf{Multi-Threading:} Multi-threading is a common approach to achieve concurrency, but it is not suitable in Python for CPU-bound tasks due to the Global Interpreter Lock (GIL) that prevents multiple threads from executing Python bytecodes simultaneously.
+
+\textbf{Multi-Processing:} Multi-processing is a more suitable approach for CPU-bound tasks, as it allows for true parallelism because each process has its GIL.
+
+\begin{figure}[ht]
+\centering
+\includegraphics[scale=0.25]{../../common/figures/figures_cv/full_parallel_pipeline}
+\caption{Parallel Processing Architecture}
+\label{fig:parallel_arc}
+\end{figure}
+
+An initial approach to parallelize the processing of the pipelines is to create a new process for each pipeline and pass the frames between them using Python's multiprocessing module.
+Duplex pipes are a good fit for this task as they allow for bidirectional communication between processes.
+As shown in Figure~\ref{fig:parallel_arc}, during each iteration a copy of the initial PipeData is sent to each Pipeline Process after which the results are collected and merged into a single PipeData instance.
+
+This approach is more efficient than the sequential processing architecture, as each pipeline can process frames in parallel, but it still has some key issues that need to be addressed.
+For instance, the system is bottlenecked by the slowest pipeline, as the frame is only finished processing once all parallel pipelines have returned their results.
+Additionally, the system is memory inefficient as each frame is copied multiple times, and it is not scalable as the number of pipelines increases.
+
+%While the architecture shown in Figure~\ref{fig:architecture_sync} is much more efficient than a naive single-process implementation, there are still key areas that can be improved.
+%
+%The main issue is that inside the pipeline management process, a frame is only finished processing once all parallel pipelines have returned their results.
+%This means that the slowest filter in the pipeline will determine the frame rate of the whole system, which is not desirable since an expectation of autonomous systems is having different control loops (and thus data acquisition loops) running at different rates.
+%An illustrative example is the need for a high rate for lane and pedestrian detection, while a lower rate is sufficient for non-moving objects such as traffic sign detection.
+%
+%A similar situation can be observed with the behaviour planning process and the visualization process, where the latter one is waiting for the former one to finish before it can start drawing the results even though the results are already available.
+%
+%Another concern is that if the processing of a frame takes longer than the time it takes to receive a new frame, the system will start to accumulate frames in the pipeline management process, which can lead to a significant delay in the system.
+
+\subsection{Expanded Multiprocessing Architecture}
+
+To address some issues with the parallel processing approach, the architecture was revised to move each module into its own process, with the process hierarchy shown in Figure~\ref{fig:process_hierarchy}.
+
+\begin{figure}[ht]
+\centering
+\includegraphics[scale=0.35]{../../common/figures/figures_cv/Process_Hierarchy}
+\caption{Process Hierarchy}
+\label{fig:process_hierarchy}
+\end{figure}
+
+The main processes are the \textbf{Capture}, \textbf{Multiprocessing Manager}, \textbf{Decision Making}, and \textbf{Visualization(Application)}.
+
+N additional processes are created for each of the parallel pipelines in the configuration and an additional 2 processes can be used for saving the raw frame (live recording) and/or the final processed frame (results recording).
+
+This version of the architecture requires a significant amount of startup time (about 8 seconds) as each process is created and IPC connections are established.
+
+\subsubsection{\textbf{Data Lifecycle}}
+
+The Capture process is responsible for acquiring frames from the camera or a pre-recorded video at a specified frame rate.
+The frames are written to the N Pipes that connect the Capture process to the N Pipeline processes and optionally to the Save Input Video process.
+
+Each Pipeline Process must instantiate a PipeData from the frame and perform the feature extraction operations in their respective pipelines then passing the results through another N Pipes to the Multiprocessing Manager.
+
+The Multiprocessing Manager continuously checks the N Pipes for new PipeData, and merges it to its current PipeData instance.
+The merged PipeData is sent to all consumers, in this case, the Decision Making process and the Visualization process through another 2 Pipes.
+An additional Queue is connected to the save process, to allow it to save all processed frames to a video file, even after processing has finished to guarantee that all frames are saved.
+These steps are illustrated in Figure~\ref{fig:expanded_mp_arc}.
+
+\begin{figure}[ht]
+\centering
+\includegraphics[scale=0.35]{../../common/figures/figures_cv/ArcNaivePipe}
+\caption{Expanded Multiprocessing Architecture, red line represents operation sequence}
+\label{fig:expanded_mp_arc}
+\end{figure}
+
+\subsubsection{\textbf{Discussion}}
+
+Even though this approach brings some advantages such as:
+\begin{itemize}
+    \item Each module is decoupled from the others, allowing for easy modification and testing.
+    \item The system can save frames asynchronously through the use of queues.
+    \item In theory iterations should take less time as each module starts processing the next frame as soon as it finishes the current one, instead of waiting in sequence.
+\end{itemize}
+
+It also has significant drawbacks:
+\begin{itemize}
+    \item The write method of MultiProcessing Pipe in Python is theoretically non-blocking, using a buffer to store the data until the other end is ready to read, but in practice this buffer is quite small (depending on OS and Python version it can be as low as 4KB, smaller than a frame).
+    \item Due to frame capture being much faster than processing, the buffer is quickly filled and the write method becomes blocking, leading to the same issue of the slowest pipeline determining the frame rate of the whole system.
+%    \item \textbf{(Not very important) The same phenomenon can be observed with the other N Pipes between the Pipeline processes and the Multiprocessing Manager, but in that case the reader is the faster process, so the negative impact is less noticeable.}
+    \item The system is less memory efficient and not scalable as each frame is copied through a multitude of pipes.
+\end{itemize}
+
+These issues render this version of the architecture unsuitable for real-time applications, proving to be no real improvement over the parallel processing approach.
+
+%\textbf{Aspects of the proposed architecture:}
+%\begin{itemize}
+%    \item Each module is decoupled from the others, allowing for easy modification and testing.
+%    \item The system can save the initial and final frames without affecting the real-time performance.
+%    \item Iterations take less time as each module starts computing on the next frame as soon as it finishes the current one (and the next frame is available), instead of waiting in sequence.
+%
+%    \item The system is less memory efficient as each frame is copied through a multitude of pipes and queues.
+%    \item The system is still somewhat hindered by the slowest pipeline.
+%    While the fastest pipeline can continue processing new frames, the slowest pipelines will lag behind and process frames that are increasingly outdated.
+%    \item While each frame is processed by all pipelines, only the fastest process can be considered real-time making the system unsuitable for such applications.
+%\end{itemize}
+
+\subsection{Proposed Shared Memory Architecture}
+
+To minimize the drawbacks of the previous architecture, we must leverage more advanced IPC mechanisms, such as shared memory.
+
+This allows us to avoid frequent copies of the same data by having all pipelines read from the same shared memory location, removing the need for N pipes and thus significantly reducing memory usage and improving performance.
+This is illustrated in Figure~\ref{fig:shared_memory_arci}.
+
+\begin{figure}[ht]
+\centering
+\includegraphics[scale=0.250]{../../common/figures/figures_cv/ArcSharedMessage}
+\caption{Shared Memory Architecture}
+\label{fig:shared_memory_arci}
+\end{figure}
+
+\subsubsection{\textbf{Shared Memory and Python}}
+
+Python's multiprocessing module provides a basic shared memory implementation, which doesn't meet our requirements.
+It lacks built-in synchronization mechanisms to prevent data corruption
+%—for example, two processes might write to the same memory location simultaneously, or one process could read data while another is writing.
+
+To address these issues, we need to develop a high-level abstraction for shared memory that includes data versioning and incorporates locks and condition variables.
+This abstraction should also support blocking, partial-blocking, and non-blocking strategies~(\ref{sec:producer-consumer}) and ensure efficient data sharing.
+
+\subsubsection{\textbf{The SharedMessage Specification}}
+\label{sec:shared_message}
+
+%This shared memory architecture is designed to facilitate efficient and synchronized communication between multiple processes by leveraging several key components.
+At its core is the \textbf{Message}, which contains the data intended for transmission.
+Upon allocation, the size of the shared memory must be specified, thereby fixing the capacity \textbf{C} of the message.
+
+To accommodate variable-length messages, the \textbf{Message Size} is stored alongside the \textbf{Message}.
+To manage different versions of the message, an atomic counter \textbf{Message Version} (as defined in~\cite{shared_memo_sync}) is employed and is incremented each time a new message is written.
+Readers maintain a local copy to compare against the \textbf{Message Version} and detect updates.
+
+The layout of the \textbf{SharedMessage} is visualized in Fig~\ref{fig:shared_memory}.
+Accounting for the padding (gray), the total size of the SharedMessage's structure is 40 + \textbf{C} bytes.
+
+\begin{figure}[ht]
+\centering
+\includegraphics[scale=0.23]{../../common/figures/figures_cv/SharedMessageMemoAloc}
+\caption{SharedMessage Memory Allocation}
+\label{fig:shared_memory}
+\end{figure}
+
+\subsubsection{\textbf{SharedMessage Mutex}}
+
+To prevent race conditions and ensure data consistency an exclusive lock is employed~\cite{shared_memo_sync}.
+The Message Mutex ensures that only one process can modify the \textbf{Message}, \textbf{Message Size} or \textbf{Message Read Count} at any given time.
+
+While the \textbf{Message Version} is only supposed to change while the Mutex is held, it's stored separately as an Atomic Variable to allow readers to check for new versions without first acquiring the lock.
+
+\subsubsection{\textbf{Write Methods}}
+
+Non-blocking writes are achieved by first acquiring the Mutex, then incrementing the \textbf{Message Version} and overwriting previous data without checks.
+
+To implement the partial- and fully-blocking strategies~(\ref{sec:producer-consumer}) we require knowing the \textbf{Consumer Count}, and the \textbf{Message Read Count}.
+
+For partial-blocking, the writer waits for the \textbf{Message Read Count} to be at least 1, while for the full-blocking, the writer waits for it to be equal to the \textbf{Consumer Count} then writes the message.
+In both cases the writer waits on the \textbf{Read Condvar} in order to not consume CPU while waiting.
+
+After writing a new message, the \textbf{Read Count} will be reset and all readers waiting on the \textbf{Write Condvar} will be awakened.
+
+\subsubsection{\textbf{Read Methods}}
+facilitate the reading of the message in blocking and non-blocking modes.
+
+The non-blocking method works by first reading the \textbf{Message Version} without acquiring the lock.
+If there is a new version, the lock is acquired and the version is read again, as it could have modified while waiting for the lock and then the message is read.
+
+For the blocking method, the first step is to acquire the Mutex, then check for a new version.
+If a new version is found, the message is read.
+Otherwise the current thread will wait on the \textbf{Write Condvar} and loop back to the first step.
+
+This method must also account for the \textbf{Stopped Flag}.
+When set, the writer indicates that it has finished writing and there will be no new messages.
+In this case the blocking read transitions to a non-blocking read, checks if there is one last message otherwise returns.
+
+When reading the message, a new buffer must be allocated where the message is going to be copied, afterwards the \textbf{Read Condvar} will also be notified.
+
+\subsection{Implementation and Benchmarking}
+
+Multiple Options were explored to implement this shared memory abstraction:
+
+\subsubsection{\textbf{SHM-LOCK}}
+The first attempt at communicating using shared memory was implemented using Python's builtin Multiprocessing module.
+%* the Python mutex (mp.Lock) cannot be stored in shared memory this means the shared memory must be send between processes through the parent-child relationship (makes code bad)
+%* in Python there is no distinction between a lock and a condition variable, meaning we can only have one condition variable instead of two. This decreases the efficiency of the system, as whenever a change happens all threads waiting will be woken up. For example when someone has read a message, it will wake all other readers waiting for a new version even though one hasen't been written
+%* Python also has no support for atomic memory operations, for making the stopped + version value be accessible without locking the mutex. This design decision was originally made to ensure that checking for a new message is a very cheap operation.
+Several shortcomings were identified during the implementation:
+\begin{itemize}
+    \item The Python mutex (mp.Lock) cannot be stored in shared memory, instead it must be passed between processes through the parent-child relationship.
+    \item In Python a condition variable is also a lock, meaning only one condition variable can be used, which reduces efficiency as all waiting threads are awakened when a change occurs.
+    \item Python has no support for atomic memory operations, requiring the mutex to be locked for checking the \textbf{Stopped Flag} and \textbf{Message Version}, which is inefficient.
+\end{itemize}
+
+\subsubsection{\textbf{SHM-PTH}}
+%Realizing the shortcomings of the multiprocessing module a second implementation was attempted by using the pthread library. This meant loading the pthread library using the ctypes FFI (Foreign Function interface) and defining the needed functions in Python (which point to the C functions).
+%While still using the multiprocessing module to shared the memory between processes, using the pthread locks and condition variables allowed us to more closely implement the proposed memory layout as they can be stored in shared memory and thus solving the first 2 issues we had with the first implementation.
+%However this implementation still has no solution for the third problem
+This implementation addresses the first two issues by leveraging the \textit{pthread} library through Python’s \textit{ctypes} Foreign Function Interface.
+By defining the necessary pthread functions in Python, we can directly utilize pthread locks and condition variables, which are capable of residing in shared memory.
+This change more closely aligns with our intended memory layout and overcomes the shared memory limitations of mp.Lock and the insufficient synchronization mechanisms available in the multiprocessing module.
+
+However, it is important to note that while this approach resolves the shared memory and synchronization limitations, it does not address the absence of atomic memory operations.
+
+\subsubsection{\textbf{RS-IPC}}
+
+To overcome the inefficiency caused by the lack of atomic memory operations, we explored implementing the SharedMessage in a systems-level language.
+Since the specification~\ref{sec:shared_message} is fully compatible with both C/C++ and Rust, we chose Rust for it's memory safety, modern tooling and ease of concurrency.
+To create Python bindings for the Rust code, the PyO3 library was used with the expectation that the performance improvements could outweigh the overhead of communicating through these wrappers~\cite{pyO3}.
+
+\subsubsection{\textbf{Benchmarking}}
+
+To ensure the efficiency and real-time capabilities of the proposed shared memory architecture, we conducted extensive benchmarking tests on all three implementations and also compared them to the Pipe implementation used in Fig.~\ref{fig:parallel_arc} and Fig.~\ref{fig:expanded_mp_arc}.
+Tables~\ref{tab:writeread_avg} and~\ref{tab:writeread_total} show the average and total write-read transfer times for different PipeData sizes.
+The tests were conducted on an Intel i5-12600K processor for 50,000 iterations with blocking operations to ensure only transfer times are measured.
+The Mock PipeData contains 3 x frame size in bytes, to model a real PipeData consisting of the initial frame, the processed frame, and the extracted features.
+Multiple industry standard video processing resolutions were tested with ranging from 256x256 to 1920x1080 (576KB to 17.80 MB per frame).
+
+\begin{table}[h!]
+\centering
+\caption{Write-Read Average Transfer Time (ms) 50.000 iterations}
+\label{tab:writeread_avg}
+\resizebox{0.475\textwidth}{!}{%
+\begin{tabular}{|c|c|c|c|c|c|c|}
+\hline
+\textbf{Resolution} & \textbf{Size} & \textbf{MP-Pipe} & \textbf{RS-IPC} & \textbf{SHM-LOCK} & \textbf{SHM-PTH} \\ \hline
+256x256  & 576 KB  & 0.247 & 0.2 & 0.226 & 0.233 \\ \hline
+512x512  & 2.25 MB & 0.908 & 0.728 & 0.796 & 0.82 \\ \hline
+640x480  & 2.64 MB & 1.019 & 0.898 & 0.982 & 0.994 \\ \hline
+1280x720 & 7.91 MB & 5.542 & 4.529 & 4.762 & 4.833 \\ \hline
+1920x1080 & 17.80 MB & 16.161 & 11.26 & 11.35 & 11.96 \\ \hline
+\end{tabular}%
+}
+\end{table}
+
+\begin{table}[h!]
+\centering
+\caption{Write-Read Total Transfer Time (s) 50.000 iterations}
+\label{tab:writeread_total}
+\resizebox{0.475\textwidth}{!}{%
+\begin{tabular}{|c|c|c|c|c|c|c|}
+\hline
+\textbf{Resolution} & \textbf{Size} & \textbf{MP Pipe} & \textbf{RS-IPC} & \textbf{SHM-LOCK} & \textbf{SHM-PTH} \\ \hline
+256x256  & 576 KB  & 12.336 & 10.01 & 11.306 & 11.67 \\ \hline
+512x512  & 2.25 MB & 45.411 & 36.408 & 39.789 & 40.986 \\ \hline
+640x480  & 2.64 MB & 50.931 & 44.895 & 49.12 & 49.986 \\ \hline
+1280x720 & 7.91 MB & 277.103 & 226.434 & 238.106 & 241.671 \\ \hline
+1920x1080 & 17.80 MB & 808.053 & 562.98 & 567.252 & 598.005 \\ \hline
+\end{tabular}%
+}
+\end{table}
+
+The results show that, as expected, across the board shared memory always outperforms pipes, with the three SharedMessage implementations performing similarly.
+This is attributed to the diminishing returns implementing SharedMessage in Rust due to the overhead of calling it from Python through PyO3.
+
+Nonetheless, unlike the other implementations, \textbf{RS-IPC}\footnote{Open Source implmentation can be found at: \href{https://github.com/TheLuckyCoder/rs\_ipc}{https://github.com/rs\_ipc}} has the advantage of safely releasing the GIL (Global Interpreter Lock) and allowing for true multithreading, resulting in more overall concurrency during execution.
+
+With this advantage, more advanced communication mechanisms can be implemented using Rust multithreading, such as using background feeder threads for asynchronous write and read operations that effectively reduce the execution time of the write/read operation in the main thread to near zero.
+While these enhancements are not yet reflected in the benchmarking results, they represent a promising direction for future work.
+
+
+\textbf{Aspects of the proposed architecture:}
+\begin{itemize}
+    \item Each module is decoupled from the others, allowing for easy modification and testing.
+    \item The system can save the raw and processed frames and visualize the results on separate processes without affecting processing performance.
+    \item Iterations take less time as each module starts computing on the next frame as soon as it finishes the current one (and the next frame is available), instead of waiting in sequence, meaning the system is no longer bottlenecked by the slowest pipeline.
+    \item Memory usage scales better with pipeline size as each frame is written to and read from N+2 shared memories instead of being copied through 2N+2 of pipes and queues.
+    \item All processing strategies are available, not every frame is processed by all pipelines, but the system is still suitable for real-time applications as the fastest pipeline can process frames at a high rate and results of the slower pipelines is merged onto the latest frame.
+\end{itemize}
+
+\section{Evaluation}
+
+We have conducted a series of experiments to evaluate the performance of different combinations of hardware and software configurations for the proposed Real-Time CV architecture.
+
+\subsection{Comparison of Architectures}
+
+This experiment consists of 720p pre-recorded video of 2298 frames mocked as real-time camera input at an uncapped frame rate.
+
+\begin{figure}[ht]
+\centering
+\includegraphics[scale=0.15]{../../common/figures/figures_cv/ResNaivePipeFullBlock}
+\caption{Parallel Processing Architecture Timing Data}
+\label{parallel_arc_timing}
+\end{figure}
+
+Figure~\ref{parallel_arc_timing} presents the timing results for the initial parallel processing architecture (depicted in Figure~\ref{fig:parallel_arc}) running on a CUDA-enabled Intel Workstation (see Table~\ref{tab:hardware-configs}). The system is constrained by the slowest pipeline, with the LaneDetection (L) pipeline requiring an average of 39 ms per frame.
+Consequently, this bottleneck determines the overall frame processing time, as all pipelines must complete before the system advances to the next frame.
+
+In our measurements, each iteration required 51 ms (approximately 20 fps), with 76\% of that time spent waiting for the slowest pipeline. The remaining 24\% of the iteration time was attributed to I/O tasks (e.g., reading/writing the video) and visualization, both of which remained idle while the pipelines processed data.
+
+Breaking down the Lifecycle of a PipeData from instantiation to consumption (visualization or decision making), processing takes about 60\%-80\% of the time (based on pipeline), with the rest being spent sending (serialization and writing to pipe) and receiving (reading from pipe and deserialization) the data.
+
+\begin{figure}[ht]
+\centering
+\includegraphics[scale=0.15]{../../common/figures/figures_cv/ResSharedMessagePartialBlock}
+\caption{Shared Memory Architecture Timing}
+\label{fig:proposed_timing}
+\end{figure}
+
+For the shared memory architecture, the results are shown in Figure~\ref{fig:proposed_timing}.
+Because this design is inherently more distributed, extracting timing data that aligns precisely with the previous architecture is more challenging.
+
+Where the former approach focused on sequential iterations, this asynchronous system instead benchmarks the lifecycle of a \textit{PipeData} object.
+We accomplish this by embedding a \textit{Timing} object into each \textit{PipeData} instance and updating timing metrics as the object traverses the pipeline.
+Specifically, the lifecycle includes (refer to Figure~\ref{fig:shared_memory_arci}):
+
+\begin{enumerate}
+\item Instantiation from the input frame,
+\item Processing by an individual pipeline,
+\item Transfer from the pipeline to the \textit{MPManager},
+\item Merging of all pipeline data,
+\item Transfer of the merged data to the \textit{DecisionMaking} and \textit{Visualization} modules
+\end{enumerate}
+
+Owing to the additional data transfer between three processes (in contrast to two in the previous approach), average transfer times rose to approximately 20 ms.
+Nevertheless, processing the entire video of 2298 frames required only 32.39 s, resulting in an average throughput of 86.9 fps—representing a 4.3$\times$ speedup relative to the naive parallel design.
+
+%For the shared memory architecture the results are shown in Figure~\ref{fig:proposed_timing}.
+%Given the distributed nature of the system, extracting matching timing data is more challenging, but the results are consistent with the theoretical analysis.
+%Instead of focusing on iteration, which are now asynchronous, we benchmark the Lifecycle of a PipeData from instantiation to consumption by embedding the Timing object into the PipeData and updating it as the PIpeData travels between processes.
+%In this system the Lifecycle follows the following steps: Instantiation from Frame, Processing by a Pipeline, Transfer from Pipeline to MultiprocessingManager, Merging, Transfer as merged PipeData to DecisionMaking and Visualization. (ref Figure~\ref{fig:shared_memory_arci}).
+%Due to the need to transfer between 3 processes (unlike 2 in the previous approach) transfer times are higher at around 20 ms.
+%
+%Processing the whole video takes 32.39 seconds for all 2298 frames to process.
+%The average frame rate is then 86.9 fps resulting in a 4.3x speedup compared to the naive approach.
+
+\subsection{Hardware-Software Benchmarking}
+
+\subsubsection{System Configuration}
+
+This experiments were designed to test the system in live mode, asynchronous development mode, and synchronous development mode, each with varying levels of processing complexity and visualization requirements. (Table~\ref{tab:system-config})
+\textbf{Live Mode} focuses on the autonomous vehicle use case, where each pipeline operates at their maximum throughput to ensure real-time processing.
+This mode uses one lane detection pipeline (CPU intensive) and two object detection (GPU intensive) pipelines with no intermediate data visualization.
+\textbf{Async Dev Mode} is designed for pipeline development and testing, where the system is configured to run 5 lane detection pipelines in parallel, in partial-blocking mode, with intermediate data visualization enabled.
+\textbf{Sync Dev Mode} is similar to Async Dev Mode but with full-blocking mode enabled to ensure consistency across all pipelines.
+
+\begin{table}[h!]
+    \centering
+    \caption{System Configuration for Different Modes}
+    \label{tab:system-config}
+    \resizebox{0.475\textwidth}{!}{%
+    \begin{tabular}{|c|c|c|c|}
+        \hline
+        \textbf{System Config}          & \textbf{Live Mode}                & \textbf{ASync Dev Mode}     &\textbf{Sync Dev Mode}      \\ \hline
+        \textbf{Processing Strategy}    & Partial Blocking                  & Partial Blocking             & Full Blocking                        \\ \hline
+        \textbf{Processing Pipelines}   & 1 Lane Det + 2 Object Det         & 5 Lane Det              & 5 Lane Det                             \\ \hline
+        \textbf{Intermediate Data Viz}  & Disabled                          & Enabled                    & Enabled                                 \\ \hline
+    \end{tabular}%
+    }
+\end{table}
+
+\subsubsection{Hardware Configuration}
+To test all modes effectively, 2 development workstations and 1 embedded system were chosen, each with varying levels of computational power and memory as detailed in Table~\ref{tab:hardware-configs}.
+
+\begin{table}[h!]
+\centering
+\caption{Hardware Configurations for System Testing}
+\label{tab:hardware-configs}
+\resizebox{0.475\textwidth}{!}{%
+\begin{tabular}{|c|c|c|c|}
+\hline
+\textbf{Specification} & \textbf{Jetson AGX Orin} & \textbf{Intel Workstation} & \textbf{AMD Workstation} \\ \hline
+\textbf{Processor}       & ARM Cortex-A78AE       & Intel i5-12600K            & AMD Ryzen 7 7700         \\ \hline
+\textbf{Clock Speed}     & 2.2 GHz                & 3.7 GHz                   & 3.8 GHz                  \\ \hline
+\textbf{Cores-Threads}   & 12C - 12T              & 10C - 16T                 & 8C - 16T                   \\ \hline
+\textbf{RAM}             & 32 GB LPDDR5           & 32 GB DDR4                & 32 GB DDR5               \\ \hline
+\textbf{GPU}             & Nvidia Ampere          & Nvidia RTX 3090           & AMD RX 7700 XT           \\ \hline
+\textbf{GPU Mem}         & 32 GB LPDDR5           & 24 GB GDDR6X              & 12 GB GDDR6               \\ \hline
+\textbf{CUDA Cores}       & 2,048             & 10,496               & N/A  \\ \hline
+\end{tabular}%
+}
+\end{table}
+
+The \textbf{Intel Workstation} and \textbf{Jetson AGX Orin} are CUDA capable, while the \textbf{AMD Workstation} is not, with the expectation that the CUDA capable systems should outperform it in \textbf{Live Mode}, but given its CPU advantage, it should perform better in \textbf{Async Dev Mode}.
+
+The processing resolution be varied to test the system's scalability, as it impacts memory usage, processing time and transfer time.
+
+\begin{table}[h!]
+  \centering
+  \caption{Live Mode Total Times with FPS}
+  \label{tab:live-mode-total-times}
+  \resizebox{0.475\textwidth}{!}{%
+  \begin{tabular}{|l|c|c|c|}
+    \hline
+    \textbf{HW} & \textbf{640x480} & \textbf{1280x720} & \textbf{1920x1080} \\ \hline
+    Intel & 119.0 (fps) - 19.32 (s) & 95.2 (fps) - 24.14 (s) & 63.1 (fps) - 36.41 (s) \\ \hline
+    AMD   & 214.4 (fps) - 10.71 (s) & 43.9 (fps) - 52.43 (s) & 34.5 (fps) - 66.6 (s) \\ \hline
+    Orin   & 67.1 (fps) - 34.23 (s)  & 53.7 (fps) - 42.78 (s) & 35.5 (fps) - 64.77 (s) \\ \hline
+  \end{tabular}%
+  }
+\end{table}
+
+\begin{table}[h!]
+  \centering
+  \caption{Async and Sync Dev Mode Comparison}
+  \label{tab:async-sync-comparison}
+  \resizebox{0.475\textwidth}{!}{%
+  \begin{tabular}{|l|c|c|c|c|}
+    \hline
+    \textbf{HW} & \textbf{Resolution} & \textbf{Async} & \textbf{Sync} & \textbf{Factor} \\ \hline
+    \multirow{3}{*}{Intel}
+      & 640x480   & 93.1 (fps) - 24.67 (s) & 20.1 (fps) - 114.6 (s) & 4.63 \\ \cline{2-5}
+      & 1280x720  & 66.3 (fps) - 34.63 (s) & 15.1 (fps) - 152.4 (s) & 4.39 \\ \cline{2-5}
+      & 1920x1080 & 38.8 (fps) - 59.16 (s) & 8.3 (fps) - 275.4 (s)  & 4.67 \\ \hline
+    \multirow{3}{*}{AMD}
+      & 640x480   & 140.0 (fps) - 16.40 (s) & 32.2 (fps) - 71.4 (s)  & 4.35 \\ \cline{2-5}
+      & 1280x720  & 73.3 (fps) - 31.40 (s)  & 19.2 (fps) - 120.0 (s) & 3.82 \\ \cline{2-5}
+      & 1920x1080 & 43.4 (fps) - 53.01 (s)  & 11.2 (fps) - 205.8 (s) & 3.88 \\ \hline
+    \multirow{3}{*}{Orin}
+      & 640x480   & 61.3 (fps) - 37.50 (s)  & 15.53 (fps) - 148.00 (s) & 3.95 \\ \cline{2-5}
+      & 1280x720  & 37.9 (fps) - 60.63 (s)  & 10.14 (fps) - 226.63 (s) & 3.74 \\ \cline{2-5}
+      & 1920x1080 & 18.8 (fps) - 122.23 (s) & 5.07 (fps) - 453.03 (s)  & 3.71 \\ \hline
+  \end{tabular}%
+  }
+\end{table}
+
+% Hardware: Intel Workstation, Mode: Live, Processing Strat:  Partial Blocking, Intermediate Data Viz: False, Res 480p -> Total time: 19.32s, Avg Transfer Data: 1ms, Avg Transfer Merged Data 5ms
+% Hardware: Intel Workstation, Mode: Live, Processing Strat:  Partial Blocking, Intermediate Data Viz: False, Res 720p -> Total time: 24.14s, Avg Transfer Data: 8ms, Avg Transfer Merged Data 11ms
+% Hardware: Intel Workstation, Mode: Live, Processing Strat:  Partial Blocking, Intermediate Data Viz: False, Res 1080p -> Total time: 36.41s, Avg Transfer Data: 30ms, Avg Transfer Merged Data 24ms
+% Hardware: Intel Workstation, Mode: Testing, Processing Strat:  Full Blocking, Intermediate Data Viz: True, Res 480p -> Total time: 1.91min, Avg Transfer Data: 4ms, Avg Transfer Merged Data 11ms
+% Hardware: Intel Workstation, Mode: Testing, Processing Strat:  Full Blocking, Intermediate Data Viz: True, Res 720p -> Total time: 2.54min, Avg Transfer Data: 34ms, Avg Transfer Merged Data 25ms
+% Hardware: Intel Workstation, Mode: Testing, Processing Strat:  Full Blocking, Intermediate Data Viz: True, Res 1080p -> Total time: 4.59min, Avg Transfer Data: 103ms, Avg Transfer Merged Data 80ms
+% Hardware: Intel Workstation, Mode: Testing, Processing Strat:  Partial Blocking, Intermediate Data Viz: True, Res 480p -> Total time: 24.67s, Avg Transfer Data: 5ms, Avg Transfer Merged Data 11ms
+% Hardware: Intel Workstation, Mode: Testing, Processing Strat:  Partial Blocking, Intermediate Data Viz: True, Res 720p -> Total time: 34.63s, Avg Transfer Data: 39ms, Avg Transfer Merged Data 29ms
+% Hardware: Intel Workstation, Mode: Testing, Processing Strat:  Partial Blocking, Intermediate Data Viz: True, Res 1080p -> Total time: 59.16s, Avg Transfer Data: 95ms, Avg Transfer Merged Data 90ms
+
+
+% Hardware: AMD Workstation, Mode: Live, Processing Strat:  Partial Blocking, Intermediate Data Viz: False, Res 480p -> Total time: 52.84s, Avg Transfer Data: 2ms, Avg Transfer Merged Data 5ms
+% Hardware: AMD Workstation, Mode: Live, Processing Strat:  Partial Blocking, Intermediate Data Viz: False, Res 720p -> Total time: 52.43s, Avg Transfer Data: 6ms, Avg Transfer Merged Data 8ms
+% Hardware: AMD Workstation, Mode: Live, Processing Strat:  Partial Blocking, Intermediate Data Viz: False, Res 1080p -> Total time: 1.11min, Avg Transfer Data: 16ms, Avg Transfer Merged Data 17ms
+% Hardware: AMD Workstation, Mode: Testing, Processing Strat:  Full Blocking, Intermediate Data Viz: True, Res 480p -> Total time: 1.19min, Avg Transfer Data: 6ms, Avg Transfer Merged Data 8ms
+% Hardware: AMD Workstation, Mode: Testing, Processing Strat:  Full Blocking, Intermediate Data Viz: True, Res 720p -> Total time: 2.00min, Avg Transfer Data: 41ms, Avg Transfer Merged Data 30ms
+% Hardware: AMD Workstation, Mode: Testing, Processing Strat:  Full Blocking, Intermediate Data Viz: True, Res 1080p -> Total time: 3.43min, Avg Transfer Data: 84ms, Avg Transfer Merged Data 96ms
+% Hardware: AMD Workstation, Mode: Testing, Processing Strat:  Partial Blocking, Intermediate Data Viz: True, Res 480p -> Total time: 16.40s, Avg Transfer Data: 5ms, Avg Transfer Merged Data 8ms
+% Hardware: AMD Workstation, Mode: Testing, Processing Strat:  Partial Blocking, Intermediate Data Viz: True, Res 720p -> Total time: 31.40s, Avg Transfer Data: 40ms, Avg Transfer Merged Data 30ms
+% Hardware: AMD Workstation, Mode: Testing, Processing Strat:  Partial Blocking, Intermediate Data Viz: True, Res 1080p -> Total time: 53.01s, Avg Transfer Data: 90ms, Avg Transfer Merged Data 105ms
+
+\subsubsection{Discussion}
+
+The results in Table~\ref{tab:live-mode-total-times} prove the real-time capabilities of the proposed architecture, maintaining at least 35 fps across all configurations and resolutions.
+Even though the \textbf{AMD Workstation} is disadvantaged due to the object detection running on the CPU, the partial-blocking strategy ensures that the system remains responsive while still allowing object detection to extract features at a lower rate.
+
+The comparison between \textbf{Async Dev Mode} and \textbf{Sync Dev Mode} in Table~\ref{tab:async-sync-comparison} demonstrates the importance of partial-blocking in maintaining system responsiveness, attributing to an average 4$\times$ speedup in video processing time.
+Enabling full-blocking results in similar performance to the parallel architecture (implicit full-blocking), which is in accordance with the theoretical analysis.
+
+\subsection{Real-world application}
+
+The final experiment aimed to validate the usefulness of the proposed architecture in a real scenario.
+The vehicle depicted in Fig.~\ref{fig:real_world} was designed for an international 1:10 scale autonomous driving competition in which the authors are participating~\cite{bfmc}.
+The Hardware configuration is based on a Raspberry Pi 5 with a 720p camera and a Nvidia Jetson AGX Orin for CUDA accelerated object detection.
+A demo video can be found at: (redacted for anonymity).
+The control stack has been developed and validated in a custom simulation environment (citation redacted for anonymity) and then integrated with the perception pipeline from Figure~\ref{fig:mp_pipeline} using the proposed architecture.
+
+\begin{figure}[ht]
+    \centering
+    \includegraphics[scale=0.12]{../../common/figures/real_world_test/qualif}
+    \caption{RC vehicle performing traffic light detection, path detection, trajectory planning and following on a real-world track.}
+    \label{fig:real_world}
+\end{figure}
+
+\section{Limitations \& Future Work}
+
+%While the proposed architecture clearly shows promising results, there are still limitations and areas for improvement and future work:
+%
+%\textbf{Explore Async Write and Read Operations:} A future prospect is to leverage Rust's multithreading capabilities to implement background feeder threads for asynchronous write and read operations, further reducing execution time in the calling process.
+%
+%\textbf{Implement and Benchmark Python 3.13t:} With the release of Python 3.13 FreeThreaded version, which introduces ..., we plan to implement a version of this architecture using this new feature and benchmark its performance against the current implementation.
+%
+%\textbf{Json based Pipeline Configuration and Editing:} A more user-friendly way to configure the pipelines would be to implement a JSON-based GUI that allows users to easily add, remove, and modify filters in the pipeline, manage the order of execution, and set parameters for each filter.
+%
+%\textbf{Benchmark Differing Autonomous Driving Perception Pipelines:} The proposed architecture is designed to be flexible and adaptable to various perception tasks.
+%Future work will involve benchmarking solutions from the literature and comparing them to our own autonomous driving perception pipeline, used for the Bosch Future Mobility Challenge~\cite{bfmc}.
+
+While the proposed architecture has demonstrated promising results, several limitations and areas for potential improvement remain:
+
+\begin{enumerate}
+    \item \textbf{Asynchronous SharedMessage Write and Read Operations:}
+    The Shared Memory I/O operations are currently synchronous and could be further optimized.
+    A key opportunity is to leverage Rust's multithreading capabilities to implement background feeder threads for asynchronous write and read operations, further reducing execution time in the calling process.
+
+    \item \textbf{FreeThreaded Python:}
+    With the recent release of Python 3.13 (the “FreeThreaded” version), Python may offer improved concurrency by mitigating some of the Global Interpreter Lock (GIL) constraints.
+    This could unlock significant performance gains in multi-threaded contexts.
+    We plan to develop a prototype version of this architecture in Python 3.13 and compare its performance against the existing implementation.
+
+    \item \textbf{JSON-Based Pipeline Configuration and Editing:}
+    Currently, customizing the pipeline may involve direct code modifications, which can be cumbersome users who focus on computer vision tasks and do not have deep insights into the underlying architecture.
+    A JSON-based configuration system (potentially complemented by a user-friendly GUI) would greatly simplify the process.
+    This would allow users to add, remove, reorder, and parameterize filters dynamically without modifying the underlying codebase.
+
+    \item \textbf{Benchmark Differing Autonomous Driving Perception Pipelines:}
+    While the proposed architecture is designed to be flexible and adaptable to various perception tasks, we have only tested it with a limited number of pipelines, developed mainly for the Bosch Future Mobility Challenge~\cite{bfmc}.
+    Future work will involve integrating and benchmarking additional solutions from the literature to validate the architecture in diverse contexts and compare performance against our current autonomous driving pipeline.
+
+\end{enumerate}
+
+\section{Conclusion}
+In this work, we introduced a modular, concurrent vision architecture that effectively balances high performance with developer accessibility for autonomous driving and robotics applications.
+
+By combining Python’s rich ecosystem of computer vision libraries with Rust’s low-level efficiency and safe concurrency, our architecture addresses common bottlenecks—particularly IPC overhead and limitations imposed by Python’s GIL. We achieve real-time performance through a shared memory design that reduces unnecessary data copies and enables partial-blocking communication, allowing faster pipelines to operate without being stalled by slower ones.
+
+Experimental results on multiple hardware platforms, including embedded devices and high-end workstations, demonstrate superior scalability, resource efficiency, and throughput compared to naive multiprocessing or parallel designs based on standard Python IPC primitives.
+
+Real-world testing on a 1:10 scale vehicle further validates the practicality of our approach by showing its adaptability and responsiveness in an actual autonomous driving setting.
+We further highlighted the architecture’s flexibility by supporting both real-time and offline development modes, permitting convenient debugging, visualization, and data recording.
+
+While the proposed system shows promising results, additional optimizations—such as asynchronous read/write in Rust and leveraging Python’s future free-threading capabilities—present opportunities for even greater performance gains.
+
+Ultimately, this approach offers a robust foundation for executing real-time vision pipelines where timeliness and efficiency are paramount.
+
+
+\bibliography{../../common/bibliography/IEEEabrv,../../common/bibliography/references}
+\bibliographystyle{../../common/styles/IEEEtran}
+\end{document}
