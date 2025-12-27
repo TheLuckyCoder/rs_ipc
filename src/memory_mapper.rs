@@ -38,7 +38,7 @@ impl<T: ?Sized + SlicePtrCast> SharedMemoryMapper<T> {
             return Err(e.into());
         }
 
-        match unsafe { Self::map_and_init(&shm, true) } {
+        match unsafe { Self::map_and_init(&shm) } {
             Ok((mapped_struct, mapped_size)) => Ok(Self {
                 name,
                 _fd: shm,
@@ -56,7 +56,7 @@ impl<T: ?Sized + SlicePtrCast> SharedMemoryMapper<T> {
     pub fn open(name: CString) -> std::io::Result<Self> {
         // Open shared memory
         let shm = rustix::shm::open(&name, OFlags::RDWR, Mode::all())?;
-        let (mapped_ptr, mapped_size) = unsafe { Self::map_and_init(&shm, false)? };
+        let (mapped_ptr, mapped_size) = unsafe { Self::map_and_init(&shm)? };
 
         Ok(Self {
             name,
@@ -67,7 +67,7 @@ impl<T: ?Sized + SlicePtrCast> SharedMemoryMapper<T> {
         })
     }
 
-    unsafe fn map_and_init(shm: &OwnedFd, create: bool) -> rustix::io::Result<(*const T, usize)> {
+    unsafe fn map_and_init(shm: &OwnedFd) -> rustix::io::Result<(*const T, usize)> {
         // Read actual size
         let stats = rustix::fs::fstat(shm)?;
         let size = stats.st_size as usize;
@@ -87,12 +87,6 @@ impl<T: ?Sized + SlicePtrCast> SharedMemoryMapper<T> {
 
         if let Err(e) = unsafe { mm::madvise(void_ptr.as_ptr(), size, mm::Advice::LinuxHugepage) } {
             eprintln!("Failed to set huge pages advice: {e}");
-        }
-
-        if create {
-            unsafe {
-                std::ptr::write_bytes(void_ptr.as_ptr(), 0, size);
-            }
         }
 
         let ptr =

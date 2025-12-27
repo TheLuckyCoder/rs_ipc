@@ -15,8 +15,14 @@ impl SharedCondvar {
 
     /// Wait on the condition variable if the value matches the expected value,
     /// Remember, this can wake spontaneously
-    #[inline(always)]
+    #[inline]
     pub fn wait(&self, expected: u32) {
+        for _ in 0..1000 {
+            if self.0.load(Ordering::Relaxed) != expected {
+                return;
+            }
+            std::hint::spin_loop();
+        }
         futex_wait(&self.0, expected);
     }
 

@@ -5,6 +5,7 @@ edition = "2024"
 
 [profile.release]
 lto = "fat"
+codegen-units = 1
 
 [lib]
 name = "rs_ipc"

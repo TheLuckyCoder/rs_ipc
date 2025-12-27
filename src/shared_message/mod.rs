@@ -16,22 +16,39 @@ pub(crate) type PayloadWriteGuard<'a> = SharedMutexGuard<'a, ()>;
 
 #[repr(C)]
 pub struct SharedMessage<T: ?Sized = [u8]> {
-    sequence_and_flags: AtomicU64, // SequenceState
+    // --- Cache Line 1: Read-Mostly (Polled by readers) ---
+    sequence_and_flags: AtomicU64,
+    data_size: AtomicUsize,
+
+    // Pad to 128 bytes (Cache Line 1 + prefetch margin)
+    _pad1: [u8; 112],
+
+    // --- Cache Line 2: High Contention (Read-Modify-Write) ---
     readers_state: AtomicU64, // ReadersState
+    writer_mutex: SharedMutex<()>, // Writer mutex (serializes multiple writers)
 
     // Synchronization (lock-free condition variables)
     writer_condvar: SharedCondvar, // Readers wait here for new data
     reader_done_condvar: SharedCondvar, // Writer waits here for readers to finish
 
-    // Writer mutex (serializes multiple writers)
-    writer_mutex: SharedMutex<()>,
+    // Pad to finish the 2nd 128-byte block.
+    _pad2: [u8; 104],
 
-    data_size: AtomicUsize,
     data: UnsafeCell<T>,
 }
 
 impl SharedMessage {
     pub(crate) const fn size_of_fields() -> usize {
+        const {
+            assert!(size_of::<SharedMessage<[u8; 0]>>() % 64 == 0,
+                    "SharedMessage header must align to exactly 64 bytes for cache alignment");
+        }
+
+        const {
+            assert!(size_of::<SharedMessage<[u8; 8]>>() % 64 == 8,
+                    "SharedMessage payload misalignment detected");
+        }
+
         size_of::<SharedMessage<[u8; 0]>>()
     }
 
@@ -58,6 +75,7 @@ impl SharedMessage {
 
         // Wait for readers to consume the already existing data (based on policy)
         let current_seq = self.get_sequence_state().sequence;
+        self.data_size.store(0, Ordering::Release);
 
         let mut reader_state = self.get_reader_state();
 
@@ -102,18 +120,19 @@ impl SharedMessage {
 
     /// Release a reader reference
     pub(crate) fn release_active_reader(&self) {
-        self.update_reader_state(|state| {
+        let reader_state =self.update_reader_state(|state| {
             state.active_readers -= 1;
             // Increment consumed count to signal that this reader has finished
             state.data_consumed += 1;
         });
 
-        self.reader_done_condvar.notify_all();
+        if reader_state.active_readers == 0 {
+            self.reader_done_condvar.notify_all();
+        }
     }
 
     pub(crate) fn capacity(&self) -> usize {
-        let data = unsafe { &*(self.data.get()) };
-        data.len()
+        self.data.get().len()
     }
 
     pub(crate) fn data_ref(&self) -> &[u8] {
@@ -172,14 +191,14 @@ impl SharedMessage {
         }
     }
 
-    fn update_reader_state(&self, mut mutator: impl FnMut(&mut ReadersStateCount)) {
+    fn update_reader_state(&self, mut mutator: impl FnMut(&mut ReadersStateCount)) -> ReadersStateCount {
         let mut packed = self.readers_state.load(Ordering::Acquire);
         loop {
             let mut policy = ReadersStateCount::from(packed);
             mutator(&mut policy);
             let new_packed = policy.to_packed();
             if packed == new_packed {
-                break; // nothing to do
+                return policy; // nothing to do
             }
 
             match self.readers_state.compare_exchange_weak(
@@ -188,7 +207,7 @@ impl SharedMessage {
                 Ordering::Release,
                 Ordering::Acquire,
             ) {
-                Ok(_) => break,
+                Ok(_) => return policy,
                 Err(actual_value) => packed = actual_value,
             }
         }
@@ -217,7 +236,14 @@ impl SharedMessage {
                 data.len()
             );
         }
-        data[..new_data.len()].copy_from_slice(new_data);
+        // We already checked bounds, so copy_nonoverlapping is safe and faster
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                new_data.as_ptr(),
+                data.as_mut_ptr(),
+                new_data.len()
+            );
+        }
 
         self.publish_write(writer_guard, new_data.len())
     }

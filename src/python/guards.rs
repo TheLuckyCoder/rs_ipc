@@ -273,33 +273,32 @@ impl PythonWriteGuard {
 
         let buffer_view: PyBuffer<u8> = data.extract()?;
         let write_len = buffer_view.len_bytes();
-        let buffer = guard.data_mut();
+        let data_mut = guard.data_mut();
 
-        if self.cursor + write_len > buffer.len() {
+        if self.cursor + write_len > data_mut.len() {
             return Err(PyValueError::new_err(format!(
                 "Data too large: cursor at {}, writing {} bytes, capacity {}",
                 self.cursor,
                 write_len,
-                buffer.len()
+                data_mut.len()
             )));
         }
 
-        let target_slice = &mut buffer[self.cursor..self.cursor + write_len];
+        let target_slice = &mut data_mut[self.cursor..self.cursor + write_len];
 
-        // If the data is C-contiguous (standard flat memory), we can memcpy directly.
-        // If it is non-contiguous (e.g. numpy slices), we must use copy_to_slice.
+        // If the input is flat (like PyBytes or C-contiguous Numpy), we memcpy.
         if buffer_view.is_c_contiguous() {
-            // SAFETY: We checked is_c_contiguous, so buf_ptr points to a flat array of len_bytes
-            let src_slice = unsafe {
-                std::slice::from_raw_parts(buffer_view.buf_ptr() as *const u8, write_len)
-            };
-            target_slice.copy_from_slice(src_slice);
+            // SAFETY: The buffer protocol ensures the pointer is valid for `len_bytes`.
+            unsafe {
+                let src_ptr = buffer_view.buf_ptr() as *const u8;
+                std::ptr::copy_nonoverlapping(src_ptr, target_slice.as_mut_ptr(), write_len);
+            }
         } else {
-            // This copies element-by-element or row-by-row as needed
+            // Fallback for complex strided arrays (e.g. non-contiguous numpy slices)
             buffer_view.copy_to_slice(data.py(), target_slice)?;
         }
-        self.cursor += write_len;
 
+        self.cursor += write_len;
         Ok(write_len)
     }
 
