@@ -1,26 +1,23 @@
 # rs_ipc
 
-High-performance IPC library for Python, implemented in Rust. Designed for real-time computer vision pipelines in autonomous vehicles.
+High-performance inter-process communication library for Python, implemented in Rust. Provides zero-copy shared memory communication with flexible blocking strategies, suitable for real-time and data-intensive applications.
 
-Originally developed for the paper "Accelerating Intelligent Vehicle Vision: A Hybrid Python-Rust Architecture with Partial-Blocking IPC" and expanded for a master's thesis.
+Originally developed for the paper "Accelerating Intelligent Vehicle Vision: A Hybrid Python-Rust Architecture with Partial-Blocking IPC" and expanded for a master's thesis on efficient IPC.
 
 ## Build & Test
 
 ```bash
-# Build Python wheel (development)
-maturin develop
+# Activate venv
+source venv/bin/activate
 
-# Build release wheel
-maturin build --release
+# Build Python and install wheel
+maturin develop -r
 
 # Run Rust tests
 cargo test
 
 # Run nightly benchmarks
 cargo +nightly bench --features nightly-features
-
-# Run Python tests
-pytest
 ```
 
 ## Architecture Overview
@@ -155,8 +152,8 @@ pub fn wait(&self, expected: u32) {
 }
 
 pub fn notify_all(&self) {
-    self.0.fetch_add(1, Release);  // Increment counter
-    futex_wake_all(&self.0);       // Wake all waiters
+    self.0.fetch_add(1, Release);       // Increment counter
+    assert!(futex_wake_all(&self.0));   // Wake all waiters
 }
 ```
 
@@ -239,35 +236,63 @@ The paper listed async operations as future work. Now implemented:
 | `src/python/bytes.rs` | RustPyBytes wrapper for zero-copy returns |
 | `src/python/operation_mode.rs` | Read/Write/Async mode enum |
 | `src/python/reader_wait_policy.rs` | Blocking policy configuration |
+| `src/python/queue_data.rs` | Helper structs for async queue operations |
 | `rs_ipc.pyi` | Python type stubs with documentation |
+| `benches/ipc_bench.rs` | Criterion benchmarks for Rust |
+| `benches/python_bench.py` | Comprehensive Python benchmarks |
 
 ## Performance Analysis
 
-### Original Paper Results
+### Current Benchmarks
 
-| Resolution | MP-Pipe (ms) | rs_ipc (ms) | Speedup |
-|------------|--------------|-------------|---------|
-| 256x256    | 0.247        | 0.200       | 1.24x   |
-| 512x512    | 0.908        | 0.728       | 1.25x   |
-| 1920x1080  | 16.161       | 11.26       | 1.44x   |
+Comprehensive benchmarks in `benches/` comparing rs_ipc against Python multiprocessing:
 
-Overall pipeline speedup: **4.3x** vs naive parallel design with partial-blocking.
+**Backends tested:**
+- `RsIpc_zerocopy`: Direct shared memory access (fastest)
+- `RsIpc_copy`: With data copy for comparison
+- `MpQueue`: `multiprocessing.Queue`
+- `MpPipe`: `multiprocessing.Pipe`
+- `MpShm`: `multiprocessing.shared_memory`
+- `ZeroMQ`: pyzmq PUSH/PULL over IPC (message-passing baseline)
+- `PosixIpc`: posix_ipc SharedMemory + Semaphore (same mechanism, Python sync)
 
-### Benchmarking Methodology
+**Scenarios:**
+- Latency (1:1): Single producer, single consumer
+- Scalability (1:10): One writer, ten readers
+- Contention (10:1): Ten writers, one reader
+- Variable sizes: 1MB, 2MB, 4MB, 8MB, 16MB, 32MB payloads
 
-The paper benchmarked write-read round-trip latency over 50,000 iterations with:
-- Mock PipeData: 3x frame size (initial frame + processed frame + features)
-- Blocking operations to isolate transfer time from processing
-- Intel i5-12600K workstation
+**Statistical methodology:** Multiple independent trials (default 5), warmup iterations discarded, reports median with IQR across trials. CLI flags: `--trials`, `--warmup`, `--quick`.
 
-Nightly benchmarks in `src/python/message.rs` (feature `nightly-features`) cover:
+**Sample results** (p50 latency in ms, from `benches/bench_results.csv`):
+
+| Scenario | RsIpc (zerocopy) | ZeroMQ | PosixIpc | MpQueue |
+|----------|------------------|--------|----------|---------|
+| Latency 1:1 | 0.85 | 1.22 | 0.26 | 1.76 |
+| Scale 1:10 | 2.05 | 9.22 | 4.44 | 5.80 |
+| Size 4MB | 0.24 | 1.92 | 1.35 | 3.81 |
+| Size 32MB | 27.50 | 99.85 | 50.59 | 78.70 |
+
+Run benchmarks: `python benches/python_bench.py run`
+Quick validation: `python benches/python_bench.py run --quick`
+
+Generated plots in `benches/plots/`:
+- `01_tail_latency.png`: p50/p99 comparison
+- `02_determinism.png`: Latency variance
+- `03_efficiency.png`: Throughput comparison
+- `04_size_scaling.png`: Performance vs message size
+
+### Rust Criterion Benchmarks
+
+In `benches/ipc_bench.rs`:
 - `pure_write`: Write without readers
-- `write_waiting_with_N_readers`: Scaling with consumer count
-- `write_and_read_same_thread`: Round-trip latency
+- `write_with_reader`: Round-trip with blocking reader
+
+Run: `cargo bench`
 
 ### Performance Factors
 
-1. **Memory copy**: Dominant cost at large sizes. Using `madvise(MADV_HUGEPAGE)` for TLB efficiency.
+1. **Memory copy**: Dominant cost at large sizes. Transparent huge pages (`MADV_HUGEPAGE`) were explored but are unreliable with `shm_open`-backed regions.
 2. **Futex syscalls**: ~1μs overhead when contended. Spin loop amortizes for short waits.
 3. **PyO3 overhead**: ~50ns per call for type conversion. Negligible vs memory copy.
 4. **GIL acquisition**: ~100ns. Released during blocking ops to avoid contention.
@@ -298,4 +323,82 @@ Criterion benchmarks needed for thesis:
 - [x] Throughput at various message sizes
 - [x] Multi-consumer scaling curves
 - [x] Comparison with `multiprocessing.Pipe`, `Queue`, `shared_memory`
-- [ ] Comparison with other Rust IPC crates (ipc-channel, crossbeam-channel)
+- [x] Comparison with ZeroMQ (PUSH/PULL, message-passing baseline)
+- [x] Comparison with posix_ipc (same shm mechanism, Python POSIX semaphores)
+- [x] Statistical rigor (multiple trials, IQR, warmup iterations)
+
+---
+
+## Thesis Writing Guide
+
+Thesis latex file can be found at 'paper/main.tex' and it's chapters at 'paper/chapters/*.tex'
+
+### Title
+
+**English**: Efficient Inter-Process Communication with Zero-Copy Semantics: A Rust-Based Shared Memory Library for Python
+
+**German**: Effiziente Interprozesskommunikation mit Zero-Copy-Semantik: Eine Rust-basierte Shared-Memory-Bibliothek für Python
+
+**Romanian**: Comunicare Eficientă între Procese cu Semantică Zero-Copy: O Bibliotecă Bazată pe Rust pentru Comunicare prin Memorie Partajată în Python
+
+### Terminology (be consistent)
+
+| Correct | Avoid | Notes |
+|---------|-------|-------|
+| zero-copy | zero copy, zerocopy | Hyphenated as adjective |
+| shared memory | shared-memory | No hyphen |
+| futex-based | futex based | Hyphenated as adjective |
+| GIL-free | GIL free | Hyphenated |
+| lock-free version checking | lock-free IPC | Only version checking is lock-free; read/write uses mutex |
+| partial-blocking | partial blocking | Hyphenated as adjective |
+| PyO3 | pyo3, Pyo3 | Official capitalization |
+
+### Claims to Avoid
+
+- **"Lock-free synchronization"** — Misleading. Only version checking & multiple readers at once avoid locks; actual read/write acquires the FutexLock mutex.
+- **"Zero overhead"** — There's always some overhead (futex syscalls, PyO3 FFI). Say "minimal overhead" or "reduced overhead."
+- **"Real-time guarantees"** — We don't provide hard real-time guarantees. Say "low-latency" or "suitable for real-time applications."
+
+### Original Paper Reference
+
+Conference paper: "Accelerating Intelligent Vehicle Vision: A Hybrid Python-Rust Architecture with Partial-Blocking IPC"
+
+### Chapter Structure
+
+| Chapter | Label | Content |
+|---------|-------|---------|
+| 1. Introduction | `chap:intro` | Motivation, problem statement, contributions, thesis structure |
+| 2. Foundations and Requirements | `chap:ch2` | POSIX shared memory, mmap, futex, synchronization primitives |
+| 3. Related Work | `chap:ch3` | ZeroMQ, nanomsg, ipc-channel, Cap'n Proto, positioning of rs\_ipc |
+| 4. Architecture & Implementation | `chap:ch4` | SharedMessage, FutexLock, SharedCondvar, PyO3 integration |
+| 5. Performance Evaluation | `chap:ch5` | Benchmarking methodology, results, comparison with alternatives |
+| 6. Conclusions | `chap:conclusions` | Summary, limitations, future work |
+
+### Figures Location
+
+- `paper/figures/` — thesis-specific figures
+- `common/figures/` — shared with original paper (referenced in `original_paper.tex`)
+
+### Writing Style
+
+- Academic formal tone
+- Third person preferred ("the library provides" not "we provide")
+- Active voice where possible
+- No contractions (don't → do not)
+- Spell out numbers under 10
+- Use `\texttt{}` for code/identifiers in LaTeX
+- Use proper mathematical notation for speedups: `1.24$\times$`
+
+### What Still Needs Writing
+
+- [x] Chapter 2: Foundations and Requirements
+- [ ] Chapter 3: Related Work (ZeroMQ, nanomsg, ipc-channel, Cap'n Proto, multiprocessing alternatives)
+- [ ] Chapter 4: Architecture & Implementation  
+- [ ] Chapter 5: Performance Evaluation
+- [ ] Chapter 6: Conclusions
+
+### Platform Limitations to Document
+
+- **Linux-only**: Requires futex syscalls (Linux-specific)
+- **Python 3.12+**: Due to PyO3 features used
+- **x86_64/aarch64**: Tested architectures

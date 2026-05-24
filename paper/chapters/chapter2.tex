@@ -87,34 +87,12 @@ The standard mitigation is to separate frequently accessed fields into distinct 
 \subsection{Mutexes}
 \label{subsec:mutexes}
 
-A mutex (mutual exclusion lock) ensures that at most one thread or process executes a critical section at any given time. Conceptually, a mutex provides two operations: \texttt{lock} (acquire exclusive access, blocking if unavailable) and \texttt{unlock} (release exclusive access, potentially waking a blocked waiter).
-
-Mutex implementations occupy a spectrum between two extremes:
-
-\begin{itemize}
-    \item \textbf{Spin locks}: The acquiring thread repeatedly tests the lock state in a tight loop. This avoids the overhead of context switches but wastes CPU cycles during contention. Spin locks perform well when critical sections are short and contention is rare.
-
-    \item \textbf{Blocking locks}: When the lock is unavailable, the acquiring thread yields the CPU to the operating system scheduler. This eliminates busy-waiting but incurs the cost of context switches (typically 1--10 microseconds). Blocking locks are appropriate when critical sections are long or contention is frequent.
-\end{itemize}
-
-A hybrid approach combines both strategies: spin briefly (optimistic that the lock will be released quickly), then fall back to blocking if the spin phase fails. This approach, described in detail in Section~\ref{sec:futex}, forms the basis of the futex-based lock used in \texttt{rs\_ipc}.
+A mutex (mutual exclusion lock) ensures that at most one thread or process executes a critical section at any given time~\cite{herlihy2012}. Implementations range from pure spin locks---which avoid context switches but waste CPU cycles during contention---to fully blocking locks that yield to the scheduler at the cost of 1--10 microsecond wake-up latency. A hybrid approach spins briefly before falling back to blocking, exploiting the common case where locks are held only briefly. This spin-then-block strategy, described in Section~\ref{sec:futex}, forms the basis of the futex-based lock used in \texttt{rs\_ipc}.
 
 \subsection{Condition Variables}
 \label{subsec:condvars}
 
-While mutexes protect shared state, they do not provide a mechanism for threads to efficiently wait for state changes. A thread that needs to wait for a particular condition (e.g., ``new data is available'') could repeatedly acquire the lock, check the condition, release the lock, and retry---a pattern called busy-waiting that wastes CPU resources.
-
-Condition variables solve this problem by allowing a thread to atomically release a lock and suspend execution until another thread signals that the condition may have changed. The fundamental operations are:
-
-\begin{itemize}
-    \item \textbf{wait(lock, condition)}: Atomically releases the lock and suspends the calling thread. When the thread is awakened, it re-acquires the lock before returning.
-
-    \item \textbf{notify\_one}: Wakes one suspended thread waiting on the condition variable.
-
-    \item \textbf{notify\_all}: Wakes all suspended threads waiting on the condition variable.
-\end{itemize}
-
-In a producer-consumer system, the producer signals the condition variable after writing new data, waking consumers that were waiting for fresh input. The atomicity of the release-and-suspend operation in \texttt{wait} prevents a race condition where a notification arrives between releasing the lock and entering the wait state (the ``lost wakeup'' problem).
+While mutexes protect shared state, they do not provide a mechanism for threads to efficiently wait for state changes. Condition variables fill this gap by allowing a thread to atomically release a lock and suspend execution until another thread signals that the condition may have changed~\cite{herlihy2012}. The key operations are \texttt{wait} (atomic release-and-sleep), \texttt{notify\_one} (wake a single waiter), and \texttt{notify\_all} (wake all waiters). The atomicity of the release-and-suspend in \texttt{wait} prevents the ``lost wakeup'' problem, where a notification arrives between releasing the lock and entering the wait state.
 
 
 \section{The Linux Futex Subsystem}
@@ -256,43 +234,11 @@ The gap between these options---fast but unsafe (raw shared memory) or safe but 
 
 Rust is a systems programming language that provides memory safety and thread safety guarantees at compile time, without requiring a garbage collector or runtime~\cite{rustbook}. These properties make it particularly suitable for implementing shared memory data structures that must be correct across process boundaries.
 
-\subsection{Ownership and Borrowing}
+\subsection{Safety Guarantees}
 
-Rust's ownership system enforces three rules at compile time:
+Rust's ownership system prevents use-after-free, double-free, dangling pointers, and data races at compile time through single-ownership semantics and exclusive-or-shared borrowing rules~\cite{rustbook}. Two marker traits extend these guarantees to concurrent programming: \texttt{Send} (a type can be safely transferred between threads) and \texttt{Sync} (a type can be safely shared between threads via references). For shared memory structures, manually implementing \texttt{Sync}---with an accompanying safety justification---is the mechanism by which Rust verifies that concurrent access is correctly synchronized.
 
-\begin{enumerate}
-    \item Each value has exactly one owner at any time.
-    \item When the owner goes out of scope, the value is dropped (freed).
-    \item A value may be borrowed as either one mutable reference \textit{or} any number of immutable references, but not both simultaneously.
-\end{enumerate}
-
-These rules prevent, at compile time, entire categories of bugs common in C and C++: use-after-free, double-free, dangling pointers, and data races. The type system encodes these guarantees through two marker traits relevant to concurrent programming:
-
-\begin{itemize}
-    \item \textbf{Send}: A type is \texttt{Send} if it can be safely transferred to another thread. Most types are \texttt{Send}; notable exceptions include raw pointers and types containing thread-local references.
-
-    \item \textbf{Sync}: A type is \texttt{Sync} if it can be safely shared between threads (i.e., if \texttt{\&T} is \texttt{Send}). A type containing interior mutability (such as \texttt{Cell<T>}) is not \texttt{Sync} unless it uses atomic operations or locks.
-\end{itemize}
-
-For shared memory structures, implementing \texttt{Sync} (and documenting why it is safe to do so) is the mechanism by which Rust verifies that concurrent access is correctly synchronized.
-
-\subsection{Zero-Cost Abstractions}
-
-Rust's design philosophy guarantees that high-level abstractions compile to code equivalent to hand-written low-level implementations~\cite{rustbook}. Iterators, generics, and trait objects incur no runtime overhead beyond what a manually optimized C implementation would require. This property is critical for a low-latency IPC library: the safety guarantees provided by the type system do not come at the cost of additional instructions in the generated machine code.
-
-\subsection{Unsafe Code and Safety Contracts}
-
-Certain operations---raw pointer dereferencing, calling foreign functions, implementing \texttt{Send} or \texttt{Sync} for types with interior mutability---cannot be verified by the compiler and require the \texttt{unsafe} keyword~\cite{rustonomicon}. Unsafe code does not disable Rust's safety guarantees; rather, it shifts the burden of proof from the compiler to the programmer for specific, delimited operations.
-
-The convention in Rust is to encapsulate unsafe operations within safe abstractions. The unsafe implementation maintains documented invariants, and the public API ensures that callers cannot violate those invariants regardless of how they use the interface. For a shared memory library, common unsafe operations include:
-
-\begin{itemize}
-    \item Constructing references from raw pointers obtained via \texttt{mmap}.
-    \item Implementing \texttt{Sync} for structures containing \texttt{UnsafeCell} (required for interior mutability across shared memory).
-    \item Calling operating system interfaces (\texttt{shm\_open}, \texttt{mmap}, \texttt{futex}) through FFI.
-\end{itemize}
-
-Each \texttt{unsafe} block carries an implicit contract: the surrounding code must uphold the invariants that make the operation sound. Documenting these contracts---what must be true for the unsafe code to be correct---is a standard practice that enables reasoning about safety at module boundaries rather than at every individual memory access.
+Operations that the compiler cannot verify---raw pointer dereferencing, foreign function calls, manual \texttt{Sync} implementations---require the \texttt{unsafe} keyword~\cite{rustonomicon}. The convention is to encapsulate these operations within safe abstractions whose public API upholds the required invariants. In a shared memory library, typical unsafe operations include constructing references from \texttt{mmap}-returned pointers, implementing \texttt{Sync} for structures containing \texttt{UnsafeCell}, and invoking operating system interfaces through FFI. High-level abstractions such as iterators and generics compile to code equivalent to hand-written C, ensuring that these safety guarantees introduce no runtime overhead~\cite{rustbook}.
 
 \subsection{PyO3 and Foreign Function Interface}
 
@@ -301,11 +247,9 @@ PyO3 is a Rust framework for creating native Python extensions~\cite{pyo3}. It p
 \begin{itemize}
     \item \textbf{GIL management}: The \texttt{Python<'py>} token represents GIL ownership. The \texttt{detach} method releases it for a closure's duration, enabling concurrent Python threads during blocking operations.
 
-    \item \textbf{Module-level GIL declaration}: The \texttt{\#[pymodule(gil\_used = false)]} attribute declares that the module does not require the GIL for internal state access, enabling the Python runtime to optimize GIL management for the module's methods.
-
     \item \textbf{Buffer protocol}: Rust types can implement Python's buffer protocol, allowing Python code to access Rust-owned memory directly (e.g., through \texttt{memoryview}) without copying.
 
-    \item \textbf{Type conversions}: Automatic conversion between Python and Rust types at the FFI boundary, with zero-copy paths for bytes-like objects through \texttt{Py<PyBytes>} or custom buffer types.
+    \item \textbf{Type conversions}: Automatic conversion between Python and Rust types at the FFI boundary, with zero-copy paths for bytes-like objects.
 \end{itemize}
 
 The combination of PyO3's safe Rust API, explicit GIL management, and the buffer protocol enables a library architecture where Python code interacts with shared memory through safe, idiomatic interfaces while the underlying implementation operates at native speed without GIL contention.
