@@ -8,10 +8,21 @@
 %\geometry{a4paper,top=2.5cm,left=3cm,right=2.5cm,bottom=2.5cm}
 %in style
 %controlling the appearance of your headers and footers
+\usepackage{silence}
+\WarningFilter{latex}{Label}
+\usepackage{microtype}
 \usepackage{fancyhdr}
 \usepackage{amsmath}
 \usepackage{amssymb}
+\usepackage{array}
+\usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{tikz}
+\usetikzlibrary{decorations.pathreplacing}
 \pagestyle{fancy}
+\setlength{\headheight}{14.5pt}
+\addtolength{\topmargin}{-2.5pt}
 \lhead{}
 \chead{}
 \renewcommand{\headrulewidth}{0.2pt}
@@ -22,6 +33,7 @@
 % ============================================================================
 % ENGLISH TITLE PAGE
 % ============================================================================
+\begingroup\hbadness=10000
 \begin{titlepage}
 \begin{center}
 {\Large\textbf{BABEŞ-BOLYAI UNIVERSITY CLUJ-NAPOCA}\\[1em]
@@ -141,6 +153,7 @@
 {\Large{2026}}
 \end{center}
 \end{titlepage}
+\endgroup
 
 \newpage
 \thispagestyle{empty}
@@ -155,11 +168,11 @@
 \vspace{0.5cm}
 %\cleardoublepage
 
-Python's native inter-process communication mechanisms exhibit significant performance limitations in data-intensive applications requiring low-latency data transfer. This thesis presents \texttt{rs\_ipc}, a high-performance IPC library implemented in Rust that achieves zero-copy communication through POSIX shared memory.
+Python's native inter-process communication mechanisms exhibit significant performance limitations in data-intensive applications requiring low-latency transfer of large payloads. This thesis presents \texttt{rs\_ipc}, a high-performance IPC library implemented in Rust that provides zero-copy shared memory communication for Python through PyO3 bindings.
 
-The library introduces a \texttt{SharedMessage} abstraction with futex-based synchronization, enabling efficient producer-consumer patterns without pthread FFI overhead. Key design features include direct shared memory access eliminating redundant copies, version checking without lock acquisition, flexible blocking strategies (non-blocking, partial-blocking, full-blocking), and GIL-free operations for Python multithreading.
+The library introduces a \texttt{SharedMessage} abstraction with cache-aligned memory layout, bit-packed atomic fields, and futex-based synchronization primitives operating directly via Linux system calls. The design enables lock-free read-side version checking, flexible producer-consumer policies (non-blocking, partial-blocking, full-blocking), and GIL-free operations that permit true Python multithreading during IPC.
 
-Benchmarks across embedded platforms and workstations demonstrate significant speedups over Python's \texttt{multiprocessing} primitives. The partial-blocking communication strategy enables faster processing pipelines to proceed without waiting on slower ones, substantially improving overall throughput in concurrent applications. Validation on a 1:10 scale autonomous vehicle confirms applicability to real-time computer vision systems.
+A comprehensive evaluation compares \texttt{rs\_ipc} against six alternative backends---\texttt{multiprocessing.Queue}, \texttt{Pipe}, \texttt{shared\_memory}, ZeroMQ, and POSIX IPC---across four communication topologies. In single-producer single-consumer scenarios, the copy mode achieves 0.19\,ms median latency (9.4$\times$ faster than \texttt{multi\-processing.Queue}). In fan-out topologies (1:10), the lock-free reader path yields a scalability ratio of 2.4$\times$ compared to 19$\times$ degradation for semaphore-based alternatives, sustaining 2.5\,GiB/s aggregate throughput. For pre-serialized payloads, raw shared memory throughput exceeds 18\,GiB/s at message sizes of 1--8\,MiB. The evaluation also identifies a critical trade-off: under writer contention (10:1), the zero-copy mode exhibits catastrophic tail latency due to extended lock holding during serialization, while the copy mode maintains predictable performance. These findings yield concrete deployment guidelines mapping communication topology to optimal operating mode.
 
 
 \tableofcontents
@@ -176,7 +189,6 @@ Benchmarks across embedded platforms and workstations demonstrate significant sp
 \input{chapters/chapter5}
 
 \input{chapters/chapter_conclusions}
-\addcontentsline{toc}{chapter}{Conclusions}
 
 \bibliography{references}
 

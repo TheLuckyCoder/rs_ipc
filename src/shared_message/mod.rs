@@ -35,7 +35,7 @@ pub struct SharedMessage<T: ?Sized = [u8]> {
     reader_done_condvar: SharedCondvar, // Writer waits here for readers to finish
 
     // Pad to finish the 2nd 128-byte block.
-    _pad2: [u8; 104],
+    _pad2: [u8; 108],
 
     data: UnsafeCell<T>,
 }

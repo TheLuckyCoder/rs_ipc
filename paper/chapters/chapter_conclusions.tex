@@ -1,3 +1,9 @@
-\chapter{conclusions}
-\label{conclusions}
+\chapter{Conclusions}
+\label{chap:conclusions}
+
+% TODO: Highlight that the ReaderWaitPolicy abstraction extends beyond shared-memory
+% blocking behavior to fundamentally change the system's delivery semantics. Combined
+% with WriteAsync, the same library serves as both a real-time data bus (latest-value,
+% lossy via Count(0)) and a reliable message queue (ordered, guaranteed delivery via
+% All()), selected at construction time without architectural changes.
 

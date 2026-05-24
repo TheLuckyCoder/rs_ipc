@@ -18,205 +18,137 @@ cargo test
 
 # Run nightly benchmarks
 cargo +nightly bench --features nightly-features
+
+# Run full Python benchmarks (10 trials, 20 warmup, 200 iterations)
+python benches/python_bench.py run --trials 10 --warmup 20 --iterations 200
+
+# Run with machine tag (for multi-machine comparison)
+python benches/python_bench.py run --trials 10 --warmup 20 --iterations 200 --machine-tag amd_ryzen7_7700
 ```
 
 ## Architecture Overview
 
-rs_ipc provides a `SharedMessage` abstraction for inter-process communication using POSIX shared memory (`shm_open`, `mmap`). The design prioritizes:
+rs_ipc provides a single-slot `SharedMessage` abstraction for inter-process communication using POSIX shared memory (`shm_open`, `mmap`). It targets single-machine Python-to-Python IPC for large payloads (1-32 MiB). The design prioritizes:
 
 1. **Zero-copy semantics**: Processes read/write directly to shared memory
-2. **Lock-free version checking**: Readers detect new messages without acquiring locks
+2. **Lock-free version checking**: Readers detect new messages and access data without acquiring any mutex
 3. **Flexible blocking strategies**: Non-blocking, partial-blocking, and full-blocking modes
-4. **GIL-free operations**: Python threads can perform IPC without holding the GIL
+4. **GIL-free operations**: All blocking IPC operations release Python's GIL via `py.detach()`
+5. **RAII safety**: All shared resources managed through Rust ownership (auto-cleanup on drop)
 
-### Design Evolution from Original Paper
+### Layered Architecture
 
-The original paper proposed a SharedMessage specification that has been refined in the current implementation for better performance and safety.
+1. **OS layer**: POSIX shared memory (`shm_open`/`mmap`) + Linux futex syscalls (via rustix)
+2. **Sync layer**: FutexLock (three-state, follows Rust stdlib pattern) + SharedCondvar (counter-based, mutex-free)
+3. **Protocol layer**: `SharedMessage` struct with cache-aligned layout + read/write coordination protocol
+4. **Python layer**: PyO3 bindings with GIL release, buffer protocol guards, async background threads
 
-#### Paper Specification (Section III-B)
-
-```
-┌────────────────┬──────────────┬─────────────────┬──────────────┬─────────┐
-│ Message Version│ Consumer Cnt │ Message Read Cnt│ Message Size │ Message │
-│    (8 bytes)   │  (8 bytes)   │    (8 bytes)    │  (8 bytes)   │(C bytes)│
-└────────────────┴──────────────┴─────────────────┴──────────────┴─────────┘
-Total: 40 + C bytes (with padding)
-```
-
-#### Current Implementation
+### SharedMessage Memory Layout
 
 ```
-SharedMessage<[u8]> (256-byte cache-aligned header + payload)
+#[repr(C)] SharedMessage<[u8]> — 256-byte header + variable payload
 
-Cache Line 1 (read-mostly, 0-127 bytes):
+Region 1 (bytes 0-127, read-mostly — polled by readers):
 ┌───────────────────┬─────────────┬────────────────────────────────────────┐
 │ sequence_and_flags│ data_size   │ _pad1                                  │
-│ AtomicU64 (8B)    │ AtomicUsize │ [u8; 112] cache padding                │
+│ AtomicU64 (8B)    │ AtomicUsize │ [u8; 112] padding to 128B              │
 │ [stopped:1|wip:1| │ (8B)        │                                        │
 │  sequence:62]     │             │                                        │
 └───────────────────┴─────────────┴────────────────────────────────────────┘
 
-Cache Line 2 (high contention, 128-255 bytes):
+Region 2 (bytes 128-255, high contention — read-modify-write by readers):
 ┌───────────────────┬──────────────┬─────────────────┬────────────────────┐
 │ readers_state     │ writer_mutex │ writer_condvar  │ reader_done_condvar│
-│ AtomicU64 (8B)    │ FutexLock(4B)│ SharedCondvar(4)│ SharedCondvar (4B) │
-│ [target:16|cons:16│              │                 │                    │
+│ AtomicU64 (8B)    │ SharedMutex  │ SharedCondvar(4)│ SharedCondvar (4B) │
+│ [target:16|cons:16│ (4B)         │                 │                    │
 │  active:16|done:16│              │                 │                    │
 └───────────────────┴──────────────┴─────────────────┴────────────────────┘
-  + _pad2 [u8; 104] to complete 128-byte block
+  + _pad2 [u8; 108] to fill 128-byte block
 
-Data Section:
+Payload (bytes 256+):
 ┌─────────────────────────────────────────────────────────────────────────┐
-│ data: UnsafeCell<[u8]>  (payload buffer, variable size C bytes)        │
+│ data: UnsafeCell<[u8]>  (fixed-size buffer, determined at creation)     │
 └─────────────────────────────────────────────────────────────────────────┘
-Total: 256 + C bytes
 ```
 
-**Key changes:**
+128-byte region separation prevents false sharing AND hardware prefetcher interference. Compile-time static assertions verify alignment.
 
-| Aspect | Paper | Current | Rationale |
-|--------|-------|---------|-----------|
-| Count fields | 8 bytes each | u16 (2 bytes) | Realistic consumer limits (65535 sufficient) |
-| Stopped flag | Separate field | Packed in version MSB | Reduces struct size, atomic read of both |
-| Sync primitives | pthread via FFI | Raw futex syscalls | Performance: ~15% lower latency |
-| Condvars | pthread_cond_t | Custom futex-based | Cross-process safe without pthread attributes |
-| Blocking policy | Implicit in code | `target_read_count` field | Explicit partial-blocking configuration |
+### Bit-Packed Atomic Fields (`src/shared_message/packed.rs`)
 
-### Memory Layout Details
-
-The `SharedMessage` struct uses `#[repr(C)]` for predictable memory layout across the FFI boundary. Key design decisions:
-
-**Bit-packed fields** (`src/shared_message/packed.rs`):
-
-`SequenceState` (AtomicU64):
+**SequenceState** (AtomicU64) — single Acquire load gives reader everything it needs:
 - Bit 63: `stopped` flag
-- Bit 62: `writing_in_progress` flag  
-- Bits 0-61: 62-bit sequence counter
+- Bit 62: `writing_in_progress` flag
+- Bits 0-61: sequence counter (wraps from max to 1, skipping 0 which means "never written")
 
-`ReadersStateCount` (AtomicU64):
+**ReadersStateCount** (AtomicU64) — updated via CAS retry loop:
 - Bits 0-15: `target_read` (partial-blocking threshold)
 - Bits 16-31: `consumers` (registered reader count)
-- Bits 32-47: `active_readers` (currently accessing data)
+- Bits 32-47: `active_readers` (currently accessing payload)
 - Bits 48-63: `data_consumed` (finished reading current version)
 
-**Version wraparound** (`src/shared_message/mod.rs`):
-Version 0 is reserved as "no message written yet". On overflow, version wraps to 1, not 0, to maintain this invariant.
+### Read/Write Protocol
 
-### Synchronization Primitives
+**Write path** (`start_write` + `publish_write` in `src/shared_message/mod.rs`):
+1. Check stopped → acquire writer_mutex
+2. Wait for previous message consumption: block until `data_consumed >= min(target_read, consumers)`
+3. Set WRITING_IN_PROGRESS flag (fetch_or, Release)
+4. Drain active readers: wait until `active_readers == 0`
+5. Caller writes data (either memcpy or incremental via write guard)
+6. Publish: CAS loop to atomically increment sequence + clear WIP flag
+7. notify_all on writer_condvar to wake blocked readers
+8. Release writer_mutex (guard drop)
 
-The paper's SHM-PTH implementation used pthread via Python's ctypes FFI. The current implementation uses raw Linux futex syscalls for better performance.
+Critical section = steps 2-8. In copy mode the data write (step 5) is ~2μs memcpy. In zerocopy mode with pickle it's ~800μs.
 
-#### Why Futex over pthread
+**Read path** (`read` in `src/shared_message/mod.rs`) — NO MUTEX ACQUIRED:
+1. Read condvar ticket (prevents lost wakeup)
+2. Single Acquire load of sequence_and_flags (lock-free version check)
+3. If no new data: return None (non-blocking) or wait on condvar (blocking)
+4. If writing_in_progress: wait on condvar
+5. CAS increment active_readers (register as reader)
+6. Double-check: re-load sequence_and_flags. If state changed (writer started between steps 5-6), unregister + retry
+7. Return ReadGuard. On drop: decrement active_readers + increment data_consumed (single CAS), notify writer if active_readers hits 0
 
-1. **No FFI overhead**: Direct syscall via rustix, no ctypes marshalling
-2. **Simpler cross-process setup**: pthread_mutex requires `PTHREAD_PROCESS_SHARED` attribute and careful initialization in shared memory
-3. **Smaller footprint**: Futex is 4 bytes vs pthread_mutex_t (40+ bytes on Linux)
-4. **Spin-then-block**: Custom spin loop before syscall reduces latency for short critical sections
+### Producer-Consumer Policies (`ReaderWaitPolicy`)
 
-#### FutexLock Implementation (`src/sync/lock/futex_lock.rs`)
+| Policy | `target_read` value | Writer behavior |
+|--------|---------------------|-----------------|
+| `Count(0)` | 0 | Overwrite immediately (latest-wins, real-time) |
+| `Count(n)` | n | Wait for n readers to consume before overwriting |
+| `All()` | u16::MAX | Wait for all registered consumers (full delivery) |
 
-Three-state lock inspired by `std::sync::Mutex`:
-- `UNLOCKED (0)`: Available
-- `LOCKED (1)`: Held, no waiters
-- `CONTENDED (2)`: Held, threads waiting
+Effective threshold = `min(target_read, consumers)`.
 
-```rust
-pub fn lock(&self) {
-    // Fast path: CAS from UNLOCKED to LOCKED
-    if self.0.compare_exchange(UNLOCKED, LOCKED, Acquire, Relaxed).is_err() {
-        self.lock_contended();
-    }
-}
+### Synchronization Primitives (`src/sync/`)
 
-fn lock_contended(&self) {
-    let mut state = self.spin();  // Spin up to 100 iterations
-    // ... transition to CONTENDED and futex_wait
-}
-```
+**FutexLock** (`src/sync/lock/futex_lock.rs`): Three-state lock (UNLOCKED/LOCKED/CONTENDED) following Drepper's pattern, closely based on Rust's stdlib Mutex. Spin phase: 100 iterations with relaxed loads. Falls back to futex_wait. 4 bytes total.
 
-The spin phase (`spin()`) performs relaxed loads to avoid cache-line bouncing before falling back to the kernel.
+**SharedCondvar** (`src/sync/condvar.rs`): Counter-based notification. No associated mutex required. Spin 1000 iterations checking counter, then futex_wait. Ticket-based lost-wakeup prevention: caller reads counter before releasing lock, passes expected to wait(). If notify happened in between, counter already differs and wait returns immediately.
 
-#### SharedCondvar Implementation (`src/sync/condvar.rs`)
+### Python Integration (`src/python/`)
 
-Uses a notification counter rather than traditional condvar semantics:
+**Module**: `#[pymodule(gil_used = false)]` — compatible with free-threaded Python 3.13+
 
-```rust
-pub fn wait(&self, expected: u32) {
-    for _ in 0..1000 {
-        if self.0.load(Relaxed) != expected {
-            return;  // Counter changed, wakeup detected
-        }
-        spin_loop();
-    }
-    futex_wait(&self.0, expected);  // Sleep if still unchanged
-}
+**Two data paths**:
+- **Copy mode** (`write(data)` / `read()`): serialize outside lock → memcpy under lock (~2μs critical section). Safe under writer contention.
+- **Zerocopy mode** (`write_guard()` / `read_guard()`): Guards implement buffer protocol + file-like interface (read/write/seek/tell). Enables `pickle.dump(obj, guard)` / `pickle.load(guard)` directly into/from shared memory. ~800μs critical section with pickle. Catastrophic tail latency under multi-writer contention.
 
-pub fn notify_all(&self) {
-    self.0.fetch_add(1, Release);       // Increment counter
-    assert!(futex_wake_all(&self.0));   // Wake all waiters
-}
-```
+**Async modes** (`OperationMode.WriteAsync` / `ReadAsync`):
+- WriteAsync: background writer thread + mpsc channel. Python caller returns immediately.
+- ReadAsync: background reader thread reads continuously, buffers in channel for main thread.
 
-The caller reads the counter value before releasing any lock, then passes it to `wait()`. If `notify_all` is called between lock release and `wait()`, the counter will have changed and the spin loop returns immediately.
+**Parallel read** (`read_all`): Rayon par_iter with GIL released. Reads N SharedMessages concurrently. Reduces multi-feed latency from sum to max.
 
-### Producer-Consumer Strategies
+**Guards** (`src/python/guards.rs`): PythonReadGuard/PythonWriteGuard implement Python's buffer protocol (__getbuffer__) AND file-like interface (read/write/seek/tell). This enables pickle, memoryview, and numpy interop. Lifetime managed via Py<PythonSharedMessage> Arc keeping the mapping alive.
 
-Configured via `ReaderWaitPolicy` at creation time:
+### Memory Management (`src/memory_mapper.rs`)
 
-| Policy | `target_read_count` | Behavior |
-|--------|---------------------|----------|
-| `Count(0)` | 0 | Non-blocking: overwrite immediately |
-| `Count(n)` | n | Partial-blocking: wait for n readers |
-| `All()` | u16::MAX | Full-blocking: wait for all registered consumers |
-
-The writer blocks in `start_write()` while waiting for readers to consume the previous message. It waits until `data_consumed >= min(target_read, consumers)` before allowing the next write.
-
-### PyO3 Integration & GIL Release
-
-The module is declared with `gil_used = false` (`src/python/mod.rs`):
-```rust
-#[pymodule(gil_used = false)]
-fn rs_ipc(m: &Bound<'_, PyModule>) -> PyResult<()> { ... }
-```
-
-Blocking operations release the GIL using `py.detach()`:
-```rust
-fn read_py(&self, block: bool, py: Python<'_>) -> Option<RustPyBytes> {
-    py.detach(|| self.read(block))  // GIL released during read
-}
-```
-
-**Safety invariants for GIL release:**
-1. No Python objects accessed inside the closure
-2. `RustPyBytes` wraps `Arc<[u8]>` (Rust-owned), not a Python buffer
-3. Shared state uses Rust atomics/mutexes, not Python locks
-
-#### Parallel Read (`read_all`)
-
-Uses rayon to read from multiple SharedMessages in parallel:
-```rust
-fn read_all(readers: Vec<Py<PythonSharedMessage>>, py: Python<'_>) -> Vec<Option<RustPyBytes>> {
-    py.detach(|| {
-        readers.into_par_iter()
-            .map(|reader| reader.get().read(false))
-            .collect()
-    })
-}
-```
-
-### Async Background Threads
-
-The paper listed async operations as future work. Now implemented:
-
-**WriteAsync** (`src/python/message.rs`):
-- Background thread blocks on write operations
-- Main thread enqueues via `mpsc::channel`
-- With `Count(0)`, coalesces writes: only latest message sent
-
-**ReadAsync** (`src/python/message.rs`):
-- Background thread calls blocking read continuously
-- Results buffered in channel for main thread
-- Useful for event-loop integration
+`SharedMemoryMapper<T: SlicePtrCast>`: RAII wrapper around shm_open/mmap lifecycle.
+- `create()`: shm_open(O_CREAT|O_RDWR|O_TRUNC) → ftruncate → mmap(MAP_SHARED_VALIDATE) → madvise(HUGEPAGE)
+- `open()`: shm_open(O_RDWR) → fstat (get size) → mmap
+- Drop: munmap always; shm_unlink only if creator (prevents orphaned shm objects)
+- `SlicePtrCast` trait: safe DST construction from void ptr (alignment check + fat pointer)
+- Implements Deref<Target=T>, Send, Sync
 
 ## Key Files
 
@@ -268,10 +200,10 @@ Comprehensive benchmarks in `benches/` comparing rs_ipc against Python multiproc
 
 | Scenario | RsIpc (zerocopy) | ZeroMQ | PosixIpc | MpQueue |
 |----------|------------------|--------|----------|---------|
-| Latency 1:1 | 0.85 | 1.22 | 0.26 | 1.76 |
-| Scale 1:10 | 2.05 | 9.22 | 4.44 | 5.80 |
-| Size 4MB | 0.24 | 1.92 | 1.35 | 3.81 |
-| Size 32MB | 27.50 | 99.85 | 50.59 | 78.70 |
+| Latency 1:1 | 0.83 | 1.20 | 0.24 | 1.79 |
+| Scale 1:10 | 1.97 | 9.77 | 4.64 | 5.96 |
+| Size 4MB | 0.22 | 1.27 | 0.59 | 3.30 |
+| Size 32MB | 12.19 | 27.03 | 14.87 | 44.85 |
 
 Run benchmarks: `python benches/python_bench.py run`
 Quick validation: `python benches/python_bench.py run --quick`
@@ -370,7 +302,7 @@ Conference paper: "Accelerating Intelligent Vehicle Vision: A Hybrid Python-Rust
 | 1. Introduction | `chap:intro` | Motivation, problem statement, contributions, thesis structure |
 | 2. Foundations and Requirements | `chap:ch2` | POSIX shared memory, mmap, futex, synchronization primitives |
 | 3. Related Work | `chap:ch3` | ZeroMQ, nanomsg, ipc-channel, Cap'n Proto, positioning of rs\_ipc |
-| 4. Architecture & Implementation | `chap:ch4` | SharedMessage, FutexLock, SharedCondvar, PyO3 integration |
+| 4. Architecture & Implementation | `chap:ch4` | System overview, memory management, sync primitives, SharedMessage layout (evolution from paper), read/write protocol, Python integration (GIL, copy/zerocopy, async), trade-offs |
 | 5. Performance Evaluation | `chap:ch5` | Benchmarking methodology, results, comparison with alternatives |
 | 6. Conclusions | `chap:conclusions` | Summary, limitations, future work |
 
@@ -393,9 +325,13 @@ Conference paper: "Accelerating Intelligent Vehicle Vision: A Hybrid Python-Rust
 
 - [x] Chapter 2: Foundations and Requirements
 - [ ] Chapter 3: Related Work (ZeroMQ, nanomsg, ipc-channel, Cap'n Proto, multiprocessing alternatives)
-- [ ] Chapter 4: Architecture & Implementation  
-- [ ] Chapter 5: Performance Evaluation
+- [x] Chapter 4: Architecture & Implementation (written 2026-05-27; figures done as TikZ)
+- [x] Chapter 5: Performance Evaluation
 - [ ] Chapter 6: Conclusions
+
+### Known Issues
+
+- **Introduction cross-references are wrong**: `chapter1_introduction.tex` lines 66-74 reference `\ref{chap:ch3}` for architecture and `\ref{chap:ch4}` for performance evaluation. After adding the Related Work chapter, the correct mapping is ch3=Related Work, ch4=Architecture, ch5=Performance. Needs fixing.
 
 ### Platform Limitations to Document
 

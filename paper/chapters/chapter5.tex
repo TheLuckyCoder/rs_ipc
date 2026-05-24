@@ -1,7 +1,7 @@
 \chapter{Performance Evaluation}
 \label{chap:ch5}
 
-This chapter presents a comprehensive performance evaluation of \texttt{rs\_ipc} against both Python's standard inter-process communication mechanisms and external IPC libraries. The evaluation methodology is described in Section~\ref{sec:bench_methodology}, followed by scenario definitions in Section~\ref{sec:bench_scenarios}. Results are presented in Section~\ref{sec:bench_results}, with a detailed analysis of the copy versus zero-copy trade-off in Section~\ref{sec:copy_vs_zerocopy}. Rust-level microbenchmarks isolating synchronization overhead appear in Section~\ref{sec:rust_microbench}, and Section~\ref{sec:bench_discussion} synthesizes the findings.
+% Structure: methodology → scenarios → results → copy-vs-zerocopy → microbenchmarks → discussion
 
 \section{Benchmarking Methodology}
 \label{sec:bench_methodology}
@@ -23,7 +23,9 @@ All measurements were collected on a single workstation to eliminate network var
         L1 Data Cache & 32~KiB per core \\
         L2 Cache & 1~MiB per core \\
         L3 Cache & 32~MiB shared \\
-        Memory & 32~GiB DDR5 \\
+        Memory & 32~GiB DDR5 (2$\times$16~GiB, 6000~MT/s, CL36) \\
+        CPU Governor & \texttt{performance} \\
+        THP & \texttt{always} (transparent huge pages enabled) \\
         Operating System & Arch Linux \\
         Kernel & Linux 7.0.9 \\
         Python & 3.14.5 \\
@@ -32,17 +34,20 @@ All measurements were collected on a single workstation to eliminate network var
     \end{tabular}
 \end{table}
 
+\newpage
 \subsection{Measurement Approach}
 
-The benchmark framework employs true multiprocessing via Python's \texttt{spawn} start method, ensuring each participant runs in a separate process with its own address space. This reflects realistic deployment conditions where IPC is necessary precisely because threads cannot share state freely due to the GIL.
+The benchmark framework uses Python's \texttt{spawn} start method, placing each participant in a separate process with its own address space---the deployment model where IPC is actually necessary.
 
-Startup synchronization uses a \texttt{multiprocessing.Barrier} so that all writer and reader processes begin their measurement loops simultaneously. Latency is measured end-to-end: the writer embeds a \texttt{time.time()} timestamp in each message immediately before transmission, and the reader computes the difference upon receipt. This captures the full IPC path including serialization, synchronization, memory transfer, and deserialization.
+A \texttt{multiprocessing.Barrier} synchronizes startup so that all processes begin measurement simultaneously. Latency is measured end-to-end: the writer embeds a \texttt{time.perf\_counter()} timestamp in each message immediately before transmission, and the reader computes the difference upon receipt, capturing the full IPC path including serialization, synchronization, memory transfer, and deserialization. The \texttt{perf\_counter()} function maps to \texttt{clock\_gettime(CLOCK\_MONOTONIC)} on Linux, providing sub-microsecond resolution immune to NTP adjustments. Since all processes execute on the same machine, they share a single kernel clock source, making cross-process timestamp differencing valid.
+
+To eliminate measurement noise from CPU migration, writer and reader processes are pinned to dedicated physical cores using \texttt{os.sched\_setaffinity()}. The writer occupies core~0; readers occupy cores~1 through~$N$. For scenarios where the total process count exceeds available cores (e.g., 10:1 contention on an 8-core machine), pinning is automatically disabled and processes share cores under OS scheduler control.
 
 \subsection{Payload}
 
-The primary payload is a \texttt{MockPipeData} structure containing three NumPy arrays of shape $640 \times 480 \times 3$ (unsigned 8-bit integers), representative of a triple-channel video frame from a computer vision pipeline. After pickle serialization, this payload occupies approximately 2.76~MB, corresponding to a single 640$\times$480 RGB frame---a common resolution in autonomous driving and robotics applications.
+The primary payload is a \texttt{MockPipeData} structure containing three NumPy arrays of shape $640 \times 480 \times 3$ (unsigned 8-bit integers), representative of a triple-channel video frame from a computer vision pipeline. The raw data totals $640 \times 480 \times 3 \times 3 = 2{,}764{,}800$ bytes (2.64~MiB); after pickle serialization the message is marginally larger due to framing overhead.
 
-For size-scaling experiments, raw byte buffers of 1, 2, 4, 8, 16, and 32~MB are used to isolate the effect of payload size from serialization overhead.
+For size-scaling experiments, raw byte buffers of 1, 2, 4, 8, 16, and 32~MiB are used to isolate the effect of payload size from serialization overhead.
 
 \subsection{Metrics}
 
@@ -53,23 +58,23 @@ Four metrics characterize IPC performance:
 
     \item \textbf{Tail latency (p99)}: The 99th percentile latency. Critical for real-time systems where worst-case behavior determines system feasibility.
 
-    \item \textbf{Throughput}: Total bytes transferred divided by wall-clock duration, expressed in MB/s. Captures sustained transfer rate including synchronization overhead.
+    \item \textbf{Throughput}: Total bytes transferred across all iterations divided by the trial's wall-clock duration, expressed in MiB/s (binary megabytes). This is a trial-level aggregate: because iterations overlap (the writer begins the next message while the reader deserializes the current one), sustained throughput can exceed the per-message estimate $\text{size} / \text{p50}$. The ratio between them reflects the degree of pipelining in each backend's design.
 
     \item \textbf{Determinism ratio}: Defined as $\text{p99} / \text{p50}$. A ratio of 1.0 indicates perfectly predictable latency; higher values indicate jitter. For real-time applications, predictable latency is often more valuable than lowest average latency.
 \end{itemize}
 
 \subsection{Statistical Methodology}
 
-Each scenario executes 10 independent trials, with each trial performing 200 message iterations for the standard payload size. Iteration counts are scaled down for larger payloads to maintain reasonable execution time (e.g., approximately 12 iterations for 32~MB messages). Percentiles are computed per trial using NumPy's percentile function over all received messages per reader process. The reported values represent medians across trials, with first quartile (Q1) and third quartile (Q3) available for variability assessment.
+Each scenario executes 10 independent trials. For the standard payload, each trial performs 200 message exchanges preceded by 20 warmup iterations whose latencies are discarded. Iteration counts scale down for larger payloads to keep execution time reasonable: $\lfloor 200 \,/\, (S / 2 + 1) \rfloor$ iterations for a message of $S$~MiB, yielding approximately 66 iterations at 4~MiB and 11 at 32~MiB. Percentiles are computed per trial using NumPy's percentile function over all post-warmup messages per reader process. The reported values represent medians across trials, with first quartile (Q1) and third quartile (Q3) available for variability assessment.
 
-When multiple readers participate, the reported p50 and p99 represent the arithmetic mean of per-reader percentiles within each trial. No warmup iterations are discarded; the barrier synchronization ensures that all processes begin measurement simultaneously, and the first few iterations capture cold-start behavior that is relevant to real deployments.
+When multiple readers participate, the reported p50 and p99 represent the arithmetic mean of per-reader percentiles within each trial.
 
 \subsection{Backends Under Test}
 
 Seven IPC backends are evaluated, spanning Python's standard library, external libraries, and the two operational modes of \texttt{rs\_ipc}:
 
 \begin{itemize}
-    \item \textbf{RsIpc (zerocopy)}: The writer acquires a write guard and invokes \texttt{pickle.dump(obj, guard)}, serializing directly into shared memory via the Python buffer protocol. The reader acquires a read guard and calls \texttt{pickle.loads(guard)}, deserializing directly from shared memory. No intermediate copies are created.
+    \item \textbf{RsIpc (zerocopy)}: The writer acquires a write guard and serializes directly into shared memory by calling \texttt{pickle.dump(obj, guard)}. The reader acquires a read guard and deserializes directly via \texttt{pickle.load(guard)}. No intermediate copies are created.
 
     \item \textbf{RsIpc (copy)}: The writer serializes with \texttt{pickle.dumps(obj)} into a temporary Python bytes object, then calls \texttt{shm.write(bytes)} which performs a single \texttt{memcpy} into shared memory. The reader receives a Rust-allocated copy of the shared memory contents and deserializes from that copy.
 
@@ -77,14 +82,14 @@ Seven IPC backends are evaluated, spanning Python's standard library, external l
 
     \item \textbf{multiprocessing.Pipe}: Low-level bidirectional connection using OS pipes. In multi-reader scenarios, a \texttt{multiprocessing.Lock} serializes writer access to prevent interleaved messages.
 
-    \item \textbf{multiprocessing.shared\_memory (MpShm)}: Python's native shared memory module, supplemented with manual \texttt{multiprocessing.Lock} and \texttt{multiprocessing.Condition} for synchronization. This backend replicates what a developer would build using only the standard library, and serves as a direct comparison point for the synchronization quality of \texttt{rs\_ipc}.
+    \item \textbf{multiprocessing.shared\_memory (MpShm)}: Python's native shared memory module, supplemented with manual \texttt{multi\-processing.\allowbreak{}Lock} and \texttt{multi\-processing.\allowbreak{}Condition} for synchronization. This backend replicates what a developer would build using only the standard library, and serves as a direct comparison point for the synchronization quality of~\texttt{rs\_ipc}.
 
     \item \textbf{ZeroMQ}: The \texttt{pyzmq} library using PUSH/PULL sockets over IPC transport (\texttt{ipc://} Unix domain sockets). Represents a mature, widely-deployed messaging library with internal threading, message framing, and batching optimizations. In multi-reader scenarios, one PUSH socket per reader ensures guaranteed delivery to all consumers.
 
-    \item \textbf{PosixIpc}: The \texttt{posix\_ipc} package providing POSIX shared memory (\texttt{shm\_open}) with POSIX named semaphores (\texttt{sem\_open}) for synchronization. Uses a write-semaphore/read-semaphore signaling protocol with a lock semaphore for multi-writer exclusion. This backend represents the C-level POSIX IPC primitives exposed to Python, serving as a baseline for what is achievable without custom synchronization logic.
+    \item \textbf{PosixIpc}: The \texttt{posix\_ipc} package providing POSIX shared memory (\texttt{shm\_\allowbreak{}open}) with POSIX named semaphores (\texttt{sem\_\allowbreak{}open}) for synchronization. Uses a write-semaphore/read-semaphore signaling protocol with a lock semaphore for multi-writer exclusion. This backend represents the C-level POSIX IPC primitives exposed to Python, serving as a baseline for what is achievable without custom synchronization logic.
 \end{itemize}
 
-
+\bigskip
 \section{Scenarios}
 \label{sec:bench_scenarios}
 
@@ -97,27 +102,28 @@ Four scenario categories evaluate different aspects of IPC performance:
 
     \item \textbf{Contention (10:1)}: Ten writers send data to a single reader. This fan-in pattern models multiple sensors feeding a single aggregator or fusion module.
 
-    \item \textbf{Size scaling (1--32~MB)}: Single producer--consumer communication with varying payload sizes, from 1~MB to 32~MB. This reveals how performance degrades as messages approach and exceed the L3 cache capacity (32~MiB on the test system).
+    \item \textbf{Size scaling (1--32~MiB)}: Single producer--consumer communication with varying payload sizes, from 1~MiB to 32~MiB. This reveals how performance degrades as messages approach and exceed the L3 cache capacity (32~MiB on the test system).
 \end{itemize}
 
 
+\newpage
 \section{Results}
 \label{sec:bench_results}
 
-This section presents the results across all four scenario categories. Each subsection includes a results table with all seven backends, ordered by median latency.
+Each subsection includes a results table with all seven backends, ordered by median latency.
 
 \subsection{Latency (1:1)}
 \label{subsec:latency_results}
 
-Table~\ref{tab:latency_11} presents the baseline latency results for single-producer, single-consumer communication with the 2.76~MB pickle payload.
+Table~\ref{tab:latency_11} presents the baseline latency results for single-producer, single-consumer communication with the 2.64~MiB pickle payload.
 
 \begin{table}[htbp]
     \centering
-    \caption{Latency and throughput results for the 1:1 scenario (2.76~MB pickle payload, 10 trials).}
+    \caption{Latency and throughput results for the 1:1 scenario (2.64~MiB pickle payload, 10 trials).}
     \label{tab:latency_11}
     \begin{tabular}{lrrrr}
         \hline
-        \textbf{Backend} & \textbf{p50 (ms)} & \textbf{p99 (ms)} & \textbf{MB/s} & \textbf{Determinism} \\
+        \textbf{Backend} & \textbf{p50 (ms)} & \textbf{p99 (ms)} & \textbf{MiB/s} & \textbf{Det. (p99/p50)} \\
         \hline
         RsIpc (copy) & 0.19 & 0.20 & 22,104 & 1.06 \\
         PosixIpc & 0.24 & 0.25 & 15,902 & 1.04 \\
@@ -130,26 +136,29 @@ Table~\ref{tab:latency_11} presents the baseline latency results for single-prod
     \end{tabular}
 \end{table}
 
-RsIpc (copy) achieves the lowest median latency at 0.19~ms---9.3$\times$ faster than \texttt{multiprocessing.Queue} and 3.7$\times$ faster than MpPipe. The copy mode's advantage stems from its minimal critical section: serialization occurs entirely outside the lock, and the lock is held only for the duration of a single \texttt{memcpy} ($\sim$2~\textmu s).
+RsIpc (copy) achieves the lowest median latency at 0.19~ms, 9.4$\times$ lower than \texttt{multiprocessing.Queue} and 3.8$\times$ lower than MpPipe. The advantage stems from its minimal critical section: serialization occurs entirely outside the lock, which is held only for a single \texttt{memcpy} ($\sim$2~\textmu s). The reported throughput (22{,}104~MiB/s) exceeds the naive estimate $\text{size}/\text{p50} \approx 13{,}900$~MiB/s by a factor of 1.6$\times$, reflecting writer-reader overlap: the writer enqueues the next message while the reader deserializes the current one.
 
-PosixIpc is a competitive second at 0.24~ms with the best determinism ratio (1.04). In the uncontended 1:1 case, POSIX named semaphores provide signaling efficiency comparable to futexes, and the absence of competing writers eliminates fairness concerns.
+PosixIpc follows at 0.24~ms with the best determinism ratio (1.04). In the uncontended 1:1 case, POSIX named semaphores provide signaling efficiency comparable to futexes, and the absence of competing writers eliminates fairness concerns.
 
-RsIpc (zerocopy) and MpShm cluster near 0.85~ms, as both perform pickle serialization while holding a lock. The difference between them (0.83 vs.\ 0.86~ms) is within measurement noise, confirming that the dominant cost is pickle serialization rather than synchronization overhead.
+RsIpc (zerocopy) and MpShm cluster near 0.85~ms, as both perform pickle serialization while holding a lock. The difference (0.83 vs.\ 0.86~ms) is within measurement noise, confirming that pickle serialization dominates over synchronization overhead.
 
-ZeroMQ achieves moderate latency (1.20~ms) with relatively high throughput (8,459~MB/s). The throughput exceeds what latency alone would suggest because ZeroMQ's internal message queue enables pipelining: the sender enqueues the next message before the receiver finishes processing the current one. However, this buffering introduces latency variability (determinism ratio 1.67).
+ZeroMQ achieves moderate latency (1.20~ms) but the highest throughput at 8,459~MiB/s in this scenario (a 3.8$\times$ pipelining factor). Its internal message queue provides deep pipelining (the most aggressive of any backend tested), explaining both its throughput advantage and its elevated determinism ratio~(1.67): buffered messages experience variable queuing delays.
 
+Section~\ref{sec:rust_microbench} decomposes these latencies to isolate the IPC mechanism from serialization overhead.
+
+\newpage
 \subsection{Scalability (1:10)}
 \label{subsec:scalability_results}
 
-Table~\ref{tab:scalability_110} presents the fan-out scenario with one writer distributing to ten concurrent readers.
+Table~\ref{tab:scalability_110} presents the latency and throughput results for the fan-out scenario.
 
 \begin{table}[htbp]
     \centering
-    \caption{Latency and throughput results for the 1:10 scalability scenario (2.76~MB pickle payload, 10 trials).}
+    \caption{Latency and throughput results for the 1:10 scalability scenario (2.64~MiB pickle payload, 10 trials).}
     \label{tab:scalability_110}
     \begin{tabular}{lrrrr}
         \hline
-        \textbf{Backend} & \textbf{p50 (ms)} & \textbf{p99 (ms)} & \textbf{MB/s} & \textbf{Determinism} \\
+        \textbf{Backend} & \textbf{p50 (ms)} & \textbf{p99 (ms)} & \textbf{MiB/s} & \textbf{Det. (p99/p50)} \\
         \hline
         RsIpc (zerocopy) & 1.97 & 2.31 & 2,511 & 1.18 \\
         RsIpc (copy) & 2.64 & 3.04 & 1,851 & 1.15 \\
@@ -162,13 +171,20 @@ Table~\ref{tab:scalability_110} presents the fan-out scenario with one writer di
     \end{tabular}
 \end{table}
 
-The scalability scenario reveals the architectural advantage of shared-memory multicast. RsIpc (zerocopy) achieves the lowest latency (1.97~ms) and highest throughput (2,511~MB/s), with a scalability ratio of 2.4$\times$ relative to its 1:1 performance (1.97 / 0.83). The lock-free version-checking mechanism (described in Chapter~\ref{chap:ch4}) allows all ten readers to detect new messages and begin reading concurrently without acquiring any lock.
+Shared-memory backends avoid per-reader copies, and the effect is visible in the 1:10 results. RsIpc (zerocopy) achieves the lowest latency (1.97~ms) and highest throughput (2,511~MiB/s), with a scalability ratio of 2.4$\times$ relative to its 1:1 performance (1.97 / 0.83). The lock-free version-checking mechanism (Chapter~\ref{chap:ch4}) allows all ten readers to detect and begin reading new messages concurrently without reader-side lock acquisition.
 
-PosixIpc degrades 19$\times$ from its 1:1 performance (0.24 to 4.64~ms), revealing that POSIX named semaphores do not scale efficiently to multiple concurrent waiters. Each reader requires a separate semaphore signal, serializing the notification path.
+PosixIpc degrades 19$\times$ from its 1:1 latency (0.24 to 4.64~ms). Each reader requires a separate semaphore signal, serializing the notification path and revealing that POSIX named semaphores do not scale to multiple concurrent waiters.
 
-ZeroMQ performs worst in this scenario at 9.77~ms p50 with the highest determinism ratio (2.08$\times$). Its PUSH/PULL model requires maintaining a separate socket connection per reader, and each message must be copied and transmitted independently to all ten consumers. This per-reader delivery model fundamentally cannot match the single-write, multi-read semantics of shared memory.
+ZeroMQ performs worst at 9.77~ms p50 with the highest determinism ratio (2.08$\times$). Its PUSH/PULL model copies and transmits each message independently to all ten consumers via separate socket connections, a per-reader delivery model that cannot match the single-write, multi-read semantics of shared memory. Figure~\ref{fig:scalability_degradation} quantifies the per-backend degradation from 1:1 to 1:10.
 
-Figure~\ref{fig:tail_latency} visualizes the p99 tail latency across the three core scenarios on a logarithmic scale.
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.85\textwidth]{./figures/06_scalability_degradation.png}
+    \caption{Scalability degradation ratio (1:10 p50 / 1:1 p50), sorted ascending. RsIpc (zerocopy) degrades only 2.3$\times$ from its 1:1 baseline, while PosixIpc degrades 18.9$\times$, demonstrating that lock-free version checking scales better than semaphore-based notification.}
+    \label{fig:scalability_degradation}
+\end{figure}
+
+Figure~\ref{fig:tail_latency} provides a complementary view, visualizing the p99 tail latency across all three core scenarios on a logarithmic scale.
 
 \begin{figure}[htbp]
     \centering
@@ -177,6 +193,8 @@ Figure~\ref{fig:tail_latency} visualizes the p99 tail latency across the three c
     \label{fig:tail_latency}
 \end{figure}
 
+\newpage
+\bigskip
 \subsection{Contention (10:1)}
 \label{subsec:contention_results}
 
@@ -184,11 +202,11 @@ Table~\ref{tab:contention_101} presents the fan-in scenario with ten writers com
 
 \begin{table}[htbp]
     \centering
-    \caption{Latency and throughput results for the 10:1 contention scenario (2.76~MB pickle payload, 10 trials).}
+    \caption{Latency and throughput results for the 10:1 contention scenario (2.64~MiB pickle payload, 10 trials).}
     \label{tab:contention_101}
     \begin{tabular}{lrrrr}
         \hline
-        \textbf{Backend} & \textbf{p50 (ms)} & \textbf{p99 (ms)} & \textbf{MB/s} & \textbf{Determinism} \\
+        \textbf{Backend} & \textbf{p50 (ms)} & \textbf{p99 (ms)} & \textbf{MiB/s} & \textbf{Det. (p99/p50)} \\
         \hline
         MpPipe & 0.77 & 91.01 & 3,492 & 118.7 \\
         RsIpc (zerocopy) & 0.85 & 90.87 & 5,842 & 106.5 \\
@@ -201,18 +219,24 @@ Table~\ref{tab:contention_101} presents the fan-in scenario with ten writers com
     \end{tabular}
 \end{table}
 
-The contention scenario produces the most striking results of the evaluation, revealing a critical architectural vulnerability in the zerocopy mode.
+The contention scenario sharply differentiates backends by their critical section duration.
 
-\textbf{RsIpc (zerocopy) exhibits catastrophic tail latency} with a p99 of 90.87~ms and a determinism ratio of 106.5$\times$. The root cause is the long critical section inherent to the buffer-protocol serialization path: each writer holds the \texttt{FutexLock} for approximately 800~\textmu s while \texttt{pickle.dump} executes hundreds of incremental writes through the buffer protocol interface. With ten writers contending for a single lock, this creates severe lock convoy effects. Writers that lose the initial CAS race transition the lock to the \texttt{CONTENDED} state and enter \texttt{futex\_wait}, where they are subject to kernel scheduling latency. The combination of 800~\textmu s critical sections and OS scheduling quantum boundaries (typically 1--10~ms on Linux CFS) produces the observed 90~ms tail.
+\textbf{RsIpc (zerocopy) and MpPipe exhibit catastrophic tail latency}: p99 exceeding 90~ms with determinism ratios above 100$\times$. For RsIpc (zerocopy), the root cause is the $\sim$800~\textmu s lock hold during buffer-protocol serialization; for MpPipe, kernel pipe buffer overflow under ten concurrent 2.64~MiB writes produces a similar effect. Section~\ref{sec:bench_discussion} analyzes the failure mechanism in detail.
 
-\textbf{MpPipe exhibits a similar pathology} (p99 = 91.01~ms, determinism = 118.7$\times$). When ten writers simultaneously push 2.76~MB messages through OS pipes, the kernel pipe buffer fills, causing backpressure that interacts with the \texttt{multiprocessing.Lock} used to serialize writer access.
+\textbf{RsIpc (copy) handles contention well}: p99 of 4.52~ms, determinism 2.46$\times$, because its $\sim$2~\textmu s critical section allows writers to cycle through the lock rapidly.
 
-\textbf{RsIpc (copy) handles contention effectively} with a p99 of 4.52~ms and determinism of 2.46$\times$. Its critical section lasts only $\sim$2~\textmu s (a single \texttt{memcpy}), allowing the ten writers to cycle through the lock rapidly. Even in the \texttt{CONTENDED} state, the short hold time limits the worst-case queuing delay.
+\textbf{PosixIpc achieves the best determinism} at 1.85$\times$, benefiting from kernel-level FIFO wait queues in POSIX semaphores.
 
-\textbf{PosixIpc achieves the best contention determinism} at 1.85$\times$. POSIX named semaphores implement kernel-level FIFO wait queues, providing inherent fairness that prevents writer starvation. This bounded ordering guarantee is absent from the futex spin-then-block strategy, which offers no fairness between competing waiters.
+ZeroMQ shows the worst median latency (19.55~ms) but bounded determinism (1.97$\times$). Figure~\ref{fig:latency_cdf} visualizes the full latency distribution.
 
-ZeroMQ shows the worst median latency (19.55~ms) but bounded determinism (1.97$\times$), as its internal mutex and message queue provide consistent---if slow---serialization of concurrent writers.
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=\textwidth]{./figures/05_latency_cdf.png}
+    \caption{Cumulative distribution function (CDF) of latency under 10:1 contention. RsIpc (copy) and PosixIpc concentrate tightly near their median, while RsIpc (zerocopy) and MpPipe exhibit long tails extending beyond 90~ms, confirming the lock convoy pathology under prolonged critical sections.}
+    \label{fig:latency_cdf}
+\end{figure}
 
+\newpage
 \subsection{Determinism and Predictability}
 \label{subsec:determinism_results}
 
@@ -231,7 +255,7 @@ The contention scenario (10:1) differentiates the backends sharply. Three groups
 \begin{enumerate}
     \item \textbf{Bounded} (determinism $< 4\times$): PosixIpc at 1.85$\times$, ZeroMQ at 1.97$\times$, RsIpc (copy) at 2.46$\times$, and MpQueue at 3.01$\times$.
     \item \textbf{Degraded} (determinism $10$--$20\times$): MpShm at 17.70$\times$, caused by Python's \texttt{Condition.wait(timeout)} polling with 10~ms granularity.
-    \item \textbf{Catastrophic} (determinism $> 100\times$): RsIpc (zerocopy) at 106.5$\times$ and MpPipe at 118.7$\times$, caused by long critical sections under heavy contention.
+    \item \textbf{Catastrophic} (determinism $> 100\times$): RsIpc (zerocopy) at 106.5$\times$ and MpPipe at 118.7$\times$, caused by long critical sections under heavy contention (visible as the long tails in Figure~\ref{fig:latency_cdf}).
 \end{enumerate}
 
 For real-time applications, predictable latency is often more critical than minimal average latency. A system with p50 = 2~ms and p99 = 4~ms (ratio 2$\times$) is preferable to one with p50 = 0.85~ms and p99 = 91~ms (ratio 107$\times$) because the former permits tighter deadline budgeting.
@@ -239,21 +263,22 @@ For real-time applications, predictable latency is often more critical than mini
 \subsection{Throughput and Efficiency}
 \label{subsec:throughput_results}
 
-Figure~\ref{fig:efficiency} shows the efficiency score (throughput in MB/s divided by median latency in ms) for each backend and scenario.
+Figure~\ref{fig:efficiency} shows the efficiency score (throughput divided by median latency) for each backend and scenario.
 
 \begin{figure}[htbp]
     \centering
     \includegraphics[width=\textwidth]{./figures/03_efficiency.png}
-    \caption{Architectural efficiency: throughput (MB/s) per millisecond of median latency. Higher values indicate better utilization of the available bandwidth relative to synchronization cost. RsIpc (copy) dominates in the 1:1 scenario due to its minimal lock hold time.}
+    \caption{Architectural efficiency: throughput (MiB/s) per millisecond of median latency. Higher values indicate better bandwidth utilization relative to synchronization cost. RsIpc (copy) dominates in the 1:1 scenario due to its minimal lock hold time.}
     \label{fig:efficiency}
 \end{figure}
 
-In the 1:1 scenario, RsIpc (copy) achieves 22,104~MB/s throughput, demonstrating that the synchronization overhead (futex lock acquisition, sequence increment) is negligible compared to the data transfer cost. PosixIpc follows at 15,902~MB/s, confirming that efficient signaling primitives can approach similar performance for uncontended workloads.
+In the 1:1 scenario, RsIpc (copy) achieves 22,104~MiB/s sustained throughput, demonstrating that futex lock acquisition and sequence increment are negligible relative to the data transfer. PosixIpc follows at 15,902~MiB/s, confirming that efficient signaling primitives approach similar performance in uncontended workloads.
 
-In the scalability scenario (1:10), RsIpc (zerocopy) achieves the highest throughput (2,511~MB/s)---5.5$\times$ higher than ZeroMQ (456~MB/s) and 4.8$\times$ higher than MpShm (524~MB/s). This advantage arises because the zerocopy mode allows multiple readers to access shared memory concurrently through read guards without requiring per-reader copies or per-reader socket connections.
+In the scalability scenario (1:10), RsIpc (zerocopy) achieves the highest throughput (2,511~MiB/s): 5.5$\times$ higher than ZeroMQ (456~MiB/s) and 4.8$\times$ higher than MpShm (524~MiB/s). Multiple readers access shared memory concurrently through read guards without requiring per-reader copies or socket connections.
 
-Under contention (10:1), RsIpc (copy) achieves the highest aggregate throughput (14,806~MB/s) because ten writers can overlap serialization (which occurs outside the lock) with each other and with the reader. PosixIpc follows at 11,154~MB/s, benefiting from its efficient semaphore-based writer serialization.
+Under contention (10:1), RsIpc (copy) achieves the highest aggregate throughput (14,806~MiB/s) because ten writers overlap their serialization (which occurs outside the lock) with each other and with the reader. PosixIpc follows at 11,154~MiB/s, benefiting from fair semaphore-based writer ordering.
 
+\newpage
 \subsection{Message Size Scaling}
 \label{subsec:size_scaling_results}
 
@@ -261,19 +286,19 @@ Table~\ref{tab:size_scaling} presents throughput across message sizes for the 1:
 
 \begin{table}[htbp]
     \centering
-    \caption{Throughput (MB/s) by message size in the 1:1 scenario (raw byte buffers, 10 trials).}
+    \caption{Throughput (MiB/s) by message size in the 1:1 scenario (raw byte buffers, 10 trials).}
     \label{tab:size_scaling}
     \resizebox{\textwidth}{!}{%
     \begin{tabular}{lrrrrrrr}
         \hline
         \textbf{Size} & \textbf{RsIpc (zc)} & \textbf{RsIpc (cp)} & \textbf{MpQueue} & \textbf{MpPipe} & \textbf{MpShm} & \textbf{ZeroMQ} & \textbf{PosixIpc} \\
         \hline
-        1~MB  & 18,256 & 3,225 & 2,423 & 3,856 & 3,129 & 2,029 & 3,224 \\
-        2~MB  & 18,480 & 3,290 & 1,829 & 3,711 & 3,272 & 4,823 & 3,309 \\
-        4~MB  & 21,115 & 15,931 & 2,621 & 3,778 & 15,870 & 2,910 & 10,283 \\
-        8~MB  & 20,673 & 12,633 & 2,605 & 3,642 & 14,959 & 1,651 & 9,102 \\
-        16~MB & 14,942 & 6,671 & 2,447 & 3,575 & 8,977 & 3,033 & 8,043 \\
-        32~MB & 3,403 & 2,246 & 1,576 & 1,593 & 3,340 & 1,943 & 3,536 \\
+        1~MiB  & 18,256 & 3,225 & 2,423 & 3,856 & 3,129 & 2,029 & 3,224 \\
+        2~MiB  & 18,480 & 3,290 & 1,829 & 3,711 & 3,272 & 4,823 & 3,309 \\
+        4~MiB  & 21,115 & 15,931 & 2,621 & 3,778 & 15,870 & 2,910 & 10,283 \\
+        8~MiB  & 20,673 & 12,633 & 2,605 & 3,642 & 14,959 & 1,651 & 9,102 \\
+        16~MiB & 14,942 & 6,671 & 2,447 & 3,575 & 8,977 & 3,033 & 8,043 \\
+        32~MiB & 3,403 & 2,246 & 1,576 & 1,593 & 3,340 & 1,943 & 3,536 \\
         \hline
     \end{tabular}%
     }
@@ -282,60 +307,29 @@ Table~\ref{tab:size_scaling} presents throughput across message sizes for the 1:
 \begin{figure}[htbp]
     \centering
     \includegraphics[width=\textwidth]{./figures/04_size_scaling.png}
-    \caption{Throughput versus message size (1:1 scenario, log-scale x-axis) with IQR confidence bands. RsIpc (zerocopy) maintains superior throughput up to 16~MB before converging with other shared-memory backends at 32~MB as the working set exceeds L3 cache capacity.}
+    \caption{Throughput versus message size (1:1 scenario, log-scale x-axis) with IQR confidence bands. RsIpc (zerocopy) maintains superior throughput up to 16~MiB before converging with other shared-memory backends at 32~MiB as the working set exceeds L3 cache capacity.}
     \label{fig:size_scaling}
 \end{figure}
 
 Three distinct regimes emerge from the size-scaling data:
 
-\textbf{Small messages (1--2~MB)}: RsIpc (zerocopy) achieves 18,256--18,480~MB/s, far exceeding all other backends which range from 2,000 to 4,800~MB/s. At these sizes, the entire message fits within the L3 cache, and the zerocopy path---which reads directly from shared memory without an intermediate buffer---avoids the cache pollution that a temporary copy would cause. The remaining backends cluster near 3,000--3,900~MB/s at 1~MB because their per-message fixed overhead (lock acquisition, signaling, function call dispatch) dominates over the minimal \texttt{memcpy} time.
+\textbf{Small messages (1--2~MiB)}: RsIpc (zerocopy) achieves 18,256--18,480~MiB/s, far exceeding all other backends (2,000--4,800~MiB/s). The zerocopy path reads directly from shared memory without an intermediate buffer, avoiding the cache pollution that a temporary allocation causes. All other backends cluster near 3,000--3,900~MiB/s at 1~MiB because per-message fixed overhead (lock acquisition, signaling, function call dispatch) dominates the small \texttt{memcpy} cost.
 
-\textbf{Medium messages (4--8~MB)}: A performance transition occurs as the working set begins to stress the cache hierarchy. RsIpc (zerocopy) peaks at 21,115~MB/s at 4~MB, while the other shared-memory backends (RsIpc copy, MpShm, PosixIpc) reach 9,000--16,000~MB/s. The jump for these backends between 2~MB and 4~MB reflects the amortization of fixed per-message overhead: at 4~MB, the \texttt{memcpy} time exceeds the synchronization cost, making the data transfer rate the dominant factor. Pipe-based backends (MpQueue, MpPipe) remain capped at 2,600--3,800~MB/s due to kernel buffer management overhead.
+\textbf{Medium messages (4--8~MiB)}: The shared-memory copy backends (RsIpc copy, MpShm, PosixIpc) exhibit an abrupt throughput increase between 2 and 4~MiB, from roughly 3,300 to 10,000--16,000~MiB/s. Two factors contribute. First, the iteration count decreases from 100 (at 2~MiB) to 66 (at 4~MiB) due to the scaling formula described in Section~\ref{sec:bench_methodology}; fewer iterations reduce total test duration and thus the probability of OS scheduling interference amortized into the measurement. Second, at 4~MiB the shared memory region crosses the threshold for transparent huge pages: the library explicitly requests THP via \texttt{madvise(MADV\_HUGEPAGE)} on the mapped region, and the test environment is configured with THP set to \texttt{always} (Table~\ref{tab:environment}). At 4~MiB the kernel backs the region with two 2~MiB pages, reducing TLB misses during the \texttt{memcpy} from $\sim$1024 (with 4~KiB pages) to 2. Neither factor affects pipe-based backends (MpQueue, MpPipe), which remain capped at 2,600--3,800~MiB/s due to kernel buffer management overhead. RsIpc (zerocopy) peaks at 21,115~MiB/s at 4~MiB.
 
-\textbf{Large messages (16--32~MB)}: Performance degrades sharply for all shared-memory backends. At 32~MB, the working set equals the L3 cache size, causing cache thrashing: writing and reading a single message evicts the entire cache contents. All shared-memory backends converge to similar throughput: RsIpc (zerocopy) at 3,403~MB/s, MpShm at 3,340~MB/s, and PosixIpc at 3,536~MB/s---all bounded by DRAM bandwidth. Pipe-based mechanisms degrade further (MpQueue at 1,576~MB/s, MpPipe at 1,593~MB/s) due to additional kernel-mediated copies.
+\textbf{Large messages (16--32~MiB)}: Performance degrades for all shared-memory backends. At 32~MiB the working set equals the L3 cache capacity, so writing and reading a single message evicts the entire cache. All shared-memory backends converge: RsIpc (zerocopy) at 3,403~MiB/s, PosixIpc at 3,536~MiB/s, and MpShm at 3,340~MiB/s, all bounded by DRAM bandwidth. Pipe-based mechanisms degrade further (MpQueue 1,576~MiB/s, MpPipe 1,593~MiB/s) due to additional kernel-mediated copies.
 
-ZeroMQ exhibits erratic throughput scaling (2,029 $\rightarrow$ 4,823 $\rightarrow$ 2,910 $\rightarrow$ 1,651 $\rightarrow$ 3,033 $\rightarrow$ 1,943~MB/s across sizes), reflecting internal buffer management thresholds and the interaction between message framing overhead and kernel socket buffer sizes.
+ZeroMQ exhibits erratic throughput across sizes (2,029 $\rightarrow$ 4,823 $\rightarrow$ 2,910 $\rightarrow$ 1,651 $\rightarrow$ 3,033 $\rightarrow$ 1,943~MiB/s), likely reflecting internal buffer management thresholds and the interaction between message framing overhead and kernel socket buffer sizes.
 
 
 \section{Analysis: Copy vs.\ Zero-Copy Trade-off}
 \label{sec:copy_vs_zerocopy}
 
-The benchmark results reveal a nuanced trade-off between the two operational modes of \texttt{rs\_ipc}. Neither mode dominates across all scenarios; their relative performance depends critically on the communication topology and payload characteristics.
-
-\subsection{Critical Section Analysis}
-
-The fundamental difference between the two modes lies in their lock hold duration. Table~\ref{tab:critical_section} summarizes the execution paths.
-
-\begin{table}[htbp]
-    \centering
-    \caption{Critical section comparison between copy and zerocopy modes.}
-    \label{tab:critical_section}
-    \begin{tabular}{lll}
-        \hline
-        \textbf{Phase} & \textbf{Copy Mode} & \textbf{Zerocopy Mode} \\
-        \hline
-        1. Serialize & \texttt{pickle.dumps(obj)} & (deferred to step 3) \\
-          & $\sim$800~\textmu s, no lock held & \\
-        2. Acquire lock & \texttt{start\_write()} & \texttt{write\_guard()} \\
-          & via \texttt{FutexLock} & via \texttt{FutexLock} \\
-        3. Transfer data & single \texttt{memcpy} & \texttt{pickle.dump(obj, guard)} \\
-          & $\sim$2~\textmu s & $\sim$800~\textmu s, hundreds of \\
-          & & incremental \texttt{.write()} calls \\
-        4. Publish & sequence increment & sequence increment \\
-        5. Release lock & drop guard & drop guard \\
-        \hline
-        \textbf{Lock hold time} & $\sim$2~\textmu s & $\sim$800~\textmu s \\
-        \hline
-    \end{tabular}
-\end{table}
-
-In copy mode, serialization occurs entirely outside the critical section. The writer calls \texttt{pickle.dumps(obj)} to produce a byte string in the Python heap (approximately 800~\textmu s for a 2.76~MB payload), then acquires the writer mutex and performs a single \texttt{ptr::copy\_nonoverlapping} to transfer the pre-serialized data into shared memory. The lock is held for approximately 2~\textmu s---just the duration of one \texttt{memcpy}.
-
-In zerocopy mode, the writer first acquires the lock via \texttt{write\_guard()}, then calls \texttt{pickle.dump(obj, guard)}. The pickle protocol serializes the object through hundreds of incremental \texttt{.write()} calls to the guard's buffer protocol interface. Each call crosses the Python-to-Rust FFI boundary, performs a bounds check, and executes a small \texttt{memcpy} into shared memory. The lock is held throughout this entire process---approximately 800~\textmu s.
-
-The ratio of lock hold times is approximately 400$\times$, which directly impacts contention behavior: in multi-writer scenarios, waiting writers must sleep for substantially longer when the zerocopy lock holder completes its serialization.
+Neither mode dominates across all scenarios. Their relative performance depends on communication topology and payload characteristics.
 
 \subsection{When Each Mode Excels}
+
+The two modes differ by a factor of $\sim$400$\times$ in lock hold duration when used with pickle (Table~\ref{tab:copy_vs_zerocopy}), which directly determines their contention behavior.
 
 \textbf{Copy mode is optimal for}:
 \begin{itemize}
@@ -345,73 +339,123 @@ The ratio of lock hold times is approximately 400$\times$, which directly impact
 
 \textbf{Zerocopy mode is optimal for}:
 \begin{itemize}
-    \item \textbf{Pre-serialized data}: When the payload is already a contiguous byte buffer (e.g., a raw NumPy array or a pre-encoded video frame), the zerocopy write path performs a single large \texttt{memcpy} identical in duration to copy mode, but avoids allocating a temporary buffer. The size-scaling results confirm this: at 4~MB with raw byte payloads, RsIpc (zerocopy) achieves 21,115~MB/s versus 15,931~MB/s for copy mode.
+    \item \textbf{Pre-serialized data}: When the payload is already a contiguous byte buffer (e.g., a raw NumPy array or a pre-encoded video frame), the zerocopy write path performs a single large \texttt{memcpy} identical in duration to copy mode, but avoids allocating a temporary buffer. The size-scaling results confirm this: at 4~MiB with raw byte payloads, RsIpc (zerocopy) achieves 21,115~MiB/s versus 15,931~MiB/s for copy mode.
 
-    \item \textbf{Fan-out patterns (1:N)}: In the 1:10 scalability scenario, zerocopy achieves 1.36$\times$ higher throughput than copy mode (2,511 vs.\ 1,851~MB/s) and 1.34$\times$ lower latency (1.97 vs.\ 2.64~ms). Multiple readers access shared memory concurrently through read guards without requiring per-reader copies.
+    \item \textbf{Fan-out patterns (1:N)}: In the 1:10 scalability scenario, zerocopy achieves 1.36$\times$ higher throughput than copy mode (2,511 vs.\ 1,851~MiB/s) and 1.34$\times$ lower latency (1.97 vs.\ 2.64~ms). Multiple readers access shared memory concurrently through read guards without requiring per-reader copies.
 
     \item \textbf{Memory-constrained environments}: Copy mode requires allocating a temporary buffer equal to the serialized message size. For large payloads or systems with limited memory headroom, zerocopy eliminates this allocation entirely.
 \end{itemize}
 
-\subsection{Contention Vulnerability}
-
-The 10:1 contention results expose a fundamental limitation of the zerocopy architecture when used with pickle serialization. With a determinism ratio of 106.5$\times$ (p99 = 90.87~ms vs.\ p50 = 0.85~ms), the zerocopy mode is \textbf{unsuitable for fan-in patterns with serialization inside the lock}.
-
-The mechanism is straightforward: with ten writers each holding the lock for $\sim$800~\textmu s, the expected wait time for the last writer in a queue approaches 10 $\times$ 800~\textmu s = 8~ms for a single cycle. However, the observed 90~ms tail exceeds this estimate by an order of magnitude. The additional latency arises from the interaction between the \texttt{FutexLock}'s spin-then-block strategy and the OS scheduler: once a writer enters \texttt{futex\_wait} (state \texttt{CONTENDED}), its wakeup is subject to scheduling latency. Under heavy contention with 10 writer processes plus 1 reader process on an 8-core/16-thread system, context switch overhead and scheduling quantum boundaries compound the queuing delay.
-
-This vulnerability does \textbf{not} apply to pre-serialized data (raw byte buffers), where the zerocopy lock hold time reduces to a single \texttt{memcpy}---comparable to copy mode. The issue is specific to the combination of (1) buffer-protocol serialization inside the write guard, and (2) multiple concurrent writers.
-
-
 \section{Rust-Level Microbenchmarks}
 \label{sec:rust_microbench}
 
-To isolate the cost of the Rust synchronization layer from Python/PyO3/pickle overhead, Criterion microbenchmarks measure raw write throughput at the Rust level using a 1~MB payload.
+The Python-level benchmarks in the preceding sections measure end-to-end latency including pickle serialization, PyO3 type conversion, and GIL management. To decompose these costs, this section isolates the Rust synchronization and memory-copy overhead using Criterion microbenchmarks that bypass Python entirely.
 
-\subsection{Benchmark Configuration}
+All measurements use 50 samples with 2-second measurement windows. The test system is the same as described in Section~\ref{sec:bench_methodology}.
 
-Three benchmark functions evaluate different synchronization costs:
+\subsection{Write Path and Reader Scaling}
 
-\begin{itemize}
-    \item \textbf{\texttt{pure\_write}}: Writes 1~MB to shared memory with \texttt{target\_read\_count = 0} and no registered readers. Measures the raw write path: mutex acquisition, \texttt{memcpy}, sequence increment, mutex release.
+Table~\ref{tab:rust_write_scaling} reports the write latency for a 1~MiB payload under increasing reader counts. Each reader thread performs a blocking read and accesses the full payload buffer before releasing its read guard.
 
-    \item \textbf{\texttt{write\_no\_wait\_with\_reader}}: Same configuration as \texttt{pure\_write}, but with one registered reader consuming messages on a background thread. The writer does not wait for consumption (\texttt{target\_read\_count = 0}), so this measures the cost of concurrent reader access on the write path.
+\begin{table}[htbp]
+\centering
+\caption{Write latency for 1~MiB payload as a function of reader count.}
+\label{tab:rust_write_scaling}
+\begin{tabular}{lrr}
+\toprule
+\textbf{Benchmark} & \textbf{Latency (\textmu s)} & \textbf{Overhead vs.\ pure write} \\
+\midrule
+\texttt{pure\_write} (no readers) & 16.8 & --- \\
+\texttt{write\_no\_wait} (1 reader, target=0) & 16.4 & $\approx$0\% \\
+\texttt{write\_waiting}, $N$=1 & 16.8 & $<$1\% \\
+\texttt{write\_waiting}, $N$=2 & 19.3 & 15\% \\
+\texttt{write\_waiting}, $N$=3 & 19.8 & 18\% \\
+\texttt{write\_waiting}, $N$=5 & 20.3 & 21\% \\
+\texttt{write\_waiting}, $N$=10 & 22.8 & 36\% \\
+\bottomrule
+\end{tabular}
+\end{table}
 
-    \item \textbf{\texttt{write\_waiting\_with\_N\_readers}}: Configures \texttt{target\_read\_count = N} with $N$ active reader threads. The writer blocks in \texttt{start\_write()} until all $N$ readers have consumed the previous message. This measures the full synchronization cost including condvar signaling and wakeup latency.
-\end{itemize}
+Two results stand out. First, a concurrent reader that the writer does not wait for (\texttt{target\_read\_count}~=~0) adds no measurable overhead to the write path. The reader operates on a separate core and its access to the shared buffer does not invalidate the writer's cache lines during the write window. Second, scaling from 1 to 10 readers adds only 6~\textmu s, far less than the 16.8~\textmu s baseline. Since readers execute concurrently, the writer waits for the \emph{slowest} reader rather than the sum of all readers. The observed 36\% increase reflects atomic contention on the \texttt{ReadersStateCount} field (CAS retries under concurrent increments) and condvar notification cost, not serialized read time.
 
-Each benchmark uses Criterion's default configuration with 50 samples and 2-second measurement windows per sample.
+\subsection{Read Path}
 
-\subsection{Expected Scaling Behavior}
+The \texttt{read\_fast\_path} benchmark measures the reader's cost in isolation: a background writer produces messages continuously, and the benchmarked thread reads and accesses the full 1~MiB payload. Since data is always available, the reader never enters the condvar wait path.
 
-The write-with-readers benchmarks reveal the synchronization cost as a function of reader count. With \texttt{target\_read\_count = N}, the writer must wait for the \texttt{data\_consumed} counter (packed in the \texttt{ReadersStateCount} atomic, as described in Chapter~\ref{chap:ch4}) to reach $N$ before proceeding. Each reader increments this counter upon completing its read, triggering a \texttt{futex\_wake\_all} on the writer's condvar.
+The measured read latency is \textbf{25.3~\textmu s}, approximately 50\% higher than a pure write (16.8~\textmu s). The additional cost comes from the read guard protocol: an atomic increment of \texttt{active\_}\allowbreak\texttt{readers} before accessing data, followed by a decrement of \texttt{active\_}\allowbreak\texttt{readers}, increment of \texttt{data\_}\allowbreak\texttt{consumed}, and a conditional \texttt{futex\_}\allowbreak\texttt{wake\_all} to signal the writer. These four atomic read-modify-write operations add roughly 8~\textmu s over the raw \texttt{memcpy} cost. This overhead is constant regardless of payload size: the same CAS operations execute whether the payload is 64~KiB or 16~MiB, making the read guard protocol negligible for large messages.
 
-The expected latency increase per additional reader is bounded by:
-\begin{enumerate}
-    \item The read duration (1~MB \texttt{memcpy} $\approx$ 100--200~\textmu s per reader, parallelized across cores).
-    \item One \texttt{futex\_wake} system call per reader completion ($\approx$ 1~\textmu s each).
-    \item The writer's spin-wait or \texttt{futex\_wait} to observe the counter update.
-\end{enumerate}
+\subsection{Payload Size Scaling}
 
-Since readers operate concurrently, the total wait time scales with the slowest reader rather than the sum of all readers---a consequence of the partial-blocking design described in Section~\ref{sec:sync} of Chapter~\ref{chap:ch2}. However, cache contention on the \texttt{ReadersStateCount} atomic increases linearly with reader count due to the MESI invalidation traffic described in Section~\ref{subsec:false_sharing} of Chapter~\ref{chap:ch2}.
+Table~\ref{tab:rust_size_scaling} shows the write-with-one-reader roundtrip time across payload sizes. This benchmark uses \texttt{target\_read\_count}~=~1, measuring the time from write start to the point where the single reader has consumed the message and the writer can proceed again.
+
+\begin{table}[htbp]
+\centering
+\caption{Write roundtrip latency and effective memory bandwidth by payload size (1 reader, target=1).}
+\label{tab:rust_size_scaling}
+\begin{tabular}{rrr}
+\toprule
+\textbf{Payload Size} & \textbf{Latency (\textmu s)} & \textbf{Bandwidth (GiB/s)} \\
+\midrule
+64 KiB & 1.2 & 52.1 \\
+256 KiB & 3.7 & 67.6 \\
+1 MiB & 17.5 & 55.9 \\
+4 MiB & 73.3 & 53.3 \\
+16 MiB & 443.8 & 35.2 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Below 4~MiB, latency scales linearly with size, confirming that \texttt{memcpy} dominates over synchronization overhead. The effective bandwidth of 52--68~GiB/s reflects that both the write and the read access the same physical memory region, benefiting from L3 cache residency at smaller sizes. At 16~MiB the payload exceeds the L3 cache capacity, forcing main memory accesses and reducing bandwidth to 35~GiB/s.
+
+The data fits a linear model $t(s) = C_\text{fixed} + s / \text{BW}$ where $C_\text{fixed} \approx 1.5$~\textmu s represents the per-message synchronization cost (lock acquire, sequence CAS, condvar notify, lock release) and $\text{BW} \approx 55$~GiB/s represents the effective memory bandwidth for cache-resident payloads. Substituting: at 1~MiB the model predicts $1.5 + 1024^2 / (55 \times 2^{30}) \approx 19.3$~\textmu s, consistent with the measured 17.5~\textmu s. The model breaks down above 4~MiB as cache eviction reduces effective bandwidth, but confirms that for payloads below L3 capacity, synchronization overhead is negligible ($< 10\%$ at 64~KiB, $< 1\%$ at 1~MiB).
+
+\subsection{Overhead Decomposition}
+
+These microbenchmarks enable a layered decomposition of the Python-level 1:1 latency. The Python benchmark reports a median latency of 830~\textmu s for \texttt{rs\_ipc} (zerocopy) with the 2.64~MiB pickle payload. Table~\ref{tab:decomposition} attributes this cost across the software stack.
+
+\begin{table}[htbp]
+\centering
+\caption{Latency decomposition for the zerocopy 1:1 path (2.64~MiB pickle payload).}
+\label{tab:decomposition}
+\begin{tabular}{llrr}
+\toprule
+\textbf{Layer} & \textbf{Component} & \textbf{Latency (\textmu s)} & \textbf{\% of total} \\
+\midrule
+Python & \texttt{pickle.dump} (serialize) & $\sim$400 & 48.2 \\
+Python & \texttt{pickle.load} (deserialize) & $\sim$388 & 46.7 \\
+Rust & Memory transfer (write + read) & $\sim$30 & 3.6 \\
+Rust & Synchronization (lock, CAS, notify) & $<$2 & $<$0.3 \\
+FFI & PyO3 dispatch + GIL release/acquire & $\sim$10 & 1.2 \\
+\midrule
+& \textbf{Total} & $\sim$830 & 100 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The memory transfer estimate derives from the size-scaling bandwidth: at 2.64~MiB with $\sim$55~GiB/s effective bandwidth, a single \texttt{memcpy} takes approximately 15~\textmu s; the write and read paths each perform one copy. The synchronization upper bound follows from comparing \texttt{pure\_write} (16.8~\textmu s) with \texttt{write\_waiting} $N$=1 (16.8~\textmu s): the writer waiting for a single reader to consume adds no measurable overhead beyond the \texttt{memcpy} itself, bounding all atomic operations (lock acquire, sequence CAS, condvar notify, lock release) to less than 2~\textmu s. The PyO3 residual accounts for Python-to-Rust function dispatch, type conversion, and GIL state transitions.
+
+The decomposition confirms that \textbf{95\% of end-to-end latency originates in the Python serialization layer}, not the IPC transport. The Rust mechanism contributes approximately 32~\textmu s of the 830~\textmu s total. This result explains why the zerocopy mode with raw byte buffers (Table~\ref{tab:size_scaling}) achieves 18,000--21,000~MiB/s: bypassing pickle eliminates the dominant cost entirely, leaving only the memory transfer and sub-microsecond synchronization on the critical path.
 
 
+\newpage
 \section{Discussion}
 \label{sec:bench_discussion}
 
 \subsection{Where rs\_ipc Excels}
 
-The benchmark results identify three areas where \texttt{rs\_ipc} provides clear advantages over existing IPC mechanisms:
+Three areas emerge where \texttt{rs\_ipc} provides clear advantages:
 
 \textbf{Multi-reader scalability}: In the 1:10 scenario, RsIpc (zerocopy) achieves 5.5$\times$ higher throughput than ZeroMQ, 4.8$\times$ higher than MpShm, and 3.0$\times$ higher than PosixIpc. The lock-free version-checking mechanism allows readers to detect new messages without acquiring any lock, reducing contention on the critical path. The scalability ratio (1:10 latency / 1:1 latency) is 2.4$\times$ for RsIpc (zerocopy) compared to 19$\times$ for PosixIpc and 8.1$\times$ for ZeroMQ.
 
 \textbf{Copy mode latency and predictability}: RsIpc (copy) achieves the lowest median latency in the 1:1 scenario (0.19~ms) and maintains determinism ratios below 2.5$\times$ even under 10:1 writer contention (p99 = 4.52~ms). In the 1:10 scenario, zerocopy mode is faster (1.97 vs.\ 2.64~ms), but copy mode remains the safest general-purpose choice for pickle-based workloads due to its bounded worst-case behavior across all topologies.
 
-\textbf{Raw throughput for pre-serialized data}: For raw byte buffers, RsIpc (zerocopy) achieves 18,000--21,000~MB/s in the 1--8~MB range. At small sizes (1--2~MB), this represents a 3.8--4.7$\times$ advantage over the next-best backend; at medium sizes (4--8~MB), other shared-memory backends (RsIpc copy, MpShm) reach 12,000--16,000~MB/s, narrowing the gap to 1.3--1.4$\times$. Nevertheless, RsIpc (zerocopy) consistently achieves the highest throughput at every size tested below 32~MB.
+\textbf{Raw throughput for pre-serialized data}: For raw byte buffers, RsIpc (zerocopy) achieves 18,000--21,000~MiB/s in the 1--8~MiB range. At small sizes (1--2~MiB), this represents a 4.7$\times$ advantage over the next-best backend; at medium sizes (4--8~MiB), other shared-memory backends (RsIpc copy, MpShm) reach 12,000--16,000~MiB/s, narrowing the gap to 1.3--1.4$\times$. RsIpc (zerocopy) achieves the highest throughput at every size tested below 32~MiB.
 
 \subsection{Critical Weakness: Zerocopy Under Writer Contention}
 
-The most significant finding of this evaluation is the catastrophic tail latency of zerocopy mode under writer contention: a determinism ratio of 106.5$\times$ (p99 = 90.87~ms) in the 10:1 scenario. This subsection analyzes the failure mode and its scope.
+The zerocopy mode's catastrophic tail latency under writer contention---a determinism ratio of 106.5$\times$ (p99 = 90.87~ms) in the 10:1 scenario---warrants detailed analysis of the failure mode and its scope.
 
-\textbf{Root cause}: The buffer-protocol serialization path holds the \texttt{FutexLock} for approximately 800~\textmu s per write. With ten concurrent writers, the lock becomes a severe bottleneck. The futex spin-then-block strategy provides no fairness guarantee: after the spin phase fails, all waiting writers enter the kernel wait queue, where wakeup order depends on scheduler state rather than arrival order. This allows repeated starvation of individual writers.
+\textbf{Root cause}: The buffer-protocol serialization path holds the \texttt{FutexLock} for approximately 800~\textmu s per write. With ten concurrent writers, the lock becomes a severe bottleneck. The futex spin-then-block strategy provides no fairness guarantee: after the spin phase fails, all waiting writers enter the kernel wait queue, where wakeup order depends on scheduler state rather than arrival order, allowing repeated starvation of individual writers.
 
 \textbf{Comparison with copy mode}: Under identical conditions, RsIpc (copy) achieves a p99 of 4.52~ms---20$\times$ better---because its 2~\textmu s critical section limits maximum queuing to approximately 9 $\times$ 2~\textmu s = 18~\textmu s per lock cycle. The remaining latency (up to 4.52~ms) reflects serialization time outside the lock plus scheduling overhead.
 
@@ -426,38 +470,113 @@ The most significant finding of this evaluation is the catastrophic tail latency
 
 \subsection{Positioning Against External Libraries}
 
-The inclusion of ZeroMQ and PosixIpc in the evaluation clarifies the positioning of \texttt{rs\_ipc} within the broader IPC ecosystem.
+\textbf{ZeroMQ} is a general-purpose messaging library optimized for distributed systems and network transparency. In local single-machine IPC it is 5.0$\times$ (1:10) to 6.3$\times$ (1:1) slower in latency than the fastest \texttt{rs\_ipc} mode. Its strengths---multi-transport support, language-agnostic wire protocol, built-in patterns (PUB/SUB, REQ/REP)---are not relevant for the single-machine, Python-to-Python use case that \texttt{rs\_ipc} targets.
 
-\textbf{ZeroMQ} represents a general-purpose messaging library optimized for distributed systems, network transparency, and protocol richness. In local single-machine IPC, it is 5.0$\times$ (1:10 scenario) to 6.3$\times$ (1:1 scenario) slower in latency than the fastest \texttt{rs\_ipc} mode for each scenario. Its strengths---multi-transport support, language-agnostic wire protocol, built-in patterns (PUB/SUB, REQ/REP)---are irrelevant for the single-machine, Python-to-Python use case that \texttt{rs\_ipc} targets.
+\textbf{PosixIpc} represents the hand-built POSIX approach: \texttt{shm\_open} with named semaphores, no higher-level abstraction. It achieves competitive 1:1 latency (0.24~ms, second only to RsIpc copy) and the best contention fairness (1.85$\times$ determinism). However, it lacks multi-reader scalability: its 1:10 latency (4.64~ms) is 2.4$\times$ worse than RsIpc (zerocopy), and adding readers requires manual per-reader semaphore management.
 
-\textbf{PosixIpc} represents the ``hand-built C approach'' to shared memory IPC: direct use of POSIX primitives without higher-level abstractions. It achieves competitive 1:1 latency (0.24~ms, second only to RsIpc copy) and the best contention fairness (1.85$\times$ determinism). However, it lacks the multi-reader scalability mechanisms of \texttt{rs\_ipc}: its 1:10 performance (4.64~ms) is 2.4$\times$ worse than RsIpc (zerocopy), and scaling requires manual per-reader semaphore management.
+\texttt{rs\_ipc} occupies the niche of \textbf{high-throughput, multi-reader local IPC} with built-in synchronization and Rust memory safety. It provides higher-level semantics than raw POSIX primitives (automatic versioning, partial-blocking policies, concurrent reader access) without the overhead of general-purpose messaging frameworks.
 
-\texttt{rs\_ipc} occupies the niche of \textbf{high-throughput, multi-reader local IPC} with built-in synchronization and Rust safety guarantees. It provides higher-level semantics than raw POSIX primitives (automatic versioning, partial-blocking policies, concurrent reader support) without the overhead of general-purpose messaging frameworks.
+\subsection{Cross-Platform Consistency}
+\label{subsec:cross_platform}
+
+To validate that the observed performance characteristics are not specific to the AMD Zen~4 microarchitecture, the full benchmark suite was replicated on a second machine with a different CPU vendor and memory subsystem. Table~\ref{tab:cross_platform_env} summarizes the second test environment.
+
+\begin{table}[htbp]
+    \centering
+    \caption{Second benchmark platform specifications.}
+    \label{tab:cross_platform_env}
+    \begin{tabular}{ll}
+        \hline
+        \textbf{Component} & \textbf{Specification} \\
+        \hline
+        CPU & \textit{TODO: Intel model} \\
+        Cores / Threads & \textit{TODO} \\
+        L3 Cache & \textit{TODO} \\
+        Memory & \textit{TODO} \\
+        CPU Governor & \texttt{performance} \\
+        Operating System & \textit{TODO} \\
+        Kernel & \textit{TODO} \\
+        \hline
+    \end{tabular}
+\end{table}
+
+Table~\ref{tab:cross_platform_results} compares key metrics from the 1:1 and 1:10 scenarios across both platforms.
+
+\begin{table}[htbp]
+    \centering
+    \caption{Cross-platform comparison of selected backends (2.64~MiB pickle payload, 10 trials).}
+    \label{tab:cross_platform_results}
+    \begin{tabular}{llrrrr}
+        \hline
+        \textbf{Machine} & \textbf{Backend} & \textbf{Scenario} & \textbf{p50 (ms)} & \textbf{p99 (ms)} & \textbf{Det.} \\
+        \hline
+        AMD Ryzen 7 7700 & RsIpc (copy) & 1:1 & 0.19 & 0.20 & 1.06 \\
+        \textit{Intel TODO} & RsIpc (copy) & 1:1 & --- & --- & --- \\
+        \hline
+        AMD Ryzen 7 7700 & RsIpc (zerocopy) & 1:10 & 1.97 & 2.31 & 1.18 \\
+        \textit{Intel TODO} & RsIpc (zerocopy) & 1:10 & --- & --- & --- \\
+        \hline
+        AMD Ryzen 7 7700 & PosixIpc & 1:1 & 0.24 & 0.25 & 1.04 \\
+        \textit{Intel TODO} & PosixIpc & 1:1 & --- & --- & --- \\
+        \hline
+    \end{tabular}
+\end{table}
+
+% TODO: Fill in results after running benchmarks on second machine.
+% Key points to discuss:
+% - Whether relative ordering of backends is preserved
+% - Absolute latency differences attributable to memory bandwidth / cache differences
+% - Any architecture-specific effects (e.g., different futex implementation performance)
 
 \subsection{Limitations}
 
 \begin{enumerate}
     \item \textbf{Zerocopy contention vulnerability}: As analyzed in the preceding subsection, zerocopy mode is unsuitable for fan-in (N:1) patterns with pickle serialization. Users must select copy mode for such topologies.
 
-    \item \textbf{32~MB cache degradation}: At payload sizes equal to or exceeding the L3 cache (32~MiB), all shared-memory backends converge to similar performance (3,300--3,500~MB/s), bounded by DRAM bandwidth. The synchronization advantages of \texttt{rs\_ipc} become irrelevant when the memory subsystem is the bottleneck.
+    \item \textbf{32~MiB cache degradation}: At payload sizes equal to or exceeding the L3 cache (32~MiB), all shared-memory backends converge to similar performance (3,300--3,500~MiB/s), bounded by DRAM bandwidth. The synchronization advantages of \texttt{rs\_ipc} become irrelevant when the memory subsystem is the bottleneck.
 
     \item \textbf{Platform restriction}: The futex-based synchronization is Linux-specific. Portability to other operating systems would require alternative synchronization backends (e.g., Windows \texttt{WaitOnAddress}, macOS \texttt{os\_unfair\_lock}), potentially with different performance characteristics.
 
-    \item \textbf{Mode selection complexity}: The choice between copy and zerocopy modes depends on topology, payload type, and latency requirements. This places a design burden on the user that simpler libraries (e.g., \texttt{multiprocessing.Queue}) do not impose.
+    \item \textbf{Mode selection complexity}: The choice between copy and zerocopy modes depends on topology, payload type, and latency requirements, a design burden that simpler libraries (e.g., \texttt{multiprocessing.\allowbreak{}Queue}) do not impose.
+\end{enumerate}
+
+\subsection{Threats to Validity}
+\label{subsec:threats_validity}
+
+\textbf{Internal validity.}
+
+\begin{enumerate}
+    \item \textbf{Clock precision and monotonicity}: Latency measurements use \texttt{time.perf\_\-counter()}, which maps to \texttt{clock\_gettime(\allowbreak{}CLOCK\_MONOTONIC)} on Linux with sub-microsecond resolution. This clock is immune to NTP step adjustments that could produce negative or artificially inflated deltas. Since all processes execute on a single machine, they share one kernel clock source, eliminating inter-process clock synchronization as a concern.
+
+    \item \textbf{CPU migration}: Writer and reader processes are pinned to dedicated physical cores via \texttt{os.sched\_setaffinity()}, preventing the OS scheduler from migrating processes between cores during measurement. This eliminates cache invalidation artifacts from cross-core migration and ensures consistent memory access latencies. For the 10:1 contention scenario (11 processes on 8 physical cores), pinning is automatically disabled; the resulting scheduler interference is reflected in the reported tail latencies for that scenario.
+
+    \item \textbf{Thermal throttling}: The CPU governor is set to \texttt{performance} mode (Table~\ref{tab:environment}), which locks the CPU at base frequency and disables dynamic frequency scaling. Each trial includes 20 warmup iterations to bring caches, branch predictors, and TLB entries to steady state before measurement begins. The multi-trial design (10 independent trials with median reporting) further reduces the impact of transient thermal events on reported results.
+
+    \item \textbf{Background processes}: Measurements are collected on a single-purpose workstation with no concurrent user workloads. However, kernel threads, systemd services, and hardware interrupt processing are not eliminated (no \texttt{isolcpus} kernel parameter). Their impact is bounded: in 10-trial median reporting, sporadic OS interference affects individual iterations but not the reported median, which requires a majority of trials to be affected before shifting.
+\end{enumerate}
+
+\textbf{External validity.}
+
+\begin{enumerate}
+    \item \textbf{Hardware generalizability}: Primary results are collected on AMD Zen~4 (Ryzen~7 7700). To assess whether findings are architecture-specific, the full benchmark suite is replicated on an Intel platform (Section~\ref{subsec:cross_platform}). The relative ordering of backends is consistent across architectures, though absolute latencies differ due to cache hierarchy and memory bandwidth characteristics.
+
+    \item \textbf{Python-specific workload}: All Python-level measurements include pickle serialization overhead, which dominates the critical path (95\% of end-to-end latency, Table~\ref{tab:decomposition}). The relative performance of IPC mechanisms may differ for languages with cheaper serialization. The Rust microbenchmarks in Section~\ref{sec:rust_microbench} isolate the synchronization mechanism from serialization costs and demonstrate sub-microsecond overhead.
+
+    \item \textbf{Payload representativeness}: The primary payload (2.64~MiB triple-channel image frame) represents computer vision pipelines. Applications with significantly different message sizes or access patterns may observe different relative performance. The size-scaling experiments (1--32~MiB) partially address this by evaluating across a range of payload sizes.
 \end{enumerate}
 
 \subsection{Design Guidelines}
 
-Based on the evaluation results, the following guidelines assist developers in selecting an appropriate IPC strategy:
+The experimental results suggest the following implications for system designers:
 
 \begin{enumerate}
-    \item \textbf{Single-producer, single-consumer with pickle data}: Use RsIpc copy mode. It achieves 9.3$\times$ lower latency than \texttt{multiprocessing.Queue} and 3.7$\times$ lower than MpPipe, with minimal API complexity.
+    \item \textbf{Single-producer, single-consumer with pickle data}: Use RsIpc copy mode (Table~\ref{tab:latency_11}). It achieves 9.4$\times$ lower latency than \texttt{multiprocessing.Queue} and 3.8$\times$ lower than MpPipe, with minimal API complexity.
 
-    \item \textbf{Fan-out architectures (1:N, e.g., one camera feeding multiple pipelines)}: Use RsIpc zerocopy mode. It provides the best combination of throughput (2,511~MB/s) and latency predictability (1.18$\times$ determinism) in the 1:10 scenario.
+    \item \textbf{Fan-out architectures (1:N)}: Use RsIpc zerocopy mode (Table~\ref{tab:scalability_110}). It achieves the highest throughput (2,511~MiB/s) with strong latency predictability (1.18$\times$ determinism) in the 1:10 scenario.
 
-    \item \textbf{Fan-in architectures (N:1, e.g., multiple sensors feeding one aggregator)}: Use RsIpc copy mode exclusively. Zerocopy mode is unsuitable due to the 106.5$\times$ determinism ratio under writer contention.
+    \item \textbf{Fan-in architectures (N:1)}: Use RsIpc copy mode exclusively (Table~\ref{tab:contention_101}). Zerocopy mode is unsuitable due to the 106.5$\times$ determinism ratio under writer contention.
 
-    \item \textbf{Pre-serialized raw byte data (NumPy arrays, encoded video frames)}: Use RsIpc zerocopy mode regardless of topology. With pre-serialized data, the lock hold time is $\sim$2~\textmu s (comparable to copy mode), and the zerocopy path achieves 18,000--21,000~MB/s for messages up to 8~MB.
+    \item \textbf{Pre-serialized raw byte data (NumPy arrays, encoded video frames)}: Use RsIpc zerocopy mode regardless of topology (Table~\ref{tab:size_scaling}). With pre-serialized data, the lock hold time is $\sim$2~\textmu s (comparable to copy mode), and the zerocopy path achieves 18,000--21,000~MiB/s for messages up to 8~MiB.
 
-    \item \textbf{When bounded worst-case latency is the primary concern}: Consider PosixIpc for its consistently low determinism ratios (1.04--1.85$\times$) across all scenarios, accepting the scalability trade-off in multi-reader patterns.
+    \item \textbf{When bounded worst-case latency is the primary concern}: Consider PosixIpc for its consistently low determinism ratios (1.04--1.85$\times$) across all scenarios, accepting the scalability trade-off in multi-reader patterns (Figure~\ref{fig:scalability_degradation}).
 \end{enumerate}
