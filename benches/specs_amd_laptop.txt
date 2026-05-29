@@ -1,0 +1,28 @@
+CPU(s):                                  16
+Model name:                              AMD Ryzen 9 5900HX with Radeon Graphics
+Thread(s) per core:                      2
+Core(s) per socket:                      8
+L3 cache:                                16 MiB (1 instance)
+NUMA node0 CPU(s):                       0-15
+
+        Error Correction Type: None
+        Size: 8 GiB
+        Type: DDR4
+        Speed: 3200 MT/s
+        Configured Memory Speed: 3200 MT/s
+        Non-Volatile Size: None
+        Volatile Size: 8 GiB
+        Cache Size: None
+        Logical Size: None
+        Size: 8 GiB
+        Type: DDR4
+        Speed: 3200 MT/s
+        Configured Memory Speed: 3200 MT/s
+        Non-Volatile Size: None
+        Volatile Size: 8 GiB
+        Cache Size: None
+        Logical Size: None
+
+ArchLinux
+6.18.33-1-lts
+
