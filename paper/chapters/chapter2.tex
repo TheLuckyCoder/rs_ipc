@@ -10,7 +10,7 @@ Unlike pipe-based or socket-based mechanisms that copy data through the kernel, 
 
 \subsection{Shared Memory Objects}
 
-The POSIX shared memory API provides two primary functions for managing shared memory objects: \texttt{shm\_open} and \texttt{shm\_unlink}~\cite{posix2017}. The \texttt{shm\_open} function creates or opens a named shared memory object, returning a file descriptor that can be used with standard file operations. On Linux, these objects reside in a \texttt{tmpfs} filesystem mounted at \texttt{/dev/shm}, backed entirely by RAM and swap rather than persistent storage.
+The POSIX shared memory API provides two primary functions for managing shared memory objects: \texttt{shm\_open} and \texttt{shm\_unlink}~\cite{posix2017}. The \texttt{shm\_open} function creates or opens a named shared memory object, returning a file descriptor that can be used with standard file operations. On Linux, these objects reside in a \texttt{tmpfs} filesystem mounted at \texttt{/dev/shm}, backed entirely by RAM and swap.
 
 The lifecycle of a shared memory object follows a create-size-map-use-unmap-unlink pattern:
 
@@ -42,10 +42,10 @@ Message-passing mechanisms (pipes, sockets, message queues) handle serialization
 The cost of this efficiency is complexity. Shared memory provides no inherent ordering, synchronization, or notification mechanism. The application must explicitly coordinate access to prevent data races, detect when new data is available, and ensure that readers do not observe partially written messages. These requirements motivate the synchronization primitives described in the following section.
 
 
-\section{Synchronization Primitives}
+\section{Synchronization and Cache Effects}
 \label{sec:sync}
 
-When multiple processes share a memory region, concurrent access without coordination leads to data races. Correct shared memory IPC requires atomic operations for lock-free state checks, memory ordering constraints to ensure cross-core visibility of writes, and blocking primitives to avoid busy-waiting. These mechanisms are well established in the literature~\cite{herlihy2012}; this section focuses on the hardware-level effect most relevant to the memory layout decisions in Chapter~\ref{chap:ch4}.
+When multiple processes share a memory region, concurrent access without coordination leads to data races. Correct shared memory IPC requires atomic operations for lock-free state checks, memory ordering constraints to ensure cross-core visibility of writes, and blocking primitives to avoid busy-waiting~\cite{herlihy2012}. Modern hardware provides atomic read-modify-write instructions (compare-and-swap, fetch-and-add) that guarantee indivisible updates to aligned words, and memory ordering semantics (Acquire, Release, SeqCst in the C++11 model~\cite{boehm2008}) that control when stores by one core become visible to loads on another. These form the foundation of the lock-free coordination paths described in Chapter~\ref{chap:ch4}. The blocking primitives---futexes---are covered separately in Section~\ref{sec:futex}; this section focuses on the hardware-level cache effect most relevant to the memory layout decisions.
 
 \subsection{False Sharing}
 \label{subsec:false_sharing}
@@ -60,7 +60,7 @@ The standard mitigation is to separate fields with different access patterns int
 \section{The Linux Futex Subsystem}
 \label{sec:futex}
 
-Traditional Unix synchronization primitives such as System~V semaphores require a system call for every lock and unlock operation, regardless of whether contention exists. The POSIX threads (pthread) library improves upon this with userspace fast paths, but cross-process use introduces complexity: the mutex must be initialized with the \texttt{PTHREAD\_\-PROCESS\_\-SHARED} attribute, placed in shared memory, and accessed through the same library version in all processes.
+Traditional Unix synchronization primitives such as System~V semaphores require a system call for every lock and unlock operation, regardless of whether contention exists. The POSIX threads (pthread) library improves upon this with userspace fast paths, but cross-process use introduces complexity. The mutex must be initialized with the \texttt{PTHREAD\_\-PROCESS\_\-SHARED} attribute, placed in shared memory, and accessed through the same library version in all processes.
 
 The \textit{futex} (Fast Userspace Mutex) subsystem, introduced in Linux 2.5.7~\cite{franke2002}, addresses these limitations.
 
@@ -115,7 +115,7 @@ Table~\ref{tab:futex_vs_pthread} summarizes the practical differences between fu
 \hline
 \textbf{Aspect} & \textbf{pthread} & \textbf{Futex} \\
 \hline
-Size & 40+ bytes & 4 bytes \\
+Size & 40 bytes (glibc x86\_64) & 4 bytes \\
 \hline
 Initialization & Attribute setup required & Zero-initialization \\
 \hline
@@ -144,15 +144,15 @@ CPython employs a Global Interpreter Lock (GIL) that permits only one thread to 
 
 \subsection{Releasing the GIL from Native Extensions}
 
-Native extensions written in C, C++, or Rust can release the GIL while executing code that does not interact with Python objects. The CPython C~API provides the macros \texttt{Py\_BEGIN\_ALLOW\_THREADS} and \texttt{Py\_END\_ALLOW\_THREADS} for this purpose. In the Rust ecosystem, the PyO3 framework provides an equivalent mechanism through the \texttt{Python::detach} method, which releases the GIL for the duration of a closure~\cite{pyo3}.
+Native extensions written in C, C++, or Rust can release the GIL while executing code that does not interact with Python objects. The CPython C~API provides the macros \texttt{Py\_BEGIN\_ALLOW\_THREADS} and \texttt{Py\_END\_ALLOW\_THREADS} for this purpose. In the Rust ecosystem, the PyO3 framework provides an equivalent mechanism through the \texttt{Python::detach()} method, called on the GIL token (\texttt{py.detach(|| \{...\})}), which releases the GIL for the duration of the provided closure~\cite{pyo3}.
 
 The safety invariant is that no Python objects may be accessed (read, written, or reference-counted) while the GIL is released. Code operating exclusively on Rust-owned data structures satisfies this invariant trivially, making IPC operations ideal candidates for GIL release: blocking waits proceed without holding the GIL, allowing other Python threads to execute concurrently.
 
 \subsection{Free-Threading in Python 3.13+}
 
-Python 3.13 introduced an experimental build configuration that removes the GIL (PEP~703)~\cite{pep703}, relying instead on biased reference counting and per-object locks. Python 3.14 elevated this to officially supported status (PEP~779). However, every C extension must explicitly declare compatibility; extensions that lack this declaration cause the interpreter to silently re-enable the GIL. Given the breadth of Python's extension ecosystem, widespread adoption is expected to require several years.
+Python 3.13 introduced an experimental build configuration that removes the GIL (PEP~703)~\cite{pep703}, relying instead on biased reference counting and per-object locks. Python 3.14 elevated this to officially supported status (PEP~779)~\cite{pep779}. However, every C extension must explicitly declare compatibility; extensions that lack this declaration cause the interpreter to silently re-enable the GIL. Given the breadth of Python's extension ecosystem, widespread adoption is expected to require several years.
 
-Crucially, free-threading addresses only \textit{intra-process} parallelism. The GIL forces data-intensive Python applications to use multiple processes for true parallelism, but those processes then require efficient IPC to exchange data; this is precisely the problem that motivates \texttt{rs\_ipc}. Even in a free-threaded interpreter, IPC remains necessary for fault isolation and multi-host deployment, and the GIL release patterns described in this work remain beneficial for allowing blocking operations to proceed without holding Python-internal locks.
+Crucially, free-threading addresses only \textit{intra-process} parallelism. While shared data structures within a single free-threaded process could replace some IPC use cases, multi-process architectures remain necessary for fault isolation (a crash in one pipeline stage does not terminate the entire system), independent resource limits, and multi-host deployment where shared memory is fundamentally unavailable. The GIL release patterns described in this work remain beneficial even under free-threading: blocking IPC operations must not hold Python-internal per-object locks, and \texttt{py.detach()} continues to serve this purpose regardless of whether a global lock exists.
 
 \subsection{Standard Library IPC Limitations}
 

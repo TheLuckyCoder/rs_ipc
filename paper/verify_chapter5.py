@@ -335,7 +335,7 @@ def build_prose_checks(data: dict) -> list[Check]:
         Check("Determinism: MpShm 10:1",
               det(shm_101),
               r"MpShm at (\d+\.\d+)\$\\times\$, caused",
-              2),
+              1),
         Check("Determinism: zc catastrophic",
               det(zc_101),
               r"RsIpc \(zerocopy\) at (\d+\.\d)\$\\times\$ and MpPipe",
@@ -720,6 +720,119 @@ def verify_prose(tex: str, checks: list[Check], verbose: bool) -> tuple[int, int
     return passed, total, errors
 
 
+# --- Microbenchmark consistency checks ---
+
+def extract_microbench_table(tex: str) -> dict:
+    """Extract pure_write latency from the Rust microbenchmark table (tab:rust_write_scaling).
+    Returns dict with benchmark names and their latencies in μs."""
+    label = "tab:rust_write_scaling"
+    label_pos = tex.find(r"\label{" + label + "}")
+    if label_pos == -1:
+        return {}
+    begin = tex.rfind(r"\begin{table}", 0, label_pos)
+    end = tex.find(r"\end{table}", label_pos)
+    if begin == -1 or end == -1:
+        return {}
+    table_text = tex[begin:end]
+
+    results = {}
+    # Match rows like: \texttt{pure\_write} ... & 16.8 & ...
+    for m in re.finditer(
+        r"\\texttt\{([^}]+)\}[^&]*&\s*([\d.]+)\s*&", table_text
+    ):
+        name = m.group(1).replace(r"\_", "_")
+        latency = float(m.group(2))
+        results[name] = latency
+    return results
+
+
+def build_microbench_checks(tex: str) -> list[Check]:
+    """Build consistency checks for microbenchmark-derived prose claims.
+
+    These verify that prose claims about critical section duration are
+    consistent with the microbenchmark table values in the same chapter.
+    """
+    microbench = extract_microbench_table(tex)
+    if not microbench:
+        return []
+
+    pure_write_us = microbench.get("pure_write")
+    if pure_write_us is None:
+        return []
+
+    sync_overhead_us = 2.0  # upper bound from decomposition
+    memcpy_per_mib_us = pure_write_us - sync_overhead_us  # ~15 μs/MiB
+    critical_section_264_us = memcpy_per_mib_us * PAYLOAD_MIB  # ~40 μs for 2.64 MiB
+
+    checks = [
+        # "~40 μs critical section" claims (multiple occurrences)
+        Check("Microbench: copy critical section (1:1 analysis)",
+              critical_section_264_us,
+              r"which is held only for a single \\texttt\{memcpy\} \(\$\\sim\$(\d+)~\\textmu",
+              -1),
+        Check("Microbench: copy critical section (contention results)",
+              critical_section_264_us,
+              r"its \$\\sim\$(\d+)~\\textmu s critical section \(memcpy only\) allows",
+              -1),
+        Check("Microbench: copy critical section (contention analysis)",
+              critical_section_264_us,
+              r"its \$\\sim\$(\d+)~\\textmu s critical section \(memcpy of the 2\.64",
+              -1),
+        Check("Microbench: max lock queuing (9 × critical section)",
+              critical_section_264_us * 9,
+              r"9~\$\\times\$~(\d+)~\\textmu s \$\\approx\$~(\d+)~\\textmu",
+              -1),
+        Check("Microbench: fan-in critical section",
+              critical_section_264_us,
+              r"The \$\\sim\$(\d+)~\\textmu s critical section \(memcpy only, ",
+              -1),
+        # "~20×" ratio claim in contention analysis
+        Check("Microbench: copy/zerocopy ratio (fan-in guideline)",
+              800 / critical_section_264_us,
+              r"\$\\sim\$(\d+)\$\\times\$ shorter than zerocopy pickle",
+              0),
+        # "15 μs per MiB" claim in decomposition
+        Check("Microbench: per-MiB memcpy rate",
+              memcpy_per_mib_us,
+              r"approximately (\d+)~\\textmu s per MiB of \\texttt\{memcpy\} bandwidth",
+              0),
+    ]
+    return checks
+
+
+def verify_microbench_prose(tex: str, checks: list[Check], verbose: bool) -> tuple[int, int, list[str]]:
+    """Run microbenchmark consistency checks. Uses looser tolerance for derived estimates."""
+    passed = 0
+    total = 0
+    errors = []
+
+    for check in checks:
+        total += 1
+        m = re.search(check.anchor, tex)
+        if not m:
+            errors.append(f"  ✗ {check.desc}: anchor not found — {check.anchor[:60]}")
+            continue
+
+        line = find_line_number(tex, m.start())
+        # Some patterns have two groups (e.g., "9 × 40 ≈ 360"); use the last one for the derived value
+        raw_found = m.group(m.lastindex)
+        found = parse_latex_number(raw_found)
+
+        # Use 20% tolerance for microbenchmark-derived estimates (they involve extrapolation)
+        tolerance = max(found * 0.2, 5)
+        if abs(found - check.expected) <= tolerance:
+            passed += 1
+            if verbose:
+                print(f"  ✓ {check.desc} = {found} (expected ~{check.expected:.0f}, line {line})")
+        else:
+            errors.append(
+                f"  ✗ {check.desc}: found {found}, expected ~{check.expected:.0f} "
+                f"(derived from pure_write, line {line})"
+            )
+
+    return passed, total, errors
+
+
 # --- Main ---
 
 def main():
@@ -762,6 +875,22 @@ def main():
             print(e)
     if not errs:
         print(f"  ✓ All {t} claims verified")
+
+    # Microbenchmark consistency
+    print(f"\nMicrobenchmark consistency:")
+    mb_checks = build_microbench_checks(tex)
+    if mb_checks:
+        p, t, errs = verify_microbench_prose(tex, mb_checks, verbose)
+        total_passed += p
+        total_checks += t
+        if errs:
+            all_errors.extend(errs)
+            for e in errs:
+                print(e)
+        if not errs:
+            print(f"  ✓ All {t} claims consistent with pure_write = {extract_microbench_table(tex).get('pure_write')} μs")
+    else:
+        print("  ⚠ Could not extract microbenchmark table (tab:rust_write_scaling)")
 
     # Summary
     failed = total_checks - total_passed

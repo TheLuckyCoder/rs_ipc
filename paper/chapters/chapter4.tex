@@ -7,7 +7,7 @@
 \section{System Overview and Design Goals}
 \label{sec:arch_overview}
 
-The \texttt{rs\_ipc} library provides a \texttt{SharedMessage} abstraction for inter-process communication between Python applications on a single Linux machine. The target use case is data-intensive pipelines---such as autonomous vehicle vision systems or machine learning inference chains---where multiple processes must exchange large payloads (1--32~MiB) with minimal latency.
+The \texttt{rs\_ipc} library provides a \texttt{SharedMessage} abstraction for inter-process communication between Python applications on a single Linux machine. The library targets single-machine Python-to-Python IPC for large payloads (1--32~MiB), as motivated in Chapter~\ref{chap:intro}.
 
 The design pursues five goals:
 
@@ -24,7 +24,7 @@ The design pursues five goals:
 \end{enumerate}
 
 \newpage
-The library is organized into four layers illustrated by~\ref{fig:arch_layers}, each building on the one below:
+The library is organized into four layers illustrated in Figure~\ref{fig:arch_layers}, each building on the one below:
 
 \begin{enumerate}
     \item \textbf{Operating system layer}: POSIX shared memory (\texttt{shm\_open}, \texttt{mmap}) provides the raw shared address space; Linux futex syscalls provide the blocking mechanism. These primitives are described in Chapter~\ref{chap:ch2}.
@@ -80,9 +80,9 @@ This section describes the two primitives that coordinate access to the shared m
 \subsection{Writer Mutex}
 \label{subsec:writer_mutex}
 
-The writer mutex serializes concurrent writers to a shared message slot. Its implementation follows the three-state futex lock pattern described in Section~\ref{sec:futex}: state~0 (unlocked), state~1 (locked, no waiters), and state~2 (locked, waiters present). The implementation closely follows the design of Rust's standard library \texttt{std::sync::Mutex}, which itself implements Drepper's algorithm~\cite{drepper2005} with a spin phase that performs relaxed loads to avoid generating cache-line invalidations.
+The writer mutex serializes concurrent writers to a shared message slot. Its implementation follows the three-state futex lock pattern described in Section~\ref{sec:futex}, closely mirroring Rust's standard library \texttt{std::sync::Mutex}~\cite{drepper2005}. The spin phase performs 100 relaxed loads before falling back to \texttt{futex\_wait}.
 
-The lock is wrapped in a \texttt{SharedMutex<T>} abstraction that pairs the 4-byte futex with an \texttt{UnsafeCell<T>}, providing interior mutability under the lock's protection. Locking returns an RAII guard (\texttt{SharedMutexGuard}) that automatically unlocks on drop, preventing accidental deadlocks from early returns or panics. Because futex-based locks operate on a memory address rather than thread identity, the guard is safe to send across threads, unlike \texttt{pthread} mutexes, which on some platforms require the unlocking thread to be the same as the locking thread.
+The lock is wrapped in a \texttt{SharedMutex<T>} abstraction that pairs the 4-byte futex with an \texttt{UnsafeCell<T>}, providing interior mutability under the lock's protection. Locking returns an RAII guard (\texttt{SharedMutexGuard}) that automatically unlocks on drop, preventing accidental deadlocks from early returns or panics. Because futex unlock is a simple atomic swap without thread-identity verification, the guard can safely be sent to and dropped from a different thread than the one that acquired it---unlike POSIX mutex semantics, where unlocking from a non-owning thread is undefined behavior~\cite{posix2017}.
 
 \subsection{Shared Condition Variable}
 \label{subsec:shared_condvar}
@@ -191,11 +191,15 @@ Compile-time static assertions verify these alignment properties: the header wit
 The initial implementation accompanying the conference paper~\cite{szilagyi2025accelerating} used a compact 40-byte header with synchronization primitives adjacent to data fields.
 Table~\ref{tab:paper_vs_current} summarizes the architectural changes and their motivations.
 
-\begin{table}[htbp]
+The conference paper's Rust implementation already employed futex-based synchronization; however, it relied on the \texttt{linux-futex} crate and used a mutex-associated condition variable modeled after the standard library's \texttt{Condvar}---requiring readers to acquire the mutex before waiting.
+The current design replaces this with direct futex syscalls via \texttt{rustix} and a standalone counter-based condition variable (Section~\ref{subsec:shared_condvar}) that enables readers to wait without holding any lock.
+This eliminates the reader--writer mutex contention that previously serialized blocking reads, while the 4-byte inline primitives retain the zero-initialization property and require no external lifecycle management.
+
+\begin{table}[!ht]
     \centering
     \caption{Evolution of the \texttt{SharedMessage} layout from the conference paper to the current implementation.}
     \label{tab:paper_vs_current}
-    \small
+    \footnotesize
     \begin{tabular}{>{\raggedright}p{2.5cm}>{\raggedright}p{3.2cm}>{\raggedright}p{3.2cm}>{\raggedright\arraybackslash}p{4.5cm}}
         \hline
         \textbf{Aspect} & \textbf{Original} & \textbf{Current} & \textbf{Rationale} \\
@@ -215,13 +219,11 @@ Table~\ref{tab:paper_vs_current} summarizes the architectural changes and their 
     \end{tabular}
 \end{table}
 
-Embedding the synchronization primitives within the shared memory region itself replaces the paper's approach of using \texttt{pthread} mutexes and condition variables accessed through Python's \texttt{ctypes} FFI (which required separate initialization and careful lifecycle management). The current design places the 4-byte futex-based mutex and condition variables directly in the header, eliminating external dependencies and enabling the zero-initialization property described in Section~\ref{subsec:shared_condvar}.
-
 \newpage
 \subsection{Bit-Packed Atomic Fields}
 \label{subsec:packed_fields}
 
-Two 64-bit atomic integers encode all coordination state, enabling lock-free queries with a single memory access.
+Two 64-bit atomic integers encode all coordination state, enabling lock-free queries with a single memory access~\cite{boehm2008}.
 
 \textbf{SequenceState} (\texttt{sequence\_and\_flags}, \texttt{AtomicU64}) packs three pieces of information into one word:
 
@@ -323,7 +325,7 @@ Algorithm~\ref{alg:write} presents the write protocol. The numbered annotations 
     \State \textbf{release} writer\_mutex
 \EndFunction
 \end{algorithmic}
-\caption{Write protocol. The critical section spans from mutex acquisition (line~2) through mutex release (line~26). Lines 5--10 enforce the \texttt{ReaderWaitPolicy}; lines 11--17 set the WIP flag and drain active readers to prevent torn reads. Stopped-flag checks within wait loops are omitted for clarity.}
+\caption{Write protocol. The critical section spans from mutex acquisition (line~3) through mutex release (line~23). Lines 6--11 enforce the \texttt{ReaderWaitPolicy}; lines 12--17 set the WIP flag and drain active readers to prevent torn reads. Stopped-flag checks within wait loops are omitted for clarity.}
 \label{alg:write}
 \end{figure}
 
@@ -378,14 +380,16 @@ The protocol achieves lock-free reader access through three key mechanisms:
 
 \textbf{Ticket-based wait} (line~2): The condvar ticket is read \emph{before} checking the sequence number. If a writer publishes between the ticket read (line~2) and the wait call (line~8), the condvar counter will have been incremented, the wait will return immediately, and the loop retries with the new sequence number visible. This ordering eliminates the lost-wakeup race described in Section~\ref{subsec:shared_condvar}.
 
-\textbf{Single-word state query} (line~3): A single Acquire load of \texttt{sequence\_and\_flags} retrieves the sequence number, writing-in-progress flag, and stopped flag atomically. This is the lock-free version-checking mechanism referenced in Chapter~\ref{chap:ch5}: readers poll this field without any lock, and multiple readers executing line~3 concurrently impose no serialization on each other.
+\textbf{Single-word state query} (line~3): A single Acquire load of \texttt{sequence\_and\_flags} retrieves the sequence number, writing-in-progress flag, and stopped flag atomically. This is the lock-free version-checking mechanism referenced in Chapter~\ref{chap:ch5}: readers poll this field without any lock, and multiple readers executing line~3 concurrently impose no serialization on each other. This pattern resembles the SeqLock~\cite{lameter2005seqlock} used in the Linux kernel for read-mostly data, but provides stronger consistency: where a SeqLock permits the writer to proceed regardless of readers---readers detect conflicts and retry---the \texttt{SharedMessage} protocol registers reader presence via CAS, preventing the writer from modifying data that readers are actively consuming.
 
-\textbf{Register-then-verify} (lines 13--18): The reader increments \texttt{active\_readers} via a CAS operation (registering its intent to access the payload), then re-checks the state. If a writer set the WIP flag or changed the sequence between the initial check (line~3) and the verification (line~14), the reader unregisters and retries. This double-check pattern prevents a race where the reader would access a buffer being actively modified. The window between lines 13 and 14 is the only point where a reader's registration could block a writer; this window is bounded by a single atomic load.
+\textbf{Register-then-verify} (lines 13--18): The reader increments \texttt{active\_readers} via a CAS operation (registering its intent to access the payload), then re-checks the state~\cite{lamport1977}. If a writer set the WIP flag or changed the sequence between the initial check (line~3) and the verification (line~14), the reader unregisters and retries. This double-check pattern prevents a race where the reader would access a buffer being actively modified. The window between lines 13 and 14 is the only point where a reader's registration could block a writer; this window is bounded by a single atomic load.
 
 \subsection{Read Guard Release}
 \label{subsec:guard_release}
 
 When a \texttt{ReadGuard} is dropped (either explicitly or by leaving scope), it performs two updates in a single CAS operation on \texttt{readers\_state}: decrementing \texttt{active\_\-readers} and incrementing \texttt{data\_consumed}. If \texttt{active\_readers} reaches zero after the decrement, the guard notifies the \texttt{reader\_done\_\-condvar} to wake the writer (which may be waiting to begin a new write in Algorithm~\ref{alg:write}, lines 13--17). The conditional notification avoids unnecessary \texttt{futex\_wake} system calls when other readers are still active.
+
+Duplicate consumption is prevented at the protocol level: the \texttt{read} function requires the caller's last-seen sequence number and returns \texttt{None} if no newer message exists (Algorithm~\ref{alg:read}, line~6), ensuring that \texttt{data\_consumed} is incremented at most once per reader per message version.
 
 \subsection{Producer-Consumer Policies}
 \label{subsec:policies}
@@ -463,7 +467,7 @@ On the read side, the GIL is released around the entire read loop (Algorithm~\re
 
 The GIL release is safe because all code executing after release operates exclusively on Rust-owned data structures: shared memory regions accessed through atomic operations, futex-based locks, and condvar counters. No Python objects are read, written, or reference-counted while the GIL is released. The same safety argument applies to the zerocopy and asynchronous modes described below.
 
-The critical section in copy mode is bounded by the \texttt{memcpy} duration (approximately 2~\textmu s for a 2~MiB payload), making this path tolerant of writer contention.
+The critical section in copy mode is bounded by the \texttt{memcpy} duration---approximately 15~\textmu s per MiB of payload based on the microbenchmarks in Section~\ref{sec:rust_microbench}, or roughly 40~\textmu s for the 2.64~MiB benchmark payload. Synchronization overhead (lock acquisition, sequence CAS, condvar notify) adds less than 2~\textmu s. This short critical section makes copy mode tolerant of writer contention.
 
 \subsection{Zerocopy Path}
 \label{subsec:zerocopy_path}
@@ -486,8 +490,8 @@ Table~\ref{tab:copy_vs_zerocopy} compares the two data paths.
         \textbf{Characteristic} & \textbf{Copy mode} & \textbf{Zerocopy mode} \\
         \hline
         Serialization location & Python heap (outside lock) & Shared memory (inside lock) \\
-        Lock hold time (pickle) & $\sim$2~\textmu s (memcpy only) & $\sim$800~\textmu s (full serialize) \\
-        Lock hold time (raw bytes) & $\sim$2~\textmu s & $\sim$2~\textmu s \\
+        Lock hold time (pickle, 2.64~MiB) & $\sim$40~\textmu s (memcpy only) & $\sim$800~\textmu s (full serialize) \\
+        Lock hold time (raw bytes, 2.64~MiB) & $\sim$40~\textmu s & $\sim$40~\textmu s \\
         Temporary allocation & Yes (serialized buffer) & No \\
         Intermediate copies & 1 (heap $\to$ shm) & 0 \\
         Contention tolerance & High (short critical section) & Low with pickle; high with raw bytes \\
@@ -495,12 +499,12 @@ Table~\ref{tab:copy_vs_zerocopy} compares the two data paths.
     \end{tabular}
 \end{table}
 
-The 400$\times$ difference in lock hold time between copy and zerocopy modes (when used with pickle) explains the catastrophic tail latency observed under writer contention in Chapter~\ref{chap:ch5}. With raw byte payloads (e.g., pre-serialized numpy arrays), both paths have equivalent critical section duration.
+The $\sim$20$\times$ difference in lock hold time between copy and zerocopy modes when used with pickle serialization (40~\textmu s vs.\ 800~\textmu s) explains the divergent tail latency observed under writer contention in Chapter~\ref{chap:ch5}. With raw byte payloads (e.g., pre-serialized numpy arrays), both paths have equivalent critical section duration.
 
 \subsection{Parallel and Asynchronous Modes}
 \label{subsec:async_modes}
 
-For pipelines that must read from multiple producers concurrently, the \texttt{read\_all} function releases the GIL and reads from all $N$ shared memory regions in parallel using a Rayon work-stealing thread pool. Parallel reading reduces the total blocking time from the sum of individual read latencies to the maximum, which is significant when synchronizing data from multiple independent sensors arriving at slightly different times.
+For pipelines that must read from multiple producers concurrently, the \texttt{read\_all} function releases the GIL and reads from all $N$ shared memory regions in parallel using a Rayon~\cite{rayon2019} work-stealing thread pool. Parallel reading reduces the total blocking time from the sum of individual read latencies to the maximum, which is significant when synchronizing data from multiple independent sensors arriving at slightly different times.
 
 For applications where the Python main thread cannot afford to block (event-loop-driven GUI applications, real-time control loops), the library provides asynchronous operation modes.
 
@@ -538,11 +542,11 @@ Table~\ref{tab:tradeoffs} summarizes the trade-offs inherent in each design deci
         \hline
         \textbf{Design choice} & \textbf{Benefit} & \textbf{Cost} \\
         \hline
-        Lock-free reader path & Multiple readers detect and access data concurrently; 2.4$\times$ scalability ratio in 1:10 scenario & Writer must drain active readers before writing, adding latency proportional to the slowest reader \\
+        Lock-free reader path & Multiple readers detect and access data concurrently; 2.3$\times$ scalability ratio in 1:10 scenario & Writer must drain active readers before writing, adding latency proportional to the slowest reader \\
         \hline
         Spin-then-block (100/1000 iterations) & Absorbs short waits without syscall overhead & Wastes CPU cycles when wait exceeds spin duration; parameters are heuristic, not adaptive \\
         \hline
-        No fairness guarantee in writer mutex & Higher throughput in the common case (few writers) & Under heavy writer contention, individual writers may starve; 106.5$\times$ determinism ratio in 10:1 scenario \\
+        No fairness guarantee in writer mutex & Higher throughput in the common case (few writers) & Under heavy writer contention, individual writers may starve. Combined with long critical sections (zerocopy pickle): 90.1$\times$ determinism ratio; with short critical sections (copy mode): 1.81$\times$ \\
         \hline
         Single slot (not a queue) & Constant memory usage; latest-value semantics for real-time & Slow readers miss intermediate messages; no buffering for bursty producers \\
         \hline

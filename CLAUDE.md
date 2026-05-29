@@ -243,7 +243,7 @@ This library is documented as part of a master's thesis expanding on "Accelerati
 
 ### Thesis Contributions Beyond Original Paper
 
-1. **Futex-based synchronization**: Replaced pthread FFI with direct futex syscalls
+1. **Redesigned synchronization**: Replaced mutex-associated condvar with standalone counter-based design (lock-free reader waits); switched from `linux-futex` crate to direct syscalls via `rustix`
 2. **Async read/write modes**: Background threads for non-blocking Python API
 3. **Refined memory layout**: Smaller struct, packed stopped bit, explicit blocking policy
 4. **GIL release patterns**: Safe patterns for Python multithreading with Rust
