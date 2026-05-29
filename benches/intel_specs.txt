@@ -1,0 +1,25 @@
+CPU(s):                                  12
+Model name:                              Intel(R) Core(TM) i5-10400F CPU @ 2.90GHz
+Thread(s) per core:                      2
+Core(s) per socket:                      6
+L3 cache:                                12 MiB (1 instance)
+NUMA node0 CPU(s):                       0-11
+        Error Correction Type: None
+        Size: 16 GB
+        Type: DDR4
+        Speed: 2933 MT/s
+        Configured Memory Speed: 2133 MT/s
+        Non-Volatile Size: None
+        Volatile Size: 16 GB
+        Cache Size: None
+        Logical Size: None
+        Size: 8 GB
+        Type: DDR4
+        Speed: 2133 MT/s
+        Configured Memory Speed: 2133 MT/s
+        Non-Volatile Size: None
+        Volatile Size: 8 GB
+        Cache Size: None
+        Logical Size: None
+PRETTY_NAME="Debian GNU/Linux 13 (trixie)"
+6.12.90+deb13.1-amd64
