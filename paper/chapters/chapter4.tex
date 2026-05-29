@@ -23,6 +23,7 @@ The design pursues five goals:
     \item \textbf{RAII safety}: All shared resources (memory mappings, file descriptors, read/\-write access) are managed through Rust's ownership system, ensuring cleanup without manual lifecycle management.
 \end{enumerate}
 
+\newpage
 The library is organized into four layers illustrated by~\ref{fig:arch_layers}, each building on the one below:
 
 \begin{enumerate}
@@ -328,7 +329,7 @@ Algorithm~\ref{alg:write} presents the write protocol. The numbered annotations 
 
 Several design choices merit explanation:
 
-\\textbf{Consumption wait before WIP flag} (lines 5--10): The writer first waits for the \emph{previous} message to be consumed by the required number of readers, then sets the writing-in-progress flag. This ordering prevents a pathological interaction: if WIP were set first, blocked readers would be unable to read the previous message, creating a deadlock where the writer waits for consumption that can never complete. Line~7 proactively wakes readers via the writer condvar (the condvar that readers block on for new data) to prevent this scenario when readers are sleeping.
+\textbf{Consumption wait before WIP flag} (lines 5--10): The writer first waits for the \emph{previous} message to be consumed by the required number of readers, then sets the writing-in-progress flag. This ordering prevents a pathological interaction: if WIP were set first, blocked readers would be unable to read the previous message, creating a deadlock where the writer waits for consumption that can never complete. Line~7 proactively wakes readers via the writer condvar (the condvar that readers block on for new data) to prevent this scenario when readers are sleeping.
 
 \textbf{Active reader drain} (lines 11--17): After signaling that writing is in progress, the writer must wait for all currently-active readers to release their guards. This step ensures exclusive access to the payload buffer without requiring per-byte locking. The wait is bounded: once WIP is set, no new readers can register (they observe the flag and wait), so the count monotonically decreases to zero.
 

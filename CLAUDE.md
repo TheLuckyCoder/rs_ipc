@@ -333,6 +333,20 @@ Conference paper: "Accelerating Intelligent Vehicle Vision: A Hybrid Python-Rust
 
 - **Introduction cross-references are wrong**: `chapter1_introduction.tex` lines 66-74 reference `\ref{chap:ch3}` for architecture and `\ref{chap:ch4}` for performance evaluation. After adding the Related Work chapter, the correct mapping is ch3=Related Work, ch4=Architecture, ch5=Performance. Needs fixing.
 
+### Chapter 5 Verification
+
+A script at `paper/verify_chapter5.py` checks all numerical claims in Chapter 5 against `benches/bench_results_workstation.csv`:
+
+```bash
+# Verify all tables and prose claims (217 checks)
+python paper/verify_chapter5.py
+
+# Show per-check detail with line numbers
+python paper/verify_chapter5.py --verbose
+```
+
+Run this after any benchmark data change to identify stale numbers. Exit code 0 = all pass, 1 = failures found.
+
 ### Platform Limitations to Document
 
 - **Linux-only**: Requires futex syscalls (Linux-specific)
