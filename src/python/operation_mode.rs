@@ -1,6 +1,6 @@
 use pyo3::pyclass;
 
-#[pyclass(module = "rs_ipc")]
+#[pyclass(module = "rs_ipc", from_py_object)]
 #[pyo3(frozen, eq, eq_int)]
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub enum OperationMode {

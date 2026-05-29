@@ -26,7 +26,6 @@ impl SharedCondvar {
         futex_wait(&self.0, expected);
     }
 
-
     #[inline]
     pub fn notify_one(&self) {
         self.0.fetch_add(1, Ordering::Release);

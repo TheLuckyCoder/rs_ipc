@@ -24,7 +24,7 @@ pub struct SharedMessage<T: ?Sized = [u8]> {
     _pad1: [u8; 112],
 
     // --- Cache Line 2: High Contention (Read-Modify-Write) ---
-    readers_state: AtomicU64, // ReadersState
+    readers_state: AtomicU64,      // ReadersState
     writer_mutex: SharedMutex<()>, // Writer mutex (serializes multiple writers)
 
     // Synchronization (lock-free condition variables)
@@ -38,15 +38,19 @@ pub struct SharedMessage<T: ?Sized = [u8]> {
 }
 
 impl SharedMessage {
-    pub(crate) const fn size_of_fields() -> usize {
+    pub const fn size_of_fields() -> usize {
         const {
-            assert!(size_of::<SharedMessage<[u8; 0]>>() % 64 == 0,
-                    "SharedMessage header must align to exactly 64 bytes for cache alignment");
+            assert!(
+                size_of::<SharedMessage<[u8; 0]>>().is_multiple_of(64),
+                "SharedMessage header must align to exactly 64 bytes for cache alignment"
+            );
         }
 
         const {
-            assert!(size_of::<SharedMessage<[u8; 8]>>() % 64 == 8,
-                    "SharedMessage payload misalignment detected");
+            assert!(
+                size_of::<SharedMessage<[u8; 8]>>() % 64 == 8,
+                "SharedMessage payload misalignment detected"
+            );
         }
 
         size_of::<SharedMessage<[u8; 0]>>()
@@ -75,7 +79,6 @@ impl SharedMessage {
 
         // Wait for readers to consume the already existing data (based on policy)
         let current_seq = self.get_sequence_state().sequence;
-        self.data_size.store(0, Ordering::Release);
 
         let mut reader_state = self.get_reader_state();
 
@@ -120,7 +123,7 @@ impl SharedMessage {
 
     /// Release a reader reference
     pub(crate) fn release_active_reader(&self) {
-        let reader_state =self.update_reader_state(|state| {
+        let reader_state = self.update_reader_state(|state| {
             state.active_readers -= 1;
             // Increment consumed count to signal that this reader has finished
             state.data_consumed += 1;
@@ -191,7 +194,10 @@ impl SharedMessage {
         }
     }
 
-    fn update_reader_state(&self, mut mutator: impl FnMut(&mut ReadersStateCount)) -> ReadersStateCount {
+    fn update_reader_state(
+        &self,
+        mut mutator: impl FnMut(&mut ReadersStateCount),
+    ) -> ReadersStateCount {
         let mut packed = self.readers_state.load(Ordering::Acquire);
         loop {
             let mut policy = ReadersStateCount::from(packed);
@@ -223,7 +229,7 @@ impl SharedMessage {
         let write_guard = self.start_write()?;
         Some(MessageWriteGuard::new(self, write_guard))
     }
-    
+
     /// Returns the new sequence number if successful, None if stopped.
     pub fn write_slice(&self, new_data: &[u8]) -> Option<u64> {
         let writer_guard = self.start_write()?;
@@ -238,16 +244,11 @@ impl SharedMessage {
         }
         // We already checked bounds, so copy_nonoverlapping is safe and faster
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                new_data.as_ptr(),
-                data.as_mut_ptr(),
-                new_data.len()
-            );
+            std::ptr::copy_nonoverlapping(new_data.as_ptr(), data.as_mut_ptr(), new_data.len());
         }
 
         self.publish_write(writer_guard, new_data.len())
     }
-
 
     /// Returns a ReadGuard if new data is available, None otherwise.
     pub fn read(&self, last_seen_seq: u64, block: bool) -> Option<MessageReadGuard<'_>> {

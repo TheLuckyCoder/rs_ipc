@@ -52,7 +52,7 @@ impl ReadersStateCount {
     }
 
     #[inline]
-    pub(crate) fn to_packed(&self) -> u64 {
+    pub(crate) fn to_packed(self) -> u64 {
         (self.target_read as u64) << Self::TARGET_SHIFT
             | (self.consumers as u64) << Self::CONSUMERS_SHIFT
             | (self.active_readers as u64) << Self::ACTIVE_SHIFT

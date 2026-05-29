@@ -88,9 +88,7 @@ impl PythonSharedMessage {
         let shared_message = slf.get();
         shared_message.op_mode.check_write_permission();
 
-        let guard = slf
-            .py()
-            .detach(|| shared_message.shared_memory.write());
+        let guard = slf.py().detach(|| shared_message.shared_memory.write());
         let object = slf.clone().unbind();
 
         Ok(guard.map(|guard| PythonWriteGuard::new(object, guard)))
@@ -114,7 +112,9 @@ impl PythonSharedMessage {
         let object = slf.clone().unbind();
 
         if let Some(guard) = guard {
-            shared_message.last_read_sequence.store(guard.sequence(), Ordering::Relaxed);
+            shared_message
+                .last_read_sequence
+                .store(guard.sequence(), Ordering::Relaxed);
             return Ok(Some(PythonReadGuard::new(object, guard)));
         }
 
@@ -476,123 +476,34 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "nightly-features")]
-    mod bench {
-        extern crate test;
-        use super::*;
-        use test::Bencher;
-        #[bench]
-        fn pure_write(b: &mut Bencher) {
-            let data = std::hint::black_box(get_test_data());
-            let memory = init(
-                "pure_write",
-                OperationMode::WriteSync,
-                ReaderWaitPolicy::Count(0),
-            );
-            b.iter(|| memory.write_sync(&data));
-        }
+    #[test]
+    fn write_multiple_readers() {
+        let data = get_test_data();
+        let memory = Arc::new(init(
+            "write_multiple_readers",
+            OperationMode::WriteSync,
+            ReaderWaitPolicy::All(),
+        ));
 
-        #[bench]
-        fn write_no_wait_with_reader(b: &mut Bencher) {
-            let data = std::hint::black_box(get_test_data());
-            let memory = Arc::new(init(
-                "write_with_reader",
-                OperationMode::WriteSync,
-                ReaderWaitPolicy::Count(0),
-            ));
-
-            let memory_clone = memory.clone();
+        for _ in 0..5 {
+            memory.shared_memory.add_reader();
+            let memory = memory.clone();
             thread::spawn(move || {
-                while let Some(read_data) = memory_clone.read(true) {
-                    std::hint::black_box(read_data);
+                let mut version = 0;
+                loop {
+                    let Some(guard) = memory.shared_memory.read(version, true) else {
+                        break;
+                    };
+                    version = guard.sequence();
+                    std::hint::black_box(guard.data());
                 }
             });
-
-            b.iter(|| memory.write_sync(&data));
-
-            memory.stop();
         }
 
-        #[bench]
-        fn write_and_read_same_thread(b: &mut Bencher) {
-            let data = std::hint::black_box(get_test_data());
-            let memory = Arc::new(init(
-                "write_waiting_with_reader",
-                OperationMode::WriteSync,
-                ReaderWaitPolicy::All(),
-            ));
-
-            b.iter(|| {
-                memory.write_sync(&data);
-                let data = memory.read(true).unwrap();
-                std::hint::black_box(data);
-                // println!("Got data: {}", data.0.len());
-            });
-
-            memory.stop();
+        for _ in 0..100 {
+            memory.write_sync(&data);
         }
 
-        fn write_multiple_readers(b: &mut Bencher, readers: u16) {
-            let data = std::hint::black_box(get_test_data());
-            let memory = Arc::new(init(
-                &format!("write_waiting_with_readers_{readers}"),
-                OperationMode::WriteSync,
-                ReaderWaitPolicy::All(),
-            ));
-
-            for _ in 0..readers {
-                memory.shared_memory.add_reader();
-                let memory = memory.clone();
-                thread::spawn(move || {
-                    let mut version = 0;
-                    loop {
-                        let guard = memory.shared_memory.read(version, true);
-                        if let Some(guard) = guard {
-                            let bytes = RustPyBytes::new(guard.data());
-                            version = guard.sequence();
-                            drop(guard);
-                            let a = bytes.0.iter().map(|x| x & 1).count();
-                            std::hint::black_box(a);
-                        } else {
-                            break;
-                        }
-                    }
-                });
-            }
-
-            b.iter(|| memory.write_sync(&data));
-
-            memory.stop();
-        }
-
-        #[bench]
-        fn write_waiting_with_01_reader(b: &mut Bencher) {
-            write_multiple_readers(b, 1);
-        }
-
-        #[bench]
-        fn write_waiting_with_02_readers(b: &mut Bencher) {
-            write_multiple_readers(b, 2);
-        }
-
-        #[bench]
-        fn write_waiting_with_03_readers(b: &mut Bencher) {
-            write_multiple_readers(b, 3);
-        }
-
-        #[bench]
-        fn write_waiting_with_05_readers(b: &mut Bencher) {
-            write_multiple_readers(b, 5);
-        }
-
-        #[bench]
-        fn write_waiting_with_10_readers(b: &mut Bencher) {
-            write_multiple_readers(b, 10);
-        }
-
-        #[bench]
-        fn write_waiting_with_15_readers(b: &mut Bencher) {
-            write_multiple_readers(b, 15);
-        }
+        memory.stop();
     }
 }

@@ -12,11 +12,18 @@ name = "rs_ipc"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-rustix = { version = "1.1.3", default-features = false, features = ["std", "mm", "shm", "thread", "linux_latest"] }
-rayon = { version = "1.11.0", optional = true }
-pyo3 = { version = "0.27.2", optional = true, features = ["auto-initialize"] }
+rustix = { version = "1.1.4", default-features = false, features = ["std", "mm", "shm", "thread", "linux_latest"] }
+rayon = { version = "1.12.0", optional = true }
+pyo3 = { version = "0.28.3", optional = true, features = ["auto-initialize"] }
 
 [features]
 default = ["python"]
 python = ["dep:pyo3", "dep:rayon"]
-nightly-features = ["python"]
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[[bench]]
+name = "ipc_bench"
+harness = false
+

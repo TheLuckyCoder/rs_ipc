@@ -1,5 +1,3 @@
-#![cfg_attr(feature = "nightly-features", feature(test))]
-
 mod memory_mapper;
 #[cfg(feature = "python")]
 mod python;

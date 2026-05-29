@@ -1,6 +1,6 @@
 use pyo3::pyclass;
 
-#[pyclass(module = "rs_ipc", eq)]
+#[pyclass(module = "rs_ipc", eq, from_py_object)]
 #[pyo3(frozen)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ReaderWaitPolicy {

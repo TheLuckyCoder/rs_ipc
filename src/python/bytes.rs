@@ -2,7 +2,7 @@ use pyo3::types::PyBytes;
 use pyo3::{Bound, PyErr, PyRef, PyResult, Python, pyclass, pymethods};
 use std::ffi::c_int;
 
-#[pyclass(module = "rs_ipc")]
+#[pyclass(module = "rs_ipc", from_py_object)]
 #[pyo3(frozen)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RustPyBytes(pub(crate) Box<[u8]>);
