@@ -1,4 +1,159 @@
-\chapter{Previous/Related Work}
+\chapter{Related Work}
 \label{chap:ch3}
 
-Szilagyi et al.~\cite{szilagyi2025accelerating} introduced a hybrid Python--Rust architecture using partial-blocking shared memory for autonomous vehicle vision pipelines. That work specified the \texttt{SharedMessage} abstraction and demonstrated its effectiveness against Python's native IPC mechanisms. The present thesis provides a comprehensive treatment of the library's synchronization design, memory layout, and performance characteristics as a general-purpose IPC solution.
+Szilagyi et al.~\cite{szilagyi2025accelerating} introduced a hybrid Python--Rust architecture using partial-blocking shared memory for autonomous vehicle vision pipelines. That work specified the \texttt{SharedMessage} abstraction and demonstrated its effectiveness against Python's native IPC mechanisms. The present thesis provides a comprehensive treatment of the library's synchronization design, memory layout, and performance characteristics as a general-purpose IPC solution. This chapter surveys the alternative IPC systems against which the library is evaluated in Chapter~\ref{chap:ch5}, examining their architectures, data paths, and limitations for the target use case of high-throughput, low-latency communication between Python processes on a single machine.
+
+
+\section{Python Standard Library IPC}
+\label{sec:stdlib_ipc}
+
+Python's \texttt{multiprocessing} module provides three IPC mechanisms out of the box~\cite{python_multiprocessing}. Their ubiquity makes them the natural baseline for any Python IPC library.
+
+\subsection{Queue and Pipe}
+\label{subsec:queue_pipe}
+
+\texttt{multiprocessing.Queue} is built atop \texttt{multiprocessing.Pipe} with the addition of a feeder thread and a reentrant lock for thread safety. When created with \texttt{duplex=False} (the default for Queue's internal pipe), \texttt{Pipe} wraps a unidirectional OS pipe created via \texttt{os.pipe()}; the duplex variant uses a Unix domain socket pair instead. In either case, every message traverses the kernel. The data path for a Queue message is:
+
+\begin{enumerate}
+    \item The sender serializes the object using \texttt{pickle} (holding the GIL throughout).
+    \item The serialized bytes are placed into an internal buffer and handed to the feeder thread.
+    \item The feeder thread writes the bytes into the underlying OS pipe.
+    \item The kernel copies the data from the sender's address space into its internal pipe buffer.
+    \item The receiver reads from the pipe, causing a second kernel copy into its address space.
+    \item The receiver deserializes the bytes back into a Python object (again holding the GIL).
+\end{enumerate}
+
+This path imposes a minimum of two full data copies per message (steps 4 and 5), plus the CPU cost of pickle serialization and deserialization. The kernel pipe buffer on Linux defaults to 64~KiB~\cite{kerrisk2010}; when the buffer is full, the writing process blocks until the reader drains it. For the 2.64~MiB payloads used in this work, the writer must block repeatedly as the kernel incrementally transfers data in buffer-sized chunks, adding scheduler-induced latency at each boundary.
+
+\texttt{Pipe} eliminates the feeder thread and lock overhead but retains the kernel-copy data path. Neither mechanism supports fan-out: a message placed in a Queue is delivered to exactly one consumer, and a Pipe connects exactly two endpoints.
+
+\subsection{shared\_memory}
+\label{subsec:mp_shm}
+
+The \texttt{multiprocessing.shared\_memory} module, introduced in Python~3.8, wraps \texttt{shm\_open} and \texttt{mmap} to provide named shared memory regions accessible from any process~\cite{python_multiprocessing}. Unlike Queue and Pipe, data written to a \texttt{SharedMemory} object is immediately visible to all processes that have opened the same named region---no kernel copy occurs.
+
+However, the module provides raw byte access with no synchronization, message framing, versioning, or notification mechanism. As discussed in Section~\ref{sec:python_concurrency}, \texttt{multiprocessing.Lock} cannot reside in shared memory, forcing applications that require coordination to maintain a parent-child process relationship through which lock objects are inherited. This constraint eliminates use cases where independently started processes must communicate.
+
+The companion \texttt{ShareableList} class provides a higher-level interface but supports only fixed-type arrays of scalars and short strings---it cannot represent the structured, variable-size messages required for vision pipeline data or general-purpose IPC.
+
+
+\section{The posix\_ipc Library}
+\label{sec:posix_ipc}
+
+The \texttt{posix\_ipc} package~\cite{posixipc_pkg} provides a thin Python/C wrapper around the POSIX IPC API: shared memory objects (\texttt{shm\_open}/\texttt{shm\_unlink}) and named semaphores (\texttt{sem\_open}/\texttt{sem\_wait}/\texttt{sem\_post})~\cite{posix2017}. It does not implement any protocol layer; the user must build message framing, versioning, and read/write coordination manually.
+
+The benchmarks in Chapter~\ref{chap:ch5} use \texttt{posix\_ipc} with a protocol that matches the \texttt{rs\_ipc} data path as closely as possible: a shared memory region for payload transfer, a producer semaphore to signal data availability, and a consumer semaphore to signal consumption. Message headers (size, sequence number) are packed using Python's \texttt{struct} module at the beginning of the shared region.
+
+\subsection{Synchronization via Named Semaphores}
+
+Named POSIX semaphores are kernel-managed objects. Each \texttt{sem\_wait} and \texttt{sem\_post} operation is a system call regardless of contention state, unlike futex-based locks which avoid the kernel on the uncontended fast path (Section~\ref{sec:futex}). On Linux, glibc's semaphore implementation uses futexes internally, whose wait queue provides approximately FIFO wakeup ordering. This contributes to the low latency variance observed in the benchmark results.
+
+Because the kernel manages the wait queue directly, wakeup latency is bounded by the scheduler's response time rather than by contention-dependent spin durations.
+
+\subsection{Strengths}
+
+For simple single-producer, single-consumer patterns, \texttt{posix\_ipc} achieves low uncontended latency. The payload is written directly to the shared memory region via \texttt{mmap}, avoiding kernel-mediated data transfer. Notification requires a single semaphore post. The API surface is minimal: open a named region, open named semaphores, read and write.
+
+\subsection{Limitations}
+
+Several limitations emerge when scaling beyond the simple case:
+
+\begin{itemize}
+    \item \textbf{No multi-reader scalability.} Signaling $N$ readers that new data is available requires $N$ semaphore posts---$N$ system calls per message. There is no broadcast mechanism analogous to a condition variable's \texttt{notify\_all}.
+
+    \item \textbf{No lock-free coordination paths.} Although glibc's POSIX semaphore implementation uses futexes internally (avoiding kernel entry on uncontended operations), the signaling model still requires one \texttt{sem\_post} call per reader per message---$N$ system calls under contention when all $N$ readers are blocked. The rs\_ipc condvar broadcasts to all waiters with a single \texttt{futex\_wake\_all}, regardless of reader count.
+
+    \item \textbf{Python overhead for protocol logic.} Header manipulation (packing sequence numbers, checking sizes) occurs in interpreted Python. While negligible for large payloads, this overhead becomes proportionally significant for small messages or high-frequency polling.
+
+    \item \textbf{Resource persistence.} Named semaphores and shared memory objects persist in the filesystem namespace after process termination unless explicitly unlinked. Abnormal termination (crashes, SIGKILL) leaves orphaned resources in \texttt{/dev/shm} that must be cleaned manually.
+\end{itemize}
+
+
+\section{ZeroMQ}
+\label{sec:zeromq}
+
+ZeroMQ is a brokerless message-passing library that presents an asynchronous socket-like API for inter-thread, inter-process, and inter-machine communication~\cite{zeromq2013, zeromq_guide}. The benchmarks in Chapter~\ref{chap:ch5} use the PyZMQ bindings~\cite{pyzmq} with the \texttt{ipc://} transport (Unix domain sockets) and the PUSH/PULL socket pattern.
+
+\subsection{Architecture}
+
+Each ZeroMQ context spawns one or more dedicated I/O threads that handle all network operations asynchronously. Application threads interact with sockets through an internal message queue; the I/O threads perform the actual send and receive operations in the background. This design decouples application logic from transport mechanics and provides built-in buffering and backpressure through high-water mark settings~\cite{zeromq2013}.
+
+The library abstracts over multiple transports---TCP, IPC (Unix domain sockets), in-process (lock-free queues), and multicast---behind a uniform socket API. Socket types define messaging patterns: PUSH/PULL for pipeline distribution, PUB/SUB for publish-subscribe, REQ/REP for request-reply, among others~\cite{zeromq_guide}.
+
+\subsection{Data Path over IPC Transport}
+
+When using the \texttt{ipc://} transport on a single machine, ZeroMQ communicates through Unix domain sockets. The data path for a PUSH/PULL message is:
+
+\begin{enumerate}
+    \item The application calls \texttt{socket.send(data)}, which copies the message into ZeroMQ's internal buffer (managed by the I/O thread).
+    \item The I/O thread writes the message through the Unix domain socket, including ZeroMQ's wire-level framing (size prefix, flags).
+    \item The kernel copies the data from the sender's address space into the socket buffer.
+    \item The kernel copies the data from the socket buffer into the receiver's address space when the receiver reads.
+    \item The receiving I/O thread removes ZeroMQ framing and places the message in the application-facing queue.
+    \item The application calls \texttt{socket.recv()}, retrieving the message.
+\end{enumerate}
+
+Even on a single machine, each message incurs at minimum two kernel copies (steps 3 and 4). When using the simple \texttt{socket.send(data)} API (as in these benchmarks), an additional application-level copy into ZeroMQ's internal buffer occurs in step~1. For the 2.64~MiB payloads in this work, these copies dominate latency.
+
+\subsection{Multi-Reader Patterns}
+
+ZeroMQ's PUSH/PULL pattern distributes messages round-robin across connected consumers---each message reaches exactly one receiver. Achieving fan-out (delivering every message to all readers) requires the PUB/SUB pattern, which introduces different trade-offs: messages are dropped rather than queued when a subscriber's buffer is full, making it unsuitable for reliable delivery.
+
+The benchmarks address this by creating one dedicated PUSH socket per reader, with the writer sending each message once per socket. This preserves delivery guarantees but multiplies the number of kernel copies linearly with reader count: $N$ readers require $N$ complete message transmissions through the kernel.
+
+\subsection{Strengths}
+
+ZeroMQ excels in distributed systems where its transport abstraction provides genuine value: applications can switch between local IPC and network communication without code changes. The library handles connection management, reconnection, buffering, and multi-part message framing transparently~\cite{zeromq2013}. Its mature ecosystem spans dozens of language bindings and has extensive production deployment history.
+
+\subsection{Limitations for Single-Machine Large-Payload IPC}
+
+For the specific use case addressed by this work---large-payload communication between Python processes on the same machine---ZeroMQ's architecture introduces unnecessary overhead:
+
+\begin{itemize}
+    \item \textbf{Unavoidable message copying.} Even over \texttt{ipc://} transport, the Unix domain socket path requires kernel-mediated data transfer. The zero-copy \texttt{zmq\_msg\_send} API avoids one application-level copy but cannot eliminate the kernel copies inherent to the socket mechanism.
+
+    \item \textbf{Transport abstraction overhead.} Wire-level framing and the I/O thread architecture add latency that provides no benefit when both endpoints reside on the same machine.
+
+    \item \textbf{Background thread resource usage.} ZeroMQ's I/O threads introduce additional scheduling points and context switches; under bursty traffic, the latency between application enqueue and actual socket write depends on the I/O thread's poll cycle and OS scheduling state.
+\end{itemize}
+
+
+\section{Apache Arrow Plasma}
+\label{sec:plasma}
+
+Apache Arrow's Plasma Object Store~\cite{arrow_plasma} occupied a similar design point to \texttt{rs\_ipc}: a shared memory object store enabling zero-copy data sharing between processes on a single machine. Clients wrote objects into Plasma's memory-mapped store and other processes could access them without copying, using object IDs for lookup and a notification mechanism for signaling availability.
+
+However, Plasma was deprecated in Apache Arrow 10.0 (2022) and removed entirely in Arrow 12.0 (2023). The Arrow project recommended migrating to Arrow Flight (a gRPC-based data transport for networked exchange) or Arrow IPC (a file and stream serialization format for columnar data)~\cite{arrow_flight}. Neither successor targets low-latency single-machine signaling: Arrow Flight introduces gRPC framing and network stack overhead even for local communication, while Arrow IPC is a serialization format rather than a communication mechanism.
+
+Beyond its deprecation, Plasma's architecture differed from the use case addressed here in two respects. First, it required a long-running store process that managed the shared memory pool---adding a daemon dependency and an extra context switch per operation. Second, its object model was immutable and write-once: once sealed, objects could not be updated in place, making it unsuitable for streaming scenarios where a single shared slot is continuously overwritten with the latest data. The \texttt{rs\_ipc} design specifically targets this mutable single-slot pattern with configurable blocking policies for overwrite coordination.
+
+
+\section{Comparative Summary}
+\label{sec:related_comparison}
+
+Table~\ref{tab:related_comparison} summarizes the architectural properties of the surveyed systems alongside \texttt{rs\_ipc}. The comparison focuses on properties relevant to single-machine, large-payload Python IPC.
+
+\begin{table}[htbp]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{6pt}
+\caption{Architectural comparison of IPC mechanisms.}
+\label{tab:related_comparison}
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Property} & \rotatebox{60}{\textbf{Queue/Pipe}} & \rotatebox{60}{\textbf{shared\_memory}} & \rotatebox{60}{\textbf{posix\_ipc}} & \rotatebox{60}{\textbf{ZeroMQ}} & \rotatebox{60}{\textbf{rs\_ipc}} \\
+\midrule
+Data transfer    & Kernel copy & Shared mem. & Shared mem. & Kernel copy & Shared mem. \\
+Synchronization  & Built-in    & None        & Semaphores  & Built-in    & Futex-based \\
+Multi-reader     & No          & N/A         & Manual      & Pattern-dep. & Built-in \\
+Zero-copy access & No          & Yes         & Yes         & No          & Yes \\
+Lock-free readers & No         & N/A         & No          & No          & Yes \\
+GIL released     & No          & N/A         & Partial     & Partial     & Yes \\
+Blocking policy  & Fixed       & N/A         & Fixed       & HWM-based   & Configurable \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The table reveals a gap in the existing landscape. Kernel-copy mechanisms (Queue, Pipe, ZeroMQ) provide built-in synchronization and framing but impose unavoidable copy overhead that scales linearly with payload size. The shared memory approaches (\texttt{multiprocessing.shared\_memory}, \texttt{posix\_ipc}) eliminate copies but either lack synchronization entirely or rely on kernel-mediated semaphores without lock-free fast paths.
+
+The \texttt{rs\_ipc} library occupies the intersection: shared memory for zero-copy data access, futex-based synchronization that avoids the kernel on uncontended paths, lock-free version checking for readers, and a configurable blocking policy that adapts writer behavior to application requirements.

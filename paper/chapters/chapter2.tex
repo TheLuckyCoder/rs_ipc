@@ -33,7 +33,7 @@ However, visibility at the memory level does not imply ordering guarantees at th
 
 \subsection{Translation Lookaside Buffer Considerations}
 
-When a process accesses a mapped memory region, the CPU translates virtual addresses to physical addresses via the Translation Lookaside Buffer (TLB). For large shared memory regions, TLB misses degrade performance; huge pages (2~MiB on x86\_64) reduce this pressure by covering larger address ranges with fewer entries. However, explicit huge pages require \texttt{hugetlbfs} (incompatible with \texttt{shm\_open}), and Transparent Huge Pages requested via \texttt{madvise(MADV\_HUGEPAGE)} are advisory and unreliable for frequently created regions~\cite{kerrisk2010}.
+When a process accesses a mapped memory region, the CPU translates virtual addresses to physical addresses via the Translation Lookaside Buffer (TLB). For large shared memory regions, TLB misses degrade performance; huge pages (2~MiB on x86\_64) reduce this pressure by covering larger address ranges with fewer entries. However, explicit huge pages require \texttt{hugetlbfs} (incompatible with \texttt{shm\_open}), and Transparent Huge Pages requested via \texttt{madvise(MADV\_HUGEPAGE)} are advisory and unreliable for frequently created regions~\cite{thp_kernel_docs}.
 
 \subsection{Shared Memory versus Message Passing}
 
@@ -54,7 +54,7 @@ Multi-core processors maintain cache coherence at the granularity of cache lines
 
 In shared memory IPC, false sharing is particularly damaging. Consider a structure where a write-mostly field (a sequence counter incremented by the producer) and a read-mostly field (a consumer count) occupy the same cache line. Every producer write invalidates the cache line on all consumer cores, forcing re-fetches of data they are only reading---not because the data changed, but because an adjacent field did.
 
-The standard mitigation is to separate fields with different access patterns into distinct cache lines through explicit padding. Using 128-byte separation (two cache lines) provides additional protection against hardware prefetching, which may speculatively load adjacent lines.
+The standard mitigation is to separate fields with different access patterns into distinct cache lines through explicit padding. Using 128-byte separation (two cache lines) provides additional protection against hardware prefetching on processors with adjacent-line prefetchers (documented on Intel; conservative for AMD Zen where prefetch behavior differs).
 
 
 \section{The Linux Futex Subsystem}
@@ -103,7 +103,7 @@ The spin phase (step 2) uses relaxed loads rather than CAS operations to avoid g
 
 Futex wait queues are keyed by physical memory address, not by virtual address or process identity~\cite{franke2002}. Because \texttt{mmap} with \texttt{MAP\_SHARED} causes distinct virtual addresses in separate processes to resolve to identical physical frames, a 32-bit futex variable placed in such a region is inherently cross-process: a \texttt{futex\_wake} issued by the producer resolves to the same kernel wait queue that the consumer's \texttt{futex\_wait} registered against.
 
-Physical-address keying eliminates the initialization complexity of process-shared pthread mutexes: a futex-based lock in shared memory works correctly as soon as the memory is mapped: no constructor, no attribute configuration, no shared library dependency. The lock's state is entirely represented by the 4-byte integer, making it relocatable within shared memory.
+Physical-address keying eliminates the initialization complexity of process-shared pthread mutexes: a futex-based lock in shared memory works correctly as soon as the memory is mapped---POSIX mandates that \texttt{ftruncate} zero-fills newly extended shared memory objects, satisfying the zero-initialization requirement---no constructor, no attribute configuration, no shared library dependency. The lock's state is entirely represented by the 4-byte integer, making it relocatable within shared memory.
 
 \subsection{Comparison with pthread}
 
@@ -150,7 +150,7 @@ The safety invariant is that no Python objects may be accessed (read, written, o
 
 \subsection{Free-Threading in Python 3.13+}
 
-Python 3.13 introduced an experimental build configuration that removes the GIL (PEP~703)~\cite{pep703}, relying instead on biased reference counting and per-object locks. Python 3.14 elevated this to officially supported status (PEP~779)~\cite{pep779}. However, every C extension must explicitly declare compatibility; extensions that lack this declaration cause the interpreter to silently re-enable the GIL. Given the breadth of Python's extension ecosystem, widespread adoption is expected to require several years.
+Python 3.13 introduced an experimental build configuration that removes the GIL (PEP~703)~\cite{pep703}, relying instead on biased reference counting and per-object locks. PEP~779~\cite{pep779}, accepted for Python~3.14, elevates free-threading from experimental to officially supported status. However, every C extension must explicitly declare compatibility; extensions that lack this declaration cause the interpreter to silently re-enable the GIL. Given the breadth of Python's extension ecosystem, widespread adoption is expected to require several years.
 
 Crucially, free-threading addresses only \textit{intra-process} parallelism. While shared data structures within a single free-threaded process could replace some IPC use cases, multi-process architectures remain necessary for fault isolation (a crash in one pipeline stage does not terminate the entire system), independent resource limits, and multi-host deployment where shared memory is fundamentally unavailable. The GIL release patterns described in this work remain beneficial even under free-threading: blocking IPC operations must not hold Python-internal per-object locks, and \texttt{py.detach()} continues to serve this purpose regardless of whether a global lock exists.
 

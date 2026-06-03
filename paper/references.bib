@@ -10,6 +10,14 @@
     note = {Online; accessed May 2026}
 }
 
+@misc{thp_kernel_docs,
+    author = {{Linux Kernel Contributors}},
+    title = {Transparent Hugepage Support},
+    howpublished = {Linux kernel documentation, \texttt{Documentation/admin-guide/mm/transhuge.rst}},
+    year = {2026},
+    note = {Online; accessed May 2026}
+}
+
 @misc{pep703,
     author = {Sam Gross},
     title = {{PEP 703 -- Making the Global Interpreter Lock Optional in CPython}},
@@ -166,12 +174,10 @@
 @inproceedings{boehm2008,
   title={Foundations of the C++ concurrency memory model},
   author={Boehm, Hans-J and Adve, Sarita V},
-  journal={ACM SIGPLAN Notices},
-  volume={43},
-  number={6},
+  booktitle={Proceedings of the 29th ACM SIGPLAN Conference on Programming Language Design and Implementation (PLDI)},
   pages={68--78},
   year={2008},
-  publisher={ACM New York, NY, USA}
+  publisher={ACM}
 }
 
 @misc{rayon2019,
@@ -185,19 +191,19 @@
 @inproceedings{georges2007,
   title={Statistically rigorous java performance evaluation},
   author={Georges, Andy and Buytaert, Dries and Eeckhout, Lieven},
-  journal={ACM SIGPLAN Notices},
-  volume={42},
-  number={10},
+  booktitle={Proceedings of the 22nd Annual ACM SIGPLAN Conference on Object-Oriented Programming, Systems, Languages, and Applications (OOPSLA)},
   pages={57--76},
   year={2007},
-  publisher={ACM New York, NY, USA}
+  publisher={ACM}
 }
 
 @book{zeromq2013,
-  title={ZeroMQ: messaging for many applications},
+  title={ZeroMQ: Messaging for Many Applications},
   author={Hintjens, Pieter},
   year={2013},
-  publisher={" O'Reilly Media, Inc."}
+  publisher={O'Reilly Media},
+  edition = {2nd},
+  address = {Sebastopol, CA}
 }
 
 @misc{posixipc_pkg,
@@ -205,5 +211,45 @@
   title = {posix\_ipc: POSIX IPC for Python},
   howpublished = {\url{https://github.com/osvenskan/posix_ipc}},
   year = {2023}
+}
+
+@misc{python_multiprocessing,
+  author = {{Python Software Foundation}},
+  title = {{multiprocessing --- Process-based Parallelism --- Python Documentation}},
+  howpublished = {\url{https://docs.python.org/3/library/multiprocessing.html}},
+  year = {2026},
+  note = {Online; accessed May 2026}
+}
+
+@misc{zeromq_guide,
+  author = {Hintjens, Pieter},
+  title = {{ZeroMQ --- The Guide}},
+  howpublished = {\url{https://zguide.zeromq.org/}},
+  year = {2026},
+  note = {Online; accessed May 2026}
+}
+
+@misc{pyzmq,
+  author = {{PyZMQ Contributors}},
+  title = {{PyZMQ --- Python Bindings for ZeroMQ}},
+  howpublished = {\url{https://pyzmq.readthedocs.io/}},
+  year = {2026},
+  note = {Online; accessed May 2026}
+}
+
+@misc{arrow_plasma,
+  author = {{Apache Arrow Contributors}},
+  title = {{Plasma In-Memory Object Store}},
+  howpublished = {\url{https://arrow.apache.org/docs/python/plasma.html}},
+  year = {2022},
+  note = {Deprecated in Arrow 10.0 (2022), removed in Arrow 12.0 (2023)}
+}
+
+@misc{arrow_flight,
+  author = {{Apache Arrow Contributors}},
+  title = {{Arrow Flight RPC}},
+  howpublished = {\url{https://arrow.apache.org/docs/format/Flight.html}},
+  year = {2026},
+  note = {Online; accessed May 2026}
 }
 

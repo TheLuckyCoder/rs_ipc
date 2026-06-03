@@ -324,7 +324,7 @@ Conference paper: "Accelerating Intelligent Vehicle Vision: A Hybrid Python-Rust
 ### What Still Needs Writing
 
 - [x] Chapter 2: Foundations and Requirements
-- [ ] Chapter 3: Related Work (ZeroMQ, nanomsg, ipc-channel, Cap'n Proto, multiprocessing alternatives)
+- [x] Chapter 3: Related Work (ZeroMQ, nanomsg, ipc-channel, Cap'n Proto, multiprocessing alternatives)
 - [x] Chapter 4: Architecture & Implementation (written 2026-05-27; figures done as TikZ)
 - [x] Chapter 5: Performance Evaluation
 - [ ] Chapter 6: Conclusions

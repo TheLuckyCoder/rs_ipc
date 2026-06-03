@@ -45,21 +45,15 @@ By implementing the performance-critical components in Rust and exposing them th
 \bigskip
 \section{Contributions}
 
-The primary contributions of this thesis are:
+This thesis makes the following contributions:
 
 \begin{enumerate}
-    \item \textbf{SharedMessage abstraction}: A cache-aligned shared memory data structure with bit-packed atomic fields for efficient producer-consumer communication.
+    \item \textbf{A shared memory read/write protocol with lock-free version checking and configurable delivery guarantees}: A cache-aligned \texttt{SharedMessage} data structure coordinates producers and consumers through bit-packed atomic fields, enabling readers to detect and access new data without acquiring any mutex. A configurable blocking policy allows the writer to overwrite immediately, wait for a subset of consumers, or wait for all registered readers---selected at construction time without application code changes (Chapter~\ref{chap:ch4}).
 
-    \item \textbf{Futex-based synchronization primitives}: Custom mutex and condition variable implementations using raw futex system calls, avoiding pthread FFI overhead.
+    \item \textbf{Python integration enabling zero-copy shared memory access with safe GIL release}: PyO3 bindings expose the protocol to Python with the GIL released during all blocking operations. RAII guards implement both the buffer protocol and a file-like interface, enabling \texttt{pickle} serialization directly into shared memory. Asynchronous operation modes decouple the Python caller from IPC blocking entirely (Chapter~\ref{chap:ch4}).
 
-    \item \textbf{Partial-blocking communication}: A novel blocking strategy where producers wait for a configurable subset of consumers, balancing throughput and consistency.
-
-    \item \textbf{Asynchronous operation modes with safe GIL release}: Background threads for non-blocking read and write operations, with demonstrated techniques for releasing Python's GIL during Rust operations while maintaining memory safety.
-
-    \item \textbf{Comprehensive benchmarking}: Performance evaluation comparing against six alternative backends---including ZeroMQ and POSIX IPC---across four communication topologies, with statistical methodology based on multiple independent trials.
+    \item \textbf{Empirical evaluation across six IPC backends and four communication topologies}: A benchmarking methodology based on multiple independent trials with warmup iterations compares \texttt{rs\_ipc} against ZeroMQ, POSIX IPC, and Python's \texttt{multiprocessing} primitives across latency, scalability, contention, and payload-size scenarios (Chapter~\ref{chap:ch5}).
 \end{enumerate}
-
-The \texttt{rs\_ipc} library originated in a conference paper~\cite{szilagyi2025accelerating} that introduced the initial SharedMessage specification and validated it on a 1:10 scale autonomous vehicle. The present thesis makes three novel contributions beyond the conference paper: (1) redesigned synchronization primitives---replacing the mutex-associated condition variable with a standalone counter-based design that enables lock-free reader waits, and switching from the \texttt{linux-futex} crate to direct syscalls via \texttt{rustix} for full spin-then-block control; (2) a partial-blocking communication policy that enables runtime-configurable producer-consumer delivery guarantees; and (3) a comprehensive performance evaluation against six alternative backends with statistical methodology. Additionally, the thesis introduces engineering improvements including a redesigned cache-aligned memory layout, bit-packed atomic coordination fields, asynchronous operation modes, and safe GIL release patterns for Python integration.
 
 \bigskip
 \section{Thesis Structure}

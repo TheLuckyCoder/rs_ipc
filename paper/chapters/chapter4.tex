@@ -14,7 +14,7 @@ The design pursues five goals:
 \begin{enumerate}
     \item \textbf{Zero-copy data access}: Processes read and write directly to the shared memory region. No intermediate buffers or kernel-mediated copies are required for the data transfer itself.
 
-    \item \textbf{Lock-free reader path}: Readers detect new messages and begin accessing data without acquiring any mutex. Multiple readers operate concurrently without serialization.
+    \item \textbf{Mutex-free reader path}: Readers detect new messages and access data without acquiring any mutex. Multiple readers operate concurrently; the version-checking step is lock-free in the formal sense (system-wide progress guaranteed), while blocking waits on the condvar suspend the reader when no data is available.
 
     \item \textbf{Flexible blocking strategies}: The writer's willingness to wait for consumers is configurable per-channel: non-blocking (overwrite immediately), partial-blocking (wait for $n$ readers), or full-blocking (wait for all registered readers).
 
@@ -192,8 +192,7 @@ The initial implementation accompanying the conference paper~\cite{szilagyi2025a
 Table~\ref{tab:paper_vs_current} summarizes the architectural changes and their motivations.
 
 The conference paper's Rust implementation already employed futex-based synchronization; however, it relied on the \texttt{linux-futex} crate and used a mutex-associated condition variable modeled after the standard library's \texttt{Condvar}---requiring readers to acquire the mutex before waiting.
-The current design replaces this with direct futex syscalls via \texttt{rustix} and a standalone counter-based condition variable (Section~\ref{subsec:shared_condvar}) that enables readers to wait without holding any lock.
-This eliminates the reader--writer mutex contention that previously serialized blocking reads, while the 4-byte inline primitives retain the zero-initialization property and require no external lifecycle management.
+The current design replaces this with direct futex syscalls via \texttt{rustix} and a standalone counter-based condition variable (Section~\ref{subsec:shared_condvar}) that decouples reader waits from the writer mutex.
 
 \begin{table}[!ht]
     \centering
@@ -210,7 +209,7 @@ This eliminates the reader--writer mutex contention that previously serialized b
         \hline
         Write-in-progress & Not signaled & Bit 62 of sequence word & Readers detect in-progress writes without acquiring the mutex; enables lock-free read path \\
         \hline
-        Condition variable & Mutex-associated (requires lock to wait) & Counter-based (mutex-free wait) & Readers wait for new data without acquiring any lock \\
+        Condition variable & Mutex-associated (requires lock to wait) & Counter-based (mutex-free wait) & Eliminates reader--writer lock contention on the wait path \\
         \hline
         Blocking policy & Hard-coded in logic & Explicit \texttt{target\_read} field in shared memory & Runtime-configurable per-instance policy \\
         \hline
@@ -380,7 +379,7 @@ The protocol achieves lock-free reader access through three key mechanisms:
 
 \textbf{Ticket-based wait} (line~2): The condvar ticket is read \emph{before} checking the sequence number. If a writer publishes between the ticket read (line~2) and the wait call (line~8), the condvar counter will have been incremented, the wait will return immediately, and the loop retries with the new sequence number visible. This ordering eliminates the lost-wakeup race described in Section~\ref{subsec:shared_condvar}.
 
-\textbf{Single-word state query} (line~3): A single Acquire load of \texttt{sequence\_and\_flags} retrieves the sequence number, writing-in-progress flag, and stopped flag atomically. This is the lock-free version-checking mechanism referenced in Chapter~\ref{chap:ch5}: readers poll this field without any lock, and multiple readers executing line~3 concurrently impose no serialization on each other. This pattern resembles the SeqLock~\cite{lameter2005seqlock} used in the Linux kernel for read-mostly data, but provides stronger consistency: where a SeqLock permits the writer to proceed regardless of readers---readers detect conflicts and retry---the \texttt{SharedMessage} protocol registers reader presence via CAS, preventing the writer from modifying data that readers are actively consuming.
+\textbf{Single-word state query} (line~3): A single Acquire load of \texttt{sequence\_and\_flags} retrieves the sequence number, writing-in-progress flag, and stopped flag atomically. Multiple readers executing line~3 concurrently impose no serialization on each other---this is the lock-free version check enabled by the bit-packing described in Section~\ref{subsec:packed_fields}. The pattern resembles the SeqLock~\cite{lameter2005seqlock} used in the Linux kernel for read-mostly data, but with an inverted conflict-resolution strategy: a SeqLock permits concurrent writes (readers detect torn reads via sequence mismatch and retry), whereas the SharedMessage protocol prevents torn reads entirely by blocking the writer until active readers release their guards. This eliminates reader-side retries at the cost of writer-side blocking proportional to the slowest reader.
 
 \textbf{Register-then-verify} (lines 13--18): The reader increments \texttt{active\_readers} via a CAS operation (registering its intent to access the payload), then re-checks the state~\cite{lamport1977}. If a writer set the WIP flag or changed the sequence between the initial check (line~3) and the verification (line~14), the reader unregisters and retries. This double-check pattern prevents a race where the reader would access a buffer being actively modified. The window between lines 13 and 14 is the only point where a reader's registration could block a writer; this window is bounded by a single atomic load.
 
