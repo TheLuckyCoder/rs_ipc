@@ -1,0 +1,17 @@
+[project]
+name = "rs-ipc-bench"
+version = "0.1.0"
+description = "IPC benchmark suite for rs_ipc"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy",
+    "pandas",
+    "matplotlib",
+    "seaborn",
+]
+
+[project.optional-dependencies]
+zeromq  = ["pyzmq"]
+posix   = ["posix_ipc"]
+
+# rs-ipc — typically built from ../Cargo.toml and installed via `pip install -e ..` or by using 'maturin develop -r'
