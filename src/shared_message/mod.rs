@@ -10,6 +10,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 mod guard;
 mod packed;
 
+#[cfg(test)]
+mod tests;
+
 pub use guard::*;
 
 pub(crate) type PayloadWriteGuard<'a> = SharedMutexGuard<'a, ()>;
@@ -144,6 +147,7 @@ impl SharedMessage {
         &data[..size]
     }
 
+    #[allow(clippy::mut_from_ref)]
     pub(crate) fn data_mut(&self, _write_guard: &PayloadWriteGuard) -> &mut [u8] {
         // SAFETY: This is safe because:
         // 1. The writer mutex ensures only one writer accesses this at a time

@@ -129,7 +129,7 @@ class RsIpcBackend(IpcBackend):
             policy = ReaderWaitPolicy.Count(1)
         else:
             policy = ReaderWaitPolicy.Count(num_readers)
-        self._coordinator_handle = SharedMessage.create(name, size, OperationMode.CreateOnly, policy)
+        self._coordinator_handle = SharedMessage.create(name, OperationMode.CreateOnly, policy)
 
     def get_worker_args(self) -> Dict[str, Any]:
         return {"name": self.name}

@@ -20,7 +20,7 @@ impl SequenceState {
     }
 
     #[inline]
-    pub(crate) fn to_packed(&self) -> u64 {
+    pub(crate) fn to_packed(self) -> u64 {
         ((self.stopped as u64) << 63)
             | ((self.writing_in_progress as u64) << 62)
             | self.sequence & Self::SEQUENCE_MASK
@@ -36,7 +36,9 @@ pub(crate) struct ReadersStateCount {
 }
 
 impl ReadersStateCount {
+    #[allow(clippy::erasing_op)]
     const TARGET_SHIFT: u32 = u16::BITS * 0;
+    #[allow(clippy::identity_op)]
     const CONSUMERS_SHIFT: u32 = u16::BITS * 1;
     const ACTIVE_SHIFT: u32 = u16::BITS * 2;
     const CONSUMED_SHIFT: u32 = u16::BITS * 3;

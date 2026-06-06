@@ -7,6 +7,9 @@ use std::ops::Deref;
 use std::os::fd::OwnedFd;
 use std::ptr::NonNull;
 
+/// # Safety
+/// Implementors must ensure `cast_from_void_ptr` only returns `Some` when the
+/// pointer and size describe a valid, properly-aligned region for `Self`.
 pub unsafe trait SlicePtrCast {
     /// # Safety
     /// - `ptr` and `memory_size` must refer to a mapping that is valid for Self's layout.

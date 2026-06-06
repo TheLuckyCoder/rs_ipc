@@ -14,6 +14,9 @@ mod operation_mode;
 mod queue_data;
 mod reader_wait_policy;
 
+#[cfg(test)]
+mod tests;
+
 #[pymodule(gil_used = false)]
 fn rs_ipc(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<OperationMode>()?;
