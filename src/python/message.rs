@@ -10,7 +10,7 @@ use pyo3::types::{PyBytes, PyBytesMethods};
 use pyo3::{Bound, PyResult, Python, pyclass, pymethods};
 use std::ffi::CString;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 
@@ -26,12 +26,13 @@ pub struct PythonSharedMessage {
     receiver: Mutex<Option<Receiver<ReceiverQueueData>>>,
 }
 
+static MAX_CAPACITY_BYTES: AtomicUsize = AtomicUsize::new(1024 * 1024 * 1024);
+
 #[pymethods]
 impl PythonSharedMessage {
     #[staticmethod]
     fn create(
         name: String,
-        size: NonZeroUsize,
         mode: OperationMode,
         reader_wait_policy: ReaderWaitPolicy,
     ) -> PyResult<Self> {
@@ -41,7 +42,7 @@ impl PythonSharedMessage {
 
         let c_name = CString::new(name.clone())?;
         let shared_memory =
-            SharedMessageMapper::create(c_name, SharedMessage::size_of_fields() + size.get())?;
+            SharedMessageMapper::create(c_name, SharedMessage::size_of_fields() + MAX_CAPACITY_BYTES.load(Ordering::Relaxed))?;
 
         shared_memory.set_target_read_count(reader_wait_policy.to_count());
 
@@ -61,6 +62,11 @@ impl PythonSharedMessage {
         let shared_memory = SharedMessageMapper::open(c_name)?;
 
         Ok(Self::new(shared_memory, name, mode))
+    }
+
+    #[staticmethod]
+    fn set_max_capacity(capacity_mb: NonZeroUsize) {
+        MAX_CAPACITY_BYTES.store(capacity_mb.get() * 1024 * 1024, Ordering::Relaxed);
     }
 
     fn write(&self, data: Bound<'_, PyBytes>) -> PyResult<Option<u64>> {
@@ -310,11 +316,8 @@ impl Drop for PythonSharedMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::num::NonZero;
     use std::thread;
     use std::time::Duration;
-
-    const DEFAULT_SIZE: usize = 1024 * 1024;
 
     fn get_test_data() -> Vec<u8> {
         let mut data = vec![0u8; 1024 * 100]; // 100 KB
@@ -329,13 +332,7 @@ mod tests {
         op_mode: OperationMode,
         reader_wait_policy: ReaderWaitPolicy,
     ) -> PythonSharedMessage {
-        PythonSharedMessage::create(
-            name.to_string(),
-            NonZero::new(DEFAULT_SIZE).unwrap(),
-            op_mode,
-            reader_wait_policy,
-        )
-        .unwrap()
+        PythonSharedMessage::create(name.to_string(), op_mode, reader_wait_policy).unwrap()
     }
 
     #[test]

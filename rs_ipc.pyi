@@ -140,7 +140,6 @@ class SharedMessage:
     @staticmethod
     def create(
             name: str,
-            size: int,
             mode: OperationMode,
             reader_wait_policy: Union[ReaderWaitPolicy.All, ReaderWaitPolicy.Count]
     ) -> "SharedMessage":
@@ -148,9 +147,17 @@ class SharedMessage:
         Create a new shared memory segment.
 
         :param name: The name of the shared memory file.
-        :param size: The size of the payload buffer (cannot be 0).
         :param mode: The operation mode for this instance.
         :param reader_wait_policy: The policy for waiting on readers.
+        """
+        ...
+
+    @staticmethod
+    def set_max_capacity(capacity_mb: int) -> None:
+        """
+        Set the maximum payload capacity for all future SharedMessage instances.
+
+        :param capacity_mb: Maximum payload capacity in megabytes (cannot be 0). Defaults to 1024 MB.
         """
         ...
 
