@@ -12,12 +12,12 @@ Python's \texttt{multiprocessing} module provides three IPC mechanisms out of th
 \subsection{Queue and Pipe}
 \label{subsec:queue_pipe}
 
-\texttt{multiprocessing.Queue} is built atop \texttt{multiprocessing.Pipe} with the addition of a feeder thread and a reentrant lock for thread safety. When created with \texttt{duplex=False} (the default for Queue's internal pipe), \texttt{Pipe} wraps a unidirectional OS pipe created via \texttt{os.pipe()}; the duplex variant uses a Unix domain socket pair instead. In either case, every message traverses the kernel. The data path for a Queue message is:
+\texttt{multiprocessing.Queue} is built atop \texttt{multiprocessing.Pipe} with the addition of a feeder thread and a lock for thread safety. When created with \texttt{duplex=False} (the default for Queue's internal pipe), \texttt{Pipe} wraps a unidirectional OS pipe created via \texttt{os.pipe()}; the duplex variant uses a Unix domain socket pair instead. In either case, every message traverses the kernel. The data path for a Queue message is:
 
 \begin{enumerate}
-    \item The sender serializes the object using \texttt{pickle} (holding the GIL throughout).
-    \item The serialized bytes are placed into an internal buffer and handed to the feeder thread.
-    \item The feeder thread writes the bytes into the underlying OS pipe.
+    \item The sender enqueues the Python object into an internal buffer.
+    \item A background feeder thread serializes the object using \texttt{pickle} (holding the GIL throughout).
+    \item The feeder thread writes the serialized bytes into the underlying OS pipe.
     \item The kernel copies the data from the sender's address space into its internal pipe buffer.
     \item The receiver reads from the pipe, causing a second kernel copy into its address space.
     \item The receiver deserializes the bytes back into a Python object (again holding the GIL).
@@ -46,9 +46,7 @@ The benchmarks in Chapter~\ref{chap:ch5} use \texttt{posix\_ipc} with a protocol
 
 \subsection{Synchronization via Named Semaphores}
 
-Named POSIX semaphores are kernel-managed objects. Each \texttt{sem\_wait} and \texttt{sem\_post} operation is a system call regardless of contention state, unlike futex-based locks which avoid the kernel on the uncontended fast path (Section~\ref{sec:futex}). On Linux, glibc's semaphore implementation uses futexes internally, whose wait queue provides approximately FIFO wakeup ordering. This contributes to the low latency variance observed in the benchmark results.
-
-Because the kernel manages the wait queue directly, wakeup latency is bounded by the scheduler's response time rather than by contention-dependent spin durations.
+Named POSIX semaphores are kernel-managed objects. The POSIX specification defines \texttt{sem\_wait} and \texttt{sem\_post} without mandating a userspace fast path, so a naive implementation would require a system call per operation. On Linux, glibc implements POSIX semaphores using futexes internally, providing a userspace fast path for uncontended operations (analogous to the mechanism described in Section~\ref{sec:futex}). The kernel-managed futex wait queue provides approximately FIFO wakeup ordering among concurrent waiters.
 
 \subsection{Strengths}
 
@@ -61,11 +59,11 @@ Several limitations emerge when scaling beyond the simple case:
 \begin{itemize}
     \item \textbf{No multi-reader scalability.} Signaling $N$ readers that new data is available requires $N$ semaphore posts---$N$ system calls per message. There is no broadcast mechanism analogous to a condition variable's \texttt{notify\_all}.
 
-    \item \textbf{No lock-free coordination paths.} Although glibc's POSIX semaphore implementation uses futexes internally (avoiding kernel entry on uncontended operations), the signaling model still requires one \texttt{sem\_post} call per reader per message---$N$ system calls under contention when all $N$ readers are blocked. The rs\_ipc condvar broadcasts to all waiters with a single \texttt{futex\_wake\_all}, regardless of reader count.
+    \item \textbf{Linear notification cost.} Although glibc's POSIX semaphore implementation uses futexes internally (avoiding kernel entry on uncontended operations), the signaling model still requires one \texttt{sem\_post} call per reader per message---$N$ system calls under contention when all $N$ readers are blocked. The rs\_ipc condvar broadcasts to all waiters with a single \texttt{futex\_wake\_all}, regardless of reader count.
 
     \item \textbf{Python overhead for protocol logic.} Header manipulation (packing sequence numbers, checking sizes) occurs in interpreted Python. While negligible for large payloads, this overhead becomes proportionally significant for small messages or high-frequency polling.
 
-    \item \textbf{Resource persistence.} Named semaphores and shared memory objects persist in the filesystem namespace after process termination unless explicitly unlinked. Abnormal termination (crashes, SIGKILL) leaves orphaned resources in \texttt{/dev/shm} that must be cleaned manually.
+    \item \textbf{Resource persistence.} Named semaphores and shared memory objects persist in the filesystem namespace after process termination unless explicitly unlinked. Abnormal termination (crashes, SIGKILL) leaves orphaned resources in \texttt{/dev/shm} that must be cleaned manually---a limitation inherent to POSIX shared memory rather than specific to \texttt{posix\_ipc}'s design (Section~\ref{sec:shared_message} discusses this constraint further).
 \end{itemize}
 
 
@@ -154,6 +152,6 @@ Blocking policy  & Fixed       & N/A         & Fixed       & HWM-based   & Confi
 \end{tabular}
 \end{table}
 
-The table reveals a gap in the existing landscape. Kernel-copy mechanisms (Queue, Pipe, ZeroMQ) provide built-in synchronization and framing but impose unavoidable copy overhead that scales linearly with payload size. The shared memory approaches (\texttt{multiprocessing.shared\_memory}, \texttt{posix\_ipc}) eliminate copies but either lack synchronization entirely or rely on kernel-mediated semaphores without lock-free fast paths.
+The table reveals a gap in the existing landscape. Kernel-copy mechanisms (Queue, Pipe, ZeroMQ) provide built-in synchronization and framing but impose unavoidable copy overhead that scales linearly with payload size. The shared memory approaches (\texttt{multiprocessing.shared\_memory}, \texttt{posix\_ipc}) eliminate copies but either lack synchronization entirely or rely on kernel-mediated semaphores without lock-free reader access or efficient broadcast notification.
 
 The \texttt{rs\_ipc} library occupies the intersection: shared memory for zero-copy data access, futex-based synchronization that avoids the kernel on uncontended paths, lock-free version checking for readers, and a configurable blocking policy that adapts writer behavior to application requirements.

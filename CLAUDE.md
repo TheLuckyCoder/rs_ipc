@@ -281,13 +281,13 @@ Thesis latex file can be found at 'paper/main.tex' and it's chapters at 'paper/c
 | shared memory | shared-memory | No hyphen |
 | futex-based | futex based | Hyphenated as adjective |
 | GIL-free | GIL free | Hyphenated |
-| lock-free version checking | lock-free IPC | Only version checking is lock-free; read/write uses mutex |
+| lock-free read path | lock-free IPC | The entire read path is lock-free (atomics + CAS only); only the write path acquires a mutex |
 | partial-blocking | partial blocking | Hyphenated as adjective |
 | PyO3 | pyo3, Pyo3 | Official capitalization |
 
 ### Claims to Avoid
 
-- **"Lock-free synchronization"** — Misleading. Only version checking & multiple readers at once avoid locks; actual read/write acquires the FutexLock mutex.
+- **"Lock-free synchronization"** — Partially misleading. The entire read path is lock-free (atomic loads + CAS, no mutex). Only the write path acquires the FutexLock mutex. Say "lock-free read path" not "lock-free IPC."
 - **"Zero overhead"** — There's always some overhead (futex syscalls, PyO3 FFI). Say "minimal overhead" or "reduced overhead."
 - **"Real-time guarantees"** — We don't provide hard real-time guarantees. Say "low-latency" or "suitable for real-time applications."
 

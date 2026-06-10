@@ -64,7 +64,7 @@ The \texttt{SharedMemoryMapper<T>} structure provides a type-safe, RAII-managed 
 
 Two construction paths are provided. The \texttt{create} path opens a new shared memory object with \texttt{O\_CREAT | O\_RDWR | O\_TRUNC}, sizes it, and maps it into the process address space. The \texttt{open} path opens an existing named object (without truncation) and maps it using the size reported by \texttt{fstat}. Both paths invoke \texttt{mmap} with the \texttt{MAP\_SHARED\_VALIDATE} flag, which ensures the kernel validates the mapping flags rather than silently ignoring unsupported options. An \texttt{madvise} call with \texttt{MADV\_HUGEPAGE} requests transparent huge page backing for large mappings, though as discussed in Section~\ref{sec:shm}, this hint is advisory and unreliable for short-lived shared memory regions.
 
-The structure maintains a boolean \texttt{created} flag that distinguishes creators from openers. On drop, both roles invoke \texttt{munmap} to release the virtual address mapping, but only the creator calls \texttt{shm\_unlink} to remove the named object from the filesystem, ensuring that the region persists for the lifetime of the creator process while preventing resource leaks when the creator exits.
+The structure maintains a boolean \texttt{created} flag that distinguishes creators from openers. On drop, both roles invoke \texttt{munmap} to release the virtual address mapping, but only the creator calls \texttt{shm\_unlink} to remove the named object from the filesystem, ensuring that the region persists for the lifetime of the creator process while preventing resource leaks when the creator exits. This cleanup depends on normal process termination; abnormal termination via \texttt{SIGKILL} or \texttt{SIGABRT} bypasses the \texttt{Drop} handler, leaving the shared memory object in \texttt{/dev/shm} until manual removal or system reboot---the same inherent POSIX shared memory limitation discussed for \texttt{posix\_ipc} in Section~\ref{sec:posix_ipc}.
 
 \texttt{SharedMemoryMapper} is generic over \texttt{T:~SlicePtrCast}, a trait that defines how to construct a typed reference from a raw \texttt{void} pointer returned by \texttt{mmap}. The trait's single method, \texttt{cast\_from\_void\_ptr}, receives the raw pointer and the total mapping size, verifies alignment requirements, decomposes the region into a fixed-size header and a variable-length payload, and constructs a Rust fat pointer (pointer plus length metadata) for the dynamically-sized type. The separation of mapping from interpretation allows the same mapper to host different shared memory layouts.
 
@@ -82,7 +82,7 @@ This section describes the two primitives that coordinate access to the shared m
 
 The writer mutex serializes concurrent writers to a shared message slot. Its implementation follows the three-state futex lock pattern described in Section~\ref{sec:futex}, closely mirroring Rust's standard library \texttt{std::sync::Mutex}~\cite{drepper2005}. The spin phase performs 100 relaxed loads before falling back to \texttt{futex\_wait}.
 
-The lock is wrapped in a \texttt{SharedMutex<T>} abstraction that pairs the 4-byte futex with an \texttt{UnsafeCell<T>}, providing interior mutability under the lock's protection. Locking returns an RAII guard (\texttt{SharedMutexGuard}) that automatically unlocks on drop, preventing accidental deadlocks from early returns or panics. Because futex unlock is a simple atomic swap without thread-identity verification, the guard can safely be sent to and dropped from a different thread than the one that acquired it---unlike POSIX mutex semantics, where unlocking from a non-owning thread is undefined behavior~\cite{posix2017}.
+The lock is wrapped in a \texttt{SharedMutex<T>} abstraction that pairs the 4-byte futex with an \texttt{UnsafeCell<T>}, providing interior mutability under the lock's protection. Locking returns an RAII guard (\texttt{SharedMutexGuard}) that automatically unlocks on drop, preventing accidental deadlocks from early returns or panics. Because futex unlock is a simple atomic swap without thread-identity verification, the guard can be sent to and dropped from a different thread than the one that acquired it---a property the asynchronous write mode (Section~\ref{subsec:async_modes}) exploits by transferring the write guard to a background thread---unlike POSIX mutex semantics, where unlocking from a non-owning thread is undefined behavior~\cite{posix2017}.
 
 \subsection{Shared Condition Variable}
 \label{subsec:shared_condvar}
@@ -97,7 +97,7 @@ The condition variable consists of a single 32-bit atomic integer serving as a n
     \item \texttt{notify\_all()}: Increments the counter with Release ordering and wakes all waiters via \texttt{futex\_wake\_all}.
 \end{itemize}
 
-Lost wakeups are prevented through a ticket mechanism. Before entering a state where a notification might be missed, the caller reads the current counter value (the ``ticket''). After releasing the lock, the caller passes this ticket to \texttt{wait}. If a \texttt{notify\_all} was issued between the ticket read and the \texttt{wait} call, the counter will have already been incremented, the comparison with \texttt{expected} will fail immediately, and the wait returns without blocking, eliminating the classic lost-wakeup race without requiring the condition variable to atomically release an associated mutex.
+Lost wakeups are prevented through a ticket mechanism. Before entering a state where a notification might be missed, the caller reads the current counter value (the ``ticket'') and subsequently passes it to \texttt{wait}. If a \texttt{notify\_all} was issued between the ticket read and the \texttt{wait} call, the counter will have already been incremented, the comparison with \texttt{expected} will fail immediately, and the wait returns without blocking, eliminating the classic lost-wakeup race without requiring the condition variable to atomically release an associated mutex.
 
 The \texttt{wait} implementation employs a two-phase strategy: it first spins for 1000 iterations checking the counter with Relaxed ordering and a \texttt{spin\_loop} hint, then falls back to \texttt{futex\_wait} if the counter remains unchanged. The spin phase absorbs short delays (notifications that arrive within microseconds of the wait call) without incurring the cost of a system call and subsequent scheduler-mediated wakeup.
 
@@ -213,7 +213,7 @@ The current design replaces this with direct futex syscalls via \texttt{rustix} 
         \hline
         Blocking policy & Hard-coded in logic & Explicit \texttt{target\_read} field in shared memory & Runtime-configurable per-instance policy \\
         \hline
-        Reader coordination & Writer holds mutex during read drain & CAS-based \texttt{active\_readers} tracking & Writer only blocks until readers finish; readers proceed lock-free in parallel \\
+        Reader coordination & Readers acquire mutex to coordinate access & CAS-based \texttt{active\_readers} tracking (readers never acquire mutex) & Writer only blocks until readers finish; readers proceed lock-free in parallel \\
         \hline
     \end{tabular}
 \end{table}
@@ -258,7 +258,7 @@ The packing of \texttt{SequenceState} enables the lock-free version-checking mec
 
 The sequence counter uses value~0 as a sentinel indicating that no message has been written: the counter is initialized to zero and advances to~1 on the first publish. The write protocol (Algorithm~\ref{alg:write}, line~6) relies on this invariant to distinguish a fresh channel from one with unconsumed data. On overflow past $2^{62} - 1$, the counter wraps to~1 rather than~0, preserving the sentinel. At one message per microsecond, wraparound would occur after approximately 146{,}000~years.
 
-\texttt{ReadersStateCount} packs four u16 fields into a single \texttt{AtomicU64}, updated via a compare-and-swap (CAS) retry loop. A helper function determines the effective blocking threshold by computing the minimum of \texttt{target\_read} and \texttt{consumers}: if fewer readers are registered than the target, the writer waits only for those that exist.
+\texttt{ReadersStateCount} packs four u16 fields into a single \texttt{AtomicU64}, updated via a compare-and-swap (CAS) retry loop. A helper function determines the effective blocking threshold by computing the minimum of \texttt{target\_read} and \texttt{consumers}: if fewer readers are registered than the target, the writer waits only for those that exist. The \texttt{consumers} field is incremented when a reader opens the channel (during construction) and decremented when it closes (during destruction), tracking the number of registered participants independently of the per-message \texttt{active\_readers} and \texttt{data\_consumed} counters that are modified during individual read operations.
 
 \subsection{Safety Invariants}
 \label{subsec:safety}
@@ -294,7 +294,8 @@ Algorithm~\ref{alg:write} presents the write protocol. The numbered annotations 
     \State \textbf{acquire} writer\_mutex \Comment{Serialize concurrent writers}
     \State $ticket \gets$ reader\_done\_condvar.value()
     \State $state \gets$ \textsc{LoadAcquire}(readers\_state)
-    \If{$state.\text{target\_consumed} > 0$ \textbf{and} current\_sequence $> 0$}
+    \State $current\_sequence \gets$ \textsc{LoadAcquire}(sequence\_and\_flags).\text{sequence}
+    \If{$state.\text{target\_consumed} > 0$ \textbf{and} $current\_sequence > 0$}
         \While{$state.\text{data\_consumed} < state.\text{target\_consumed}$}
             \State writer\_condvar.notify\_all() \Comment{Wake slow readers}
             \State reader\_done\_condvar.wait($ticket$)
@@ -379,7 +380,7 @@ The protocol achieves lock-free reader access through three key mechanisms:
 
 \textbf{Ticket-based wait} (line~2): The condvar ticket is read \emph{before} checking the sequence number. If a writer publishes between the ticket read (line~2) and the wait call (line~8), the condvar counter will have been incremented, the wait will return immediately, and the loop retries with the new sequence number visible. This ordering eliminates the lost-wakeup race described in Section~\ref{subsec:shared_condvar}.
 
-\textbf{Single-word state query} (line~3): A single Acquire load of \texttt{sequence\_and\_flags} retrieves the sequence number, writing-in-progress flag, and stopped flag atomically. Multiple readers executing line~3 concurrently impose no serialization on each other---this is the lock-free version check enabled by the bit-packing described in Section~\ref{subsec:packed_fields}. The pattern resembles the SeqLock~\cite{lameter2005seqlock} used in the Linux kernel for read-mostly data, but with an inverted conflict-resolution strategy: a SeqLock permits concurrent writes (readers detect torn reads via sequence mismatch and retry), whereas the SharedMessage protocol prevents torn reads entirely by blocking the writer until active readers release their guards. This eliminates reader-side retries at the cost of writer-side blocking proportional to the slowest reader.
+\textbf{Single-word state query} (line~3): A single Acquire load of \texttt{sequence\_and\_flags} retrieves the sequence number, writing-in-progress flag, and stopped flag atomically. Multiple readers executing line~3 concurrently impose no serialization on each other---this is the lock-free version check enabled by the bit-packing described in Section~\ref{subsec:packed_fields}. The pattern resembles the SeqLock~\cite{lameter2005seqlock} used in the Linux kernel for read-mostly data, but with an inverted conflict-resolution strategy: a SeqLock permits reads to proceed concurrently with a write (readers detect torn reads via sequence mismatch and retry), whereas the SharedMessage protocol prevents torn reads entirely by blocking the writer until active readers release their guards. This eliminates reader-side retries at the cost of writer-side blocking proportional to the slowest reader.
 
 \textbf{Register-then-verify} (lines 13--18): The reader increments \texttt{active\_readers} via a CAS operation (registering its intent to access the payload), then re-checks the state~\cite{lamport1977}. If a writer set the WIP flag or changed the sequence between the initial check (line~3) and the verification (line~14), the reader unregisters and retries. This double-check pattern prevents a race where the reader would access a buffer being actively modified. The window between lines 13 and 14 is the only point where a reader's registration could block a writer; this window is bounded by a single atomic load.
 
@@ -503,9 +504,9 @@ The $\sim$20$\times$ difference in lock hold time between copy and zerocopy mode
 \subsection{Parallel and Asynchronous Modes}
 \label{subsec:async_modes}
 
-For pipelines that must read from multiple producers concurrently, the \texttt{read\_all} function releases the GIL and reads from all $N$ shared memory regions in parallel using a Rayon~\cite{rayon2019} work-stealing thread pool. Parallel reading reduces the total blocking time from the sum of individual read latencies to the maximum, which is significant when synchronizing data from multiple independent sensors arriving at slightly different times.
+For pipelines that must read from multiple producers concurrently, the \texttt{read\_all} function releases the GIL and reads from all $N$ shared memory regions in parallel using a Rayon~\cite{rayon2019} work-stealing thread pool. Parallel reading reduces the total latency from the sum of individual read durations to the maximum, which is significant when synchronizing data from multiple independent sensors arriving at slightly different times.
 
-For applications where the Python main thread cannot afford to block (event-loop-driven GUI applications, real-time control loops), the library provides asynchronous operation modes.
+For applications where the Python main thread cannot afford to block (event-loop-driven GUI applications, latency-sensitive control loops), the library provides asynchronous operation modes.
 
 \textbf{WriteAsync}: On the first write call, the library spawns a dedicated background thread connected to the Python-facing object via an unbounded channel. Subsequent \texttt{write(data)} calls enqueue the payload into the channel and return immediately. The background thread dequeues messages and executes \texttt{write\_slice}, blocking as dictated by the \texttt{ReaderWaitPolicy}.
 
@@ -514,7 +515,7 @@ The interaction between \texttt{WriteAsync} and the blocking policy produces two
 \begin{itemize}
     \item With \texttt{Count(0)}, the background thread writes rapidly (no waiting for readers), the channel drains quickly, and the shared memory buffer always contains the most recent value. Slow readers skip intermediate messages. The system behaves as a \emph{latest-value publisher}.
 
-    \item With \texttt{All()} or \texttt{Count($n$)}, the background thread blocks per-message until the required readers consume. If the producer enqueues faster than readers consume, the unbounded channel accumulates messages, and every message is eventually delivered in order. The system behaves as a \emph{reliable FIFO queue}.
+    \item With \texttt{All()} or \texttt{Count($n$)}, the background thread blocks per-message until the required readers consume. If the producer enqueues faster than readers consume, the unbounded channel accumulates messages, and every message is eventually delivered in order. The system behaves as an \emph{ordered FIFO queue} (without persistence guarantees).
 \end{itemize}
 
 The same mechanism provides both fire-and-forget streaming and guaranteed delivery, selected entirely through the \texttt{ReaderWaitPolicy} at construction time without any change to application code.
@@ -541,11 +542,11 @@ Table~\ref{tab:tradeoffs} summarizes the trade-offs inherent in each design deci
         \hline
         \textbf{Design choice} & \textbf{Benefit} & \textbf{Cost} \\
         \hline
-        Lock-free reader path & Multiple readers detect and access data concurrently; 2.3$\times$ scalability ratio in 1:10 scenario & Writer must drain active readers before writing, adding latency proportional to the slowest reader \\
+        Lock-free reader path & Multiple readers detect and access data concurrently; 2.3$\times$ latency increase from 1 to 10 readers (1:10 scenario) & Writer must drain active readers before writing, adding latency proportional to the slowest reader \\
         \hline
         Spin-then-block (100/1000 iterations) & Absorbs short waits without syscall overhead & Wastes CPU cycles when wait exceeds spin duration; parameters are heuristic, not adaptive \\
         \hline
-        No fairness guarantee in writer mutex & Higher throughput in the common case (few writers) & Under heavy writer contention, individual writers may starve. Combined with long critical sections (zerocopy pickle): 90.1$\times$ determinism ratio; with short critical sections (copy mode): 1.81$\times$ \\
+        No fairness guarantee in writer mutex & Higher throughput in the common case (few writers) & Under heavy writer contention, individual writers may starve. Combined with long critical sections (zerocopy pickle): 90.1$\times$ p99/p50 ratio; with short critical sections (copy mode): 1.81$\times$ p99/p50 ratio \\
         \hline
         Single slot (not a queue) & Constant memory usage; latest-value semantics for real-time & Slow readers miss intermediate messages; no buffering for bursty producers \\
         \hline

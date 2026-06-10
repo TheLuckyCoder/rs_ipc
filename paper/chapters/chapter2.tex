@@ -37,7 +37,7 @@ When a process accesses a mapped memory region, the CPU translates virtual addre
 
 \subsection{Shared Memory versus Message Passing}
 
-Message-passing mechanisms (pipes, sockets, message queues) handle serialization, buffering, and delivery on behalf of the application, introducing at least one memory copy per transfer. Shared memory eliminates these copies entirely: both processes operate on the same physical memory, achieving true zero-copy semantics.
+Message-passing mechanisms (pipes, sockets, message queues) handle buffering and delivery on behalf of the application---and in Python's \texttt{multiprocessing} module also perform serialization---introducing kernel-mediated copies (typically two per transfer: into and out of the kernel buffer). Shared memory eliminates these copies entirely: both processes operate on the same physical memory, achieving true zero-copy semantics.
 
 The cost of this efficiency is complexity. Shared memory provides no inherent ordering, synchronization, or notification mechanism. The application must explicitly coordinate access to prevent data races, detect when new data is available, and ensure that readers do not observe partially written messages. These requirements motivate the synchronization primitives described in the following section.
 
@@ -45,7 +45,7 @@ The cost of this efficiency is complexity. Shared memory provides no inherent or
 \section{Synchronization and Cache Effects}
 \label{sec:sync}
 
-When multiple processes share a memory region, concurrent access without coordination leads to data races. Correct shared memory IPC requires atomic operations for lock-free state checks, memory ordering constraints to ensure cross-core visibility of writes, and blocking primitives to avoid busy-waiting~\cite{herlihy2012}. Modern hardware provides atomic read-modify-write instructions (compare-and-swap, fetch-and-add) that guarantee indivisible updates to aligned words, and memory ordering semantics (Acquire, Release, SeqCst in the C++11 model~\cite{boehm2008}) that control when stores by one core become visible to loads on another. These form the foundation of the lock-free coordination paths described in Chapter~\ref{chap:ch4}. The blocking primitives---futexes---are covered separately in Section~\ref{sec:futex}; this section focuses on the hardware-level cache effect most relevant to the memory layout decisions.
+When multiple processes share a memory region, concurrent access without coordination leads to data races. Correct shared memory IPC requires atomic operations for lock-free state checks, memory ordering constraints to ensure cross-core visibility of writes, and blocking primitives to avoid busy-waiting~\cite{herlihy2012}. Modern hardware provides atomic read-modify-write instructions (compare-and-swap, fetch-and-add) that guarantee indivisible updates to aligned words, and memory ordering semantics (Acquire, Release, SeqCst in the C++11 model~\cite{boehm2008}) that constrain the order in which stores by one core become observable to loads on another. These form the foundation of the lock-free read paths described in Chapter~\ref{chap:ch4}. The blocking primitives---futexes---are covered separately in Section~\ref{sec:futex}; this section focuses on the hardware-level cache effect most relevant to the memory layout decisions.
 
 \subsection{False Sharing}
 \label{subsec:false_sharing}
@@ -94,7 +94,7 @@ The lock acquisition sequence follows:
     \item Attempt a CAS from state 0 to state 1 (fast path, no syscall).
     \item If the CAS fails, spin briefly with relaxed loads, hoping the lock is released quickly.
     \item If spinning fails, transition the state to 2 (signaling that waiters exist) and call \texttt{futex\_wait}.
-    \item Upon waking, retry acquisition from step 1.
+    \item Upon waking, retry acquisition from step 2 (spin, then attempt the lock in contended state).
 \end{enumerate}
 
 The spin phase (step 2) uses relaxed loads rather than CAS operations to avoid generating cache-line invalidations, reducing coherence traffic when multiple threads contend for the same lock.
@@ -103,7 +103,7 @@ The spin phase (step 2) uses relaxed loads rather than CAS operations to avoid g
 
 Futex wait queues are keyed by physical memory address, not by virtual address or process identity~\cite{franke2002}. Because \texttt{mmap} with \texttt{MAP\_SHARED} causes distinct virtual addresses in separate processes to resolve to identical physical frames, a 32-bit futex variable placed in such a region is inherently cross-process: a \texttt{futex\_wake} issued by the producer resolves to the same kernel wait queue that the consumer's \texttt{futex\_wait} registered against.
 
-Physical-address keying eliminates the initialization complexity of process-shared pthread mutexes: a futex-based lock in shared memory works correctly as soon as the memory is mapped---POSIX mandates that \texttt{ftruncate} zero-fills newly extended shared memory objects, satisfying the zero-initialization requirement---no constructor, no attribute configuration, no shared library dependency. The lock's state is entirely represented by the 4-byte integer, making it relocatable within shared memory.
+Physical-address keying eliminates the initialization complexity of process-shared pthread mutexes: a futex-based lock in shared memory works correctly as soon as the memory is mapped---POSIX mandates that \texttt{ftruncate} zero-fills newly extended shared memory objects, satisfying the zero-initialization requirement---no constructor, no attribute configuration, no shared library dependency. The lock's state is entirely represented by a 4-byte integer, making it position-independent: any naturally aligned 4-byte region in shared memory can serve as a lock with no initialization beyond zero-filling.
 
 \subsection{Comparison with pthread}
 
@@ -152,7 +152,7 @@ The safety invariant is that no Python objects may be accessed (read, written, o
 
 Python 3.13 introduced an experimental build configuration that removes the GIL (PEP~703)~\cite{pep703}, relying instead on biased reference counting and per-object locks. PEP~779~\cite{pep779}, accepted for Python~3.14, elevates free-threading from experimental to officially supported status. However, every C extension must explicitly declare compatibility; extensions that lack this declaration cause the interpreter to silently re-enable the GIL. Given the breadth of Python's extension ecosystem, widespread adoption is expected to require several years.
 
-Crucially, free-threading addresses only \textit{intra-process} parallelism. While shared data structures within a single free-threaded process could replace some IPC use cases, multi-process architectures remain necessary for fault isolation (a crash in one pipeline stage does not terminate the entire system), independent resource limits, and multi-host deployment where shared memory is fundamentally unavailable. The GIL release patterns described in this work remain beneficial even under free-threading: blocking IPC operations must not hold Python-internal per-object locks, and \texttt{py.detach()} continues to serve this purpose regardless of whether a global lock exists.
+Crucially, free-threading addresses only \textit{intra-process} parallelism. While shared data structures within a single free-threaded process could replace some IPC use cases, multi-process architectures remain necessary for fault isolation (a crash in one pipeline stage does not terminate the entire system), independent resource limits, and multi-host deployment where shared memory is fundamentally unavailable. The GIL release patterns described in this work remain beneficial even under free-threading: blocking IPC operations must release the Python thread state so that interpreter-wide operations (stop-the-world garbage collection, biased reference count resolution) can proceed without waiting for the blocked extension thread. \texttt{py.detach()} continues to serve this purpose regardless of whether a global lock exists.
 
 \subsection{Standard Library IPC Limitations}
 

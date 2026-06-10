@@ -5,9 +5,7 @@
 
 Python's Global Interpreter Lock (GIL) prevents multiple threads from executing Python bytecode simultaneously, forcing CPU-bound workloads into a multiprocessing architecture where separate processes must exchange data through inter-process communication. Python's dominance in data-intensive domains---computer vision, machine learning, scientific computing---means these systems frequently require the kind of concurrent, low-latency data transfer that Python's standard library was never designed to provide.
 
-For applications that transfer large payloads---video frames of several megabytes, NumPy tensors, or serialized model states---the performance of this communication layer determines overall system throughput. A vision pipeline processing 30 frames per second at 2.6\,MiB per pipeline message (e.g., multiple sensor arrays per processing stage), for instance, generates over 78\,MiB/s of IPC traffic per producer-consumer pair; with multiple consumers, aggregate bandwidth demands quickly exceed what Python's standard library mechanisms can deliver efficiently.
-
-Yet Python's built-in IPC primitives were designed for generality rather than performance. They impose serialization overhead, redundant memory copies, or require developers to manually implement synchronization over raw shared memory. The gap between what these mechanisms provide and what performance-critical applications require motivates the design of a purpose-built library: one that eliminates unnecessary copies, minimizes synchronization overhead, and exposes flexible producer-consumer policies suited to diverse communication topologies.
+For applications that transfer large payloads---video frames, NumPy tensors, or serialized model states---the performance of this communication layer determines overall system throughput. A vision pipeline processing 30~frames per second with a 2.64\,MiB payload per frame generates over 79\,MiB/s of IPC traffic per producer-consumer pair. With multiple pipeline stages and fan-out to parallel consumers, aggregate bandwidth demands exceed what Python's standard library mechanisms can deliver without stalling on serialization or kernel copies.
 
 \newpage
 \section{Problem Statement}
@@ -23,9 +21,8 @@ Python's standard library offers several IPC mechanisms, each with significant l
     \item \textbf{multiprocessing.shared\_memory}: Introduced in Python 3.8, this module provides raw shared memory access but lacks built-in synchronization. Developers must implement their own locking mechanisms, and Python's lack of cross-process atomic operations complicates safe concurrent access.
 \end{itemize}
 
-Furthermore, Python's synchronization primitives exhibit limitations when used across processes. The \texttt{multiprocessing.Lock} cannot be stored in shared memory and must be passed through the parent-child process relationship. Condition variables are conflated with locks, preventing the efficient use of separate read and write notifications. These constraints make it difficult to implement sophisticated producer-consumer patterns efficiently in pure Python.
+Furthermore, Python's synchronization primitives exhibit limitations when used across processes. The \texttt{multiprocessing.Lock} cannot be stored in shared memory and must be passed through the parent-child process relationship. Condition variables cannot be placed in arbitrary shared memory regions; they must be inherited through the parent-child process hierarchy, limiting their use in dynamic process topologies. These constraints make it difficult to implement sophisticated producer-consumer patterns efficiently in pure Python.
 
-\bigskip
 \section{Proposed Solution}
 
 This thesis presents \texttt{rs\_ipc}, a high-performance inter-process communication library that addresses these limitations through a hybrid Python-Rust architecture. The library provides a \texttt{SharedMessage} abstraction built on POSIX shared memory primitives (\texttt{shm\_open}, \texttt{mmap}), offering:
@@ -33,16 +30,15 @@ This thesis presents \texttt{rs\_ipc}, a high-performance inter-process communic
 \begin{itemize}
     \item \textbf{Zero-copy semantics}: Processes read and write directly to shared memory, eliminating the serialization and memory copy overhead inherent in pipe-based communication.
 
-    \item \textbf{Futex-based synchronization}: Direct Linux futex system calls replace pthread FFI, reducing latency and simplifying cross-process synchronization.
+    \item \textbf{Futex-based synchronization}: Direct Linux futex system calls avoid the complexity of pthread cross-process primitives, reducing latency and simplifying deployment.
 
-    \item \textbf{Flexible blocking strategies}: Support for non-blocking, partial-blocking, and full-blocking communication modes enables adaptation to diverse application requirements.
+    \item \textbf{Flexible blocking strategies}: Support for non-blocking, partial-blocking, and full-blocking communication modes, enabling the user to trade between data freshness and delivery completeness.
 
     \item \textbf{GIL-free operations}: Rust's thread safety guarantees allow blocking IPC operations to release Python's GIL, enabling true concurrency in multithreaded Python applications.
 \end{itemize}
 
 By implementing the performance-critical components in Rust and exposing them through PyO3 bindings, the library combines Python's accessibility with systems-level performance.
 
-\bigskip
 \section{Contributions}
 
 This thesis makes the following contributions:
@@ -52,10 +48,11 @@ This thesis makes the following contributions:
 
     \item \textbf{Python integration enabling zero-copy shared memory access with safe GIL release}: PyO3 bindings expose the protocol to Python with the GIL released during all blocking operations. RAII guards implement both the buffer protocol and a file-like interface, enabling \texttt{pickle} serialization directly into shared memory. Asynchronous operation modes decouple the Python caller from IPC blocking entirely (Chapter~\ref{chap:ch4}).
 
-    \item \textbf{Empirical evaluation across six IPC backends and four communication topologies}: A benchmarking methodology based on multiple independent trials with warmup iterations compares \texttt{rs\_ipc} against ZeroMQ, POSIX IPC, and Python's \texttt{multiprocessing} primitives across latency, scalability, contention, and payload-size scenarios (Chapter~\ref{chap:ch5}).
+    \item \textbf{Empirical evaluation against five alternative IPC mechanisms across four benchmark scenarios spanning three communication topologies}: A benchmarking methodology based on multiple independent trials with warmup iterations, replicated on three hardware configurations, compares both \texttt{rs\_ipc} operation modes against ZeroMQ, POSIX IPC, and Python's \texttt{multiprocessing} primitives across latency, scalability, contention, and payload-size scenarios (Chapter~\ref{chap:ch5}).
 \end{enumerate}
 
-\bigskip
+Preliminary results of this work were presented at the Student Scientific Communications Session 2025, Faculty of Mathematics and Computer Science, Babeș-Bolyai University, in the paper ``Accelerating Intelligent Vehicle Vision: A Hybrid Python-Rust Architecture with Partial-Blocking IPC''~\cite{szilagyi2025accelerating}.
+
 \section{Thesis Structure}
 
 The remainder of this thesis is organized as follows:

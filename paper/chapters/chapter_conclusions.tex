@@ -1,9 +1,56 @@
 \chapter{Conclusions}
 \label{chap:conclusions}
 
-% TODO: Highlight that the ReaderWaitPolicy abstraction extends beyond shared-memory
-% blocking behavior to fundamentally change the system's delivery semantics. Combined
-% with WriteAsync, the same library serves as both a real-time data bus (latest-value,
-% lossy via Count(0)) and a reliable message queue (ordered, guaranteed delivery via
-% All()), selected at construction time without architectural changes.
+\section{Summary of Contributions}
 
+This thesis presented \texttt{rs\_ipc}, a Rust-based shared memory library providing efficient inter-process communication for Python applications on single Linux machines.
+
+The first contribution is a shared memory protocol with lock-free version checking and configurable delivery guarantees. Readers detect new messages and access payload data without acquiring any mutex, while a counter-based condition variable provides notification independently of the writer lock. The \texttt{ReaderWaitPolicy} abstraction extends beyond blocking behavior to alter the system's delivery semantics: \texttt{Count(0)} produces latest-value overwrite behavior suitable for real-time sensor streams, while \texttt{All()} guarantees delivery to every registered consumer. Combined with \texttt{WriteAsync}, the same library serves as both a lossy low-latency data bus and a reliable ordered message queue, selected at construction time. The 1:10 fan-out scenario achieves a scalability ratio of 2.3$\times$ (Table~\ref{tab:scalability_110}), compared to 20.1$\times$ for POSIX semaphore-based signaling and 6.5$\times$ for ZeroMQ.
+
+The second contribution is a Python integration layer that exposes zero-copy shared memory access with safe GIL release through PyO3 bindings. The integration enables \texttt{pickle.dump} and \texttt{pickle.load} to operate directly on shared memory without intermediate buffers. The dual data-path design---copy mode for minimal critical sections and zerocopy mode for eliminating intermediate allocations---serves diverse workload profiles from a single API. Copy mode achieves 0.19~ms median latency in the 1:1 scenario (Table~\ref{tab:latency_11}).
+
+The third contribution is an empirical evaluation comparing both \texttt{rs\_ipc} operation modes against five alternative IPC mechanisms across four benchmark scenarios spanning three communication topologies with 10 independent trials, warmup iterations, per-core pinning, and replication on three processor architectures. The overhead decomposition (Table~\ref{tab:decomposition}) reveals that 95\% of end-to-end latency in pickle-based workloads originates in Python's serialization layer, establishing a quantitative ceiling that informs both library users and future optimization efforts.
+
+\section{Key Findings}
+
+\textbf{Serialization dominates IPC transport cost.} The Rust synchronization mechanism contributes approximately 32~microseconds of the measured 840~microsecond end-to-end latency for a 2.64~MiB pickle payload (Table~\ref{tab:decomposition}). Further optimization of the transport layer yields diminishing returns for pickle-based workloads. The performance ceiling is set by Python's serialization infrastructure, not the communication channel.
+
+\textbf{Lock hold duration is the critical architectural parameter under writer contention.} The approximately 40~microsecond critical section in copy mode versus the approximately 800~microsecond critical section in zerocopy mode produces a 23$\times$ difference in p99 tail latency under 10:1 writer contention (Table~\ref{tab:contention_101}). This single design parameter---what work executes inside versus outside the lock---explains copy mode's bounded behavior (1.81$\times$ determinism ratio) versus zerocopy mode's catastrophic degradation (90.1$\times$ determinism ratio).
+
+\textbf{Lock-free readers provide superior multi-reader scalability.} The single-write, multi-read memory model where readers perform lock-free version checking outperforms both per-reader notification via semaphores and per-reader data transmission via socket connections in fan-out topologies (Figure~\ref{fig:scalability_degradation}). Multiple readers access the same physical memory region concurrently without per-reader copies or per-reader synchronization operations.
+
+\textbf{The copy/zerocopy duality serves distinct deployment topologies.} Neither mode dominates universally. Copy mode excels in 1:1 and N:1 topologies where pickle serialization occurs outside the critical section. Zerocopy mode excels in 1:N fan-out topologies and with pre-serialized byte data where lock hold time equals \texttt{memcpy} duration. Providing both modes from a single API enables deployment-time selection based on measured workload characteristics.
+
+\textbf{Construction-time policy selection unifies disparate messaging paradigms.} The \texttt{ReaderWaitPolicy} parameter transforms the library from a lossy low-latency data bus to a reliable ordered message queue without changes to the write or read call sites.
+
+\section{Limitations}
+
+The following limitations constrain the library's applicability:
+
+\begin{enumerate}
+    \item \textbf{Linux-specific implementation.} The futex-based synchronization is inherently Linux-specific. Portability to macOS or Windows requires platform-specific backends with potentially different performance characteristics. The library currently provides no cross-platform abstraction layer.
+
+    \item \textbf{Single-slot architecture.} The single message slot trades simplicity and constant memory usage for the inability to buffer bursts. Producers cannot absorb transient reader slowness without either overwriting the current message (data loss under \texttt{Count(0)}) or blocking until consumption completes (latency under \texttt{All()}). Applications with bursty production patterns may require external buffering.
+
+    \item \textbf{Zerocopy mode unsuitable for multi-writer topologies with serialization.} The extended lock hold during buffer-protocol serialization produces catastrophic tail latency (90.1$\times$ determinism ratio at 10:1 contention, Table~\ref{tab:contention_101}). Users must understand the interaction between topology and data-path mode to avoid this failure case.
+
+    \item \textbf{No backpressure in asynchronous mode.} The \texttt{WriteAsync} mode with \texttt{All()} policy employs an unbounded internal channel that grows without limit if the producer outpaces readers, providing no flow-control signal to the Python caller. Memory exhaustion is possible under sustained overproduction.
+
+    \item \textbf{Serialization ceiling beyond library control.} The library cannot circumvent the 95\% overhead imposed by pickle. Applications requiring the lowest possible latency must bypass pickle entirely using raw byte buffers or alternative serialization, which limits the convenience of the zero-copy buffer-protocol interface for structured Python objects.
+\end{enumerate}
+
+\section{Future Work}
+
+\begin{enumerate}
+    \item \textbf{Evaluation under free-threaded Python.} CPython's experimental removal of the Global Interpreter Lock~\cite{pep703}, progressing toward supported status~\cite{pep779}, weakens the primary motivation for multiprocessing-based parallelism in CPU-bound workloads. Future work should evaluate whether \texttt{rs\_ipc} remains advantageous for data sharing between free-threaded Python threads---where shared address space makes explicit shared memory redundant---and identify the workloads for which multi-process architectures persist (fault isolation, resource limits, multi-host deployment).
+
+    \item \textbf{Multi-slot ring buffer extension.} Extending the single-slot design to a bounded ring buffer would decouple producers from consumers, absorbing burst traffic without blocking or data loss. The version-checking mechanism extends to per-slot sequence numbers. The trade-off is increased memory usage and added complexity in wraparound handling and slot reclamation.
+
+    \item \textbf{Fairness-aware writer mutex.} The current unfair futex lock favors throughput in the common uncontended case but permits unbounded worst-case wait times under contention, as evidenced by the 90.1$\times$ determinism ratio. A ticket lock or queued spinlock variant could bound worst-case writer wait time at the cost of reduced throughput when contention is absent. The PosixIpc backend's consistently low determinism (1.33$\times$ at 10:1, Table~\ref{tab:contention_101}) demonstrates the achievability of fair scheduling in this domain.
+
+    \item \textbf{Adaptive spin calibration.} The static spin parameters (100 iterations for the writer mutex, 1000 for the condition variable) are heuristics tuned for the primary test platform. Adaptive strategies that adjust spin duration based on observed contention levels or historical lock hold times could improve performance across diverse workloads and hardware configurations without manual tuning.
+
+    \item \textbf{Cross-platform portability.} Implementing platform-specific synchronization backends behind a common trait interface would enable deployment on macOS and Windows. Windows provides \texttt{WaitOnAddress} with semantics equivalent to futex; macOS requires either the private \texttt{\_\_ulock\_wait} interface or a fallback to POSIX primitives with associated performance costs.
+
+    \item \textbf{Alternative serialization integration.} Since pickle serialization dominates end-to-end latency, providing first-class support for faster serialization paths---direct NumPy array views via the buffer protocol without pickle framing, or integration with schema-based formats---could substantially reduce the serialization bottleneck for common payload types while preserving the zero-copy transport advantage.
+\end{enumerate}
