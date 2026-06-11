@@ -3,7 +3,7 @@
 
 \section{Context and Motivation}
 
-Python's Global Interpreter Lock (GIL) prevents multiple threads from executing Python bytecode simultaneously, forcing CPU-bound workloads into a multiprocessing architecture where separate processes must exchange data through inter-process communication. Python's dominance in data-intensive domains---computer vision, machine learning, scientific computing---means these systems frequently require the kind of concurrent, low-latency data transfer that Python's standard library was never designed to provide.
+Python's Global Interpreter Lock (GIL) prevents multiple threads from executing Python bytecode simultaneously, forcing CPU-bound workloads into a multiprocessing architecture where separate processes must exchange data through inter-process communication. Python's dominance in data-intensive domains~\cite{stackoverflow2024}---computer vision, machine learning, scientific computing---means these systems frequently require the kind of concurrent, low-latency data transfer that Python's standard library was never designed to provide.
 
 For applications that transfer large payloads---video frames, NumPy tensors, or serialized model states---the performance of this communication layer determines overall system throughput. A vision pipeline processing 30~frames per second with a 2.64\,MiB payload per frame generates over 79\,MiB/s of IPC traffic per producer-consumer pair. With multiple pipeline stages and fan-out to parallel consumers, aggregate bandwidth demands exceed what Python's standard library mechanisms can deliver without stalling on serialization or kernel copies.
 
@@ -11,10 +11,10 @@ For applications that transfer large payloads---video frames, NumPy tensors, or 
 \section{Problem Statement}
 \label{sec:problem_statement}
 
-Python's standard library offers several IPC mechanisms, each with significant limitations for high-performance applications:
+Python's standard library offers several IPC mechanisms, each with limitations that become pronounced in high-performance applications:
 
 \begin{itemize}
-    \item \textbf{multiprocessing.Pipe}: Provides bidirectional communication but requires serialization (pickling) of data. For large objects, the serialization overhead and memory copies impose substantial latency.
+    \item \textbf{multiprocessing.Pipe}: Provides bidirectional communication but requires serialization (pickling) of data. For large objects, the serialization overhead and memory copies impose latency that grows with payload size.
 
     \item \textbf{multiprocessing.Queue}: Built on pipes with an internal feeder thread, this mechanism requires full serialization (pickling) of data and transfers it through kernel-mediated pipe buffers, combining serialization overhead with memory copy costs.
 
@@ -46,7 +46,7 @@ This thesis makes the following contributions:
 \begin{enumerate}
     \item \textbf{A shared memory read/write protocol with lock-free version checking and configurable delivery guarantees}: A cache-aligned \texttt{SharedMessage} data structure coordinates producers and consumers through bit-packed atomic fields, enabling readers to detect and access new data without acquiring any mutex. A configurable blocking policy allows the writer to overwrite immediately, wait for a subset of consumers, or wait for all registered readers---selected at construction time without application code changes (Chapter~\ref{chap:ch4}).
 
-    \item \textbf{Python integration enabling zero-copy shared memory access with safe GIL release}: PyO3 bindings expose the protocol to Python with the GIL released during all blocking operations. RAII guards implement both the buffer protocol and a file-like interface, enabling \texttt{pickle} serialization directly into shared memory. Asynchronous operation modes decouple the Python caller from IPC blocking entirely (Chapter~\ref{chap:ch4}).
+    \item \textbf{Python integration enabling zero-copy shared memory access with safe GIL release}: PyO3 bindings expose the protocol to Python with the GIL released during all blocking operations. Resource Acquisition Is Initialization (RAII) guards implement both the buffer protocol and a file-like interface, enabling \texttt{pickle} serialization directly into shared memory. Asynchronous operation modes decouple the Python caller from IPC blocking entirely (Chapter~\ref{chap:ch4}).
 
     \item \textbf{Empirical evaluation against five alternative IPC mechanisms across four benchmark scenarios spanning three communication topologies}: A benchmarking methodology based on multiple independent trials with warmup iterations, replicated on three hardware configurations, compares both \texttt{rs\_ipc} operation modes against ZeroMQ, POSIX IPC, and Python's \texttt{multiprocessing} primitives across latency, scalability, contention, and payload-size scenarios (Chapter~\ref{chap:ch5}).
 \end{enumerate}
@@ -59,7 +59,7 @@ The remainder of this thesis is organized as follows:
 
 \textbf{Chapter~\ref{chap:ch2}} provides the theoretical foundations necessary to understand the implementation. This includes an overview of POSIX shared memory, memory-mapped I/O, synchronization primitives, and the Linux futex subsystem.
 
-\textbf{Chapter~\ref{chap:ch3}} surveys related work in high-performance IPC, including message-passing frameworks, shared memory libraries, and serialization systems, positioning \texttt{rs\_ipc} within the existing landscape.
+\textbf{Chapter~\ref{chap:ch3}} surveys related work in high-performance IPC, including message-passing frameworks, shared memory libraries, and shared memory object stores, positioning \texttt{rs\_ipc} within the existing landscape.
 
 \textbf{Chapter~\ref{chap:ch4}} details the architecture and implementation of the \texttt{rs\_ipc} library. This chapter covers the \texttt{SharedMessage} data structure, the custom synchronization primitives, the PyO3 integration layer, and the asynchronous operation modes.
 

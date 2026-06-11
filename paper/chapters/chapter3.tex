@@ -46,7 +46,7 @@ The benchmarks in Chapter~\ref{chap:ch5} use \texttt{posix\_ipc} with a protocol
 
 \subsection{Synchronization via Named Semaphores}
 
-Named POSIX semaphores are kernel-managed objects. The POSIX specification defines \texttt{sem\_wait} and \texttt{sem\_post} without mandating a userspace fast path, so a naive implementation would require a system call per operation. On Linux, glibc implements POSIX semaphores using futexes internally, providing a userspace fast path for uncontended operations (analogous to the mechanism described in Section~\ref{sec:futex}). The kernel-managed futex wait queue provides approximately FIFO wakeup ordering among concurrent waiters.
+Named POSIX semaphores are kernel-managed objects. The POSIX specification defines \texttt{sem\_wait} and \texttt{sem\_post} without mandating a userspace fast path, so a naive implementation would require a system call per operation. On Linux, glibc implements POSIX semaphores using futexes internally, providing a userspace fast path for uncontended operations (analogous to the mechanism described in Section~\ref{sec:futex}). The kernel-managed futex wait queue provides approximately FIFO wakeup ordering when thread priorities are equal---an implementation detail of the Linux kernel rather than a POSIX specification guarantee~\cite{franke2002}.
 
 \subsection{Strengths}
 
@@ -57,9 +57,7 @@ For simple single-producer, single-consumer patterns, \texttt{posix\_ipc} achiev
 Several limitations emerge when scaling beyond the simple case:
 
 \begin{itemize}
-    \item \textbf{No multi-reader scalability.} Signaling $N$ readers that new data is available requires $N$ semaphore posts---$N$ system calls per message. There is no broadcast mechanism analogous to a condition variable's \texttt{notify\_all}.
-
-    \item \textbf{Linear notification cost.} Although glibc's POSIX semaphore implementation uses futexes internally (avoiding kernel entry on uncontended operations), the signaling model still requires one \texttt{sem\_post} call per reader per message---$N$ system calls under contention when all $N$ readers are blocked. The rs\_ipc condvar broadcasts to all waiters with a single \texttt{futex\_wake\_all}, regardless of reader count.
+    \item \textbf{Linear notification cost.} Signaling $N$ readers requires $N$ separate \texttt{sem\_post} calls. Although glibc implements these via futex fast paths (avoiding kernel entry when the semaphore is uncontended), the signaling model degenerates to $N$ system calls whenever all readers are blocked. There is no broadcast mechanism analogous to a condition variable's \texttt{notify\_all}.
 
     \item \textbf{Python overhead for protocol logic.} Header manipulation (packing sequence numbers, checking sizes) occurs in interpreted Python. While negligible for large payloads, this overhead becomes proportionally significant for small messages or high-frequency polling.
 
@@ -126,6 +124,16 @@ However, Plasma was deprecated in Apache Arrow 10.0 (2022) and removed entirely 
 Beyond its deprecation, Plasma's architecture differed from the use case addressed here in two respects. First, it required a long-running store process that managed the shared memory pool---adding a daemon dependency and an extra context switch per operation. Second, its object model was immutable and write-once: once sealed, objects could not be updated in place, making it unsuitable for streaming scenarios where a single shared slot is continuously overwritten with the latest data. The \texttt{rs\_ipc} design specifically targets this mutable single-slot pattern with configurable blocking policies for overwrite coordination.
 
 
+\section{Other Approaches}
+\label{sec:other_approaches}
+
+Several other IPC mechanisms occupy adjacent design points but target different constraints:
+
+\textbf{POSIX message queues} (\texttt{mq\_open}/\texttt{mq\_send}/\texttt{mq\_receive}) provide kernel-managed message passing with priority ordering and notification. However, the Linux default maximum message size is 8\,192 bytes (\texttt{/proc/sys/fs/mqueue/msgsize\_max}), and even when raised, messages are copied into and out of kernel memory---making the mechanism unsuitable for the multi-megabyte payloads targeted by this work.
+
+\textbf{io\_uring} provides high-performance asynchronous I/O through a shared submission/completion ring between user space and kernel~\cite{axboe2019}. While its registered-buffer mechanism enables zero-copy for network and disk I/O, it does not address user-to-user shared memory coordination: processes sharing a memory region still require a synchronization and notification mechanism orthogonal to the I/O submission path.
+
+
 \section{Comparative Summary}
 \label{sec:related_comparison}
 
@@ -143,13 +151,17 @@ Table~\ref{tab:related_comparison} summarizes the architectural properties of th
 \midrule
 Data transfer    & Kernel copy & Shared mem. & Shared mem. & Kernel copy & Shared mem. \\
 Synchronization  & Built-in    & None        & Semaphores  & Built-in    & Futex-based \\
-Multi-reader     & No          & N/A         & Manual      & Pattern-dep. & Built-in \\
+Multi-reader     & No          & N/A         & Manual      & Varies\textsuperscript{a} & Built-in \\
 Zero-copy access & No          & Yes         & Yes         & No          & Yes \\
 Lock-free readers & No         & N/A         & No          & No          & Yes \\
-GIL released     & No          & N/A         & Partial     & Partial     & Yes \\
+GIL released     & No          & Partial\textsuperscript{b} & Partial     & Partial     & Yes \\
 Blocking policy  & Fixed       & N/A         & Fixed       & HWM-based   & Configurable \\
 \bottomrule
 \end{tabular}
+
+\smallskip
+\noindent\textsuperscript{a}Depends on socket pattern (PUB/SUB, PUSH/PULL).\\
+\textsuperscript{b}Raw buffer access releases the GIL; no built-in blocking operations.
 \end{table}
 
 The table reveals a gap in the existing landscape. Kernel-copy mechanisms (Queue, Pipe, ZeroMQ) provide built-in synchronization and framing but impose unavoidable copy overhead that scales linearly with payload size. The shared memory approaches (\texttt{multiprocessing.shared\_memory}, \texttt{posix\_ipc}) eliminate copies but either lack synchronization entirely or rely on kernel-mediated semaphores without lock-free reader access or efficient broadcast notification.

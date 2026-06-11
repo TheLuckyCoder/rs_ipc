@@ -27,7 +27,7 @@ Named shared memory objects persist in the filesystem namespace until explicitly
 
 \subsection{Memory-Mapped I/O}
 
-The \texttt{mmap} system call maps a file descriptor (including shared memory objects) into the virtual address space of the calling process~\cite{kerrisk2010}. When invoked with the \texttt{MAP\_SHARED} flag, modifications made by one process become visible to all other processes that have mapped the same underlying object. The kernel ensures coherence through the page table mechanism: all mappings of the same physical page share the same underlying memory, so writes are immediately visible without explicit synchronization at the memory level.
+The \texttt{mmap} system call maps a file descriptor (including shared memory objects) into the virtual address space of the calling process~\cite{kerrisk2010}. When invoked with the \texttt{MAP\_SHARED} flag, modifications made by one process become visible to all other processes that have mapped the same underlying object. The kernel ensures coherence through the page table mechanism: all mappings of the same physical page share the same underlying memory, so all processes observe the same physical memory without the kernel performing explicit data movement.
 
 However, visibility at the memory level does not imply ordering guarantees at the instruction level. Modern processors may reorder memory operations for performance, meaning that a write performed by one process may not be observed in the expected order by another process. This gap between memory coherence and memory consistency motivates the synchronization mechanisms described in Section~\ref{sec:sync}.
 
@@ -45,7 +45,7 @@ The cost of this efficiency is complexity. Shared memory provides no inherent or
 \section{Synchronization and Cache Effects}
 \label{sec:sync}
 
-When multiple processes share a memory region, concurrent access without coordination leads to data races. Correct shared memory IPC requires atomic operations for lock-free state checks, memory ordering constraints to ensure cross-core visibility of writes, and blocking primitives to avoid busy-waiting~\cite{herlihy2012}. Modern hardware provides atomic read-modify-write instructions (compare-and-swap, fetch-and-add) that guarantee indivisible updates to aligned words, and memory ordering semantics (Acquire, Release, SeqCst in the C++11 model~\cite{boehm2008}) that constrain the order in which stores by one core become observable to loads on another. These form the foundation of the lock-free read paths described in Chapter~\ref{chap:ch4}. The blocking primitives---futexes---are covered separately in Section~\ref{sec:futex}; this section focuses on the hardware-level cache effect most relevant to the memory layout decisions.
+When multiple processes share a memory region, concurrent access without coordination leads to data races. Correct shared memory IPC requires atomic operations for lock-free state checks, memory ordering constraints to ensure cross-core visibility of writes, and blocking primitives to avoid busy-waiting~\cite{herlihy2012}. Modern hardware provides atomic read-modify-write instructions (compare-and-swap (CAS), fetch-and-add) that guarantee indivisible updates to aligned words, and memory ordering semantics (Acquire, Release, SeqCst in the C++11 model~\cite{boehm2008}) that constrain the order in which stores by one core become observable to loads on another. These form the foundation of the lock-free read paths described in Chapter~\ref{chap:ch4}. The blocking primitives---futexes---are covered separately in Section~\ref{sec:futex}; this section focuses on the hardware-level cache effect most relevant to the memory layout decisions.
 
 \subsection{False Sharing}
 \label{subsec:false_sharing}
@@ -54,13 +54,13 @@ Multi-core processors maintain cache coherence at the granularity of cache lines
 
 In shared memory IPC, false sharing is particularly damaging. Consider a structure where a write-mostly field (a sequence counter incremented by the producer) and a read-mostly field (a consumer count) occupy the same cache line. Every producer write invalidates the cache line on all consumer cores, forcing re-fetches of data they are only reading---not because the data changed, but because an adjacent field did.
 
-The standard mitigation is to separate fields with different access patterns into distinct cache lines through explicit padding. Using 128-byte separation (two cache lines) provides additional protection against hardware prefetching on processors with adjacent-line prefetchers (documented on Intel; conservative for AMD Zen where prefetch behavior differs).
+The standard mitigation is to separate fields with different access patterns into distinct cache lines through explicit padding. Using 128-byte separation (two cache lines) provides additional protection against hardware prefetching on processors with adjacent-line prefetchers (documented on Intel~\cite{intel_opt_manual}; conservative for AMD Zen where prefetch behavior differs).
 
 
 \section{The Linux Futex Subsystem}
 \label{sec:futex}
 
-Traditional Unix synchronization primitives such as System~V semaphores require a system call for every lock and unlock operation, regardless of whether contention exists. The POSIX threads (pthread) library improves upon this with userspace fast paths, but cross-process use introduces complexity. The mutex must be initialized with the \texttt{PTHREAD\_\-PROCESS\_\-SHARED} attribute, placed in shared memory, and accessed through the same library version in all processes.
+Traditional Unix synchronization primitives such as System~V semaphores require a system call for every lock and unlock operation, regardless of whether contention exists. The POSIX threads (pthread) library improves upon this with userspace fast paths, but cross-process use introduces complexity. The mutex must be initialized with the \texttt{PTHREAD\_\-PROCESS\_\-SHARED} attribute, placed in shared memory, and accessed through the same C library implementation in all processes (the internal layout is not standardized across implementations).
 
 The \textit{futex} (Fast Userspace Mutex) subsystem, introduced in Linux 2.5.7~\cite{franke2002}, addresses these limitations.
 
@@ -105,36 +105,6 @@ Futex wait queues are keyed by physical memory address, not by virtual address o
 
 Physical-address keying eliminates the initialization complexity of process-shared pthread mutexes: a futex-based lock in shared memory works correctly as soon as the memory is mapped---POSIX mandates that \texttt{ftruncate} zero-fills newly extended shared memory objects, satisfying the zero-initialization requirement---no constructor, no attribute configuration, no shared library dependency. The lock's state is entirely represented by a 4-byte integer, making it position-independent: any naturally aligned 4-byte region in shared memory can serve as a lock with no initialization beyond zero-filling.
 
-\subsection{Comparison with pthread}
-
-Table~\ref{tab:futex_vs_pthread} summarizes the practical differences between futex-based and pthread-based synchronization for cross-process use.
-
-\begin{table}[htbp]
-\centering
-\begin{tabular}{|l|l|l|}
-\hline
-\textbf{Aspect} & \textbf{pthread} & \textbf{Futex} \\
-\hline
-Size & 40 bytes (glibc x86\_64) & 4 bytes \\
-\hline
-Initialization & Attribute setup required & Zero-initialization \\
-\hline
-Cross-process & \texttt{PTHREAD\_PROCESS\_SHARED} & Automatic (physical addr) \\
-\hline
-FFI overhead & ctypes marshalling & Direct syscall \\
-\hline
-Library dependency & libpthread & None (kernel ABI) \\
-\hline
-Spin-then-block & Implementation-defined & Fully customizable \\
-\hline
-\end{tabular}
-\caption{Comparison of pthread and futex-based synchronization for cross-process IPC.}
-\label{tab:futex_vs_pthread}
-\end{table}
-
-For a Rust library targeting Linux and interoperating with Python through FFI, futexes offer a clear advantage: smaller memory footprint, no external library dependencies, no complex initialization, and full control over the spin-then-block strategy.
-
-
 \section{The Python Concurrency Model}
 \label{sec:python_concurrency}
 
@@ -144,7 +114,7 @@ CPython employs a Global Interpreter Lock (GIL) that permits only one thread to 
 
 \subsection{Releasing the GIL from Native Extensions}
 
-Native extensions written in C, C++, or Rust can release the GIL while executing code that does not interact with Python objects. The CPython C~API provides the macros \texttt{Py\_BEGIN\_ALLOW\_THREADS} and \texttt{Py\_END\_ALLOW\_THREADS} for this purpose. In the Rust ecosystem, the PyO3 framework provides an equivalent mechanism through the \texttt{Python::detach()} method, called on the GIL token (\texttt{py.detach(|| \{...\})}), which releases the GIL for the duration of the provided closure~\cite{pyo3}.
+Native extensions written in C, C++, or Rust can release the GIL while executing code that does not interact with Python objects. The CPython C~API provides the macros \texttt{Py\_BEGIN\_ALLOW\_THREADS} and \texttt{Py\_END\_ALLOW\_THREADS} for this purpose. In the Rust ecosystem, the PyO3 framework provides an equivalent mechanism through the \texttt{Python::detach()} method, called on the GIL token, which releases the GIL for the duration of the provided closure~\cite{pyo3}.
 
 The safety invariant is that no Python objects may be accessed (read, written, or reference-counted) while the GIL is released. Code operating exclusively on Rust-owned data structures satisfies this invariant trivially, making IPC operations ideal candidates for GIL release: blocking waits proceed without holding the GIL, allowing other Python threads to execute concurrently.
 
@@ -152,7 +122,7 @@ The safety invariant is that no Python objects may be accessed (read, written, o
 
 Python 3.13 introduced an experimental build configuration that removes the GIL (PEP~703)~\cite{pep703}, relying instead on biased reference counting and per-object locks. PEP~779~\cite{pep779}, accepted for Python~3.14, elevates free-threading from experimental to officially supported status. However, every C extension must explicitly declare compatibility; extensions that lack this declaration cause the interpreter to silently re-enable the GIL. Given the breadth of Python's extension ecosystem, widespread adoption is expected to require several years.
 
-Crucially, free-threading addresses only \textit{intra-process} parallelism. While shared data structures within a single free-threaded process could replace some IPC use cases, multi-process architectures remain necessary for fault isolation (a crash in one pipeline stage does not terminate the entire system), independent resource limits, and multi-host deployment where shared memory is fundamentally unavailable. The GIL release patterns described in this work remain beneficial even under free-threading: blocking IPC operations must release the Python thread state so that interpreter-wide operations (stop-the-world garbage collection, biased reference count resolution) can proceed without waiting for the blocked extension thread. \texttt{py.detach()} continues to serve this purpose regardless of whether a global lock exists.
+Crucially, free-threading addresses only \textit{intra-process} parallelism. Multi-process architectures remain necessary for fault isolation and independent resource limits, so IPC is not obsoleted. The GIL release patterns described in this work also remain beneficial: even without a global lock, blocking extensions must release the Python thread state via \texttt{py.detach()} so that interpreter-wide operations (stop-the-world garbage collection, biased reference count resolution) can proceed.
 
 \subsection{Standard Library IPC Limitations}
 
@@ -182,4 +152,4 @@ PyO3 is a Rust framework for creating native Python extensions~\cite{pyo3}. It p
     \item \textbf{Type conversions}: Automatic conversion between Python and Rust types at the FFI boundary, with zero-copy paths for bytes-like objects.
 \end{itemize}
 
-PyO3's safe API, explicit GIL management, and the buffer protocol together support a library architecture where Python code interacts with shared memory through idiomatic interfaces while the underlying implementation operates at native speed without GIL contention.
+These capabilities are used extensively in Chapter~\ref{chap:ch4} to expose the shared memory protocol to Python.

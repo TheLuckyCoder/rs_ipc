@@ -34,6 +34,8 @@ The following limitations constrain the library's applicability:
 
     \item \textbf{Zerocopy mode unsuitable for multi-writer topologies with serialization.} The extended lock hold during buffer-protocol serialization produces catastrophic tail latency (90.1$\times$ determinism ratio at 10:1 contention, Table~\ref{tab:contention_101}). Users must understand the interaction between topology and data-path mode to avoid this failure case.
 
+    \item \textbf{Single-machine scope.} The POSIX shared memory mechanism requires all communicating processes to reside on a single host. Extending to distributed communication would require a network transport layer, fundamentally altering the zero-copy advantages of the design.
+
     \item \textbf{No backpressure in asynchronous mode.} The \texttt{WriteAsync} mode with \texttt{All()} policy employs an unbounded internal channel that grows without limit if the producer outpaces readers, providing no flow-control signal to the Python caller. Memory exhaustion is possible under sustained overproduction.
 
     \item \textbf{Serialization ceiling beyond library control.} The library cannot circumvent the 95\% overhead imposed by pickle. Applications requiring the lowest possible latency must bypass pickle entirely using raw byte buffers or alternative serialization, which limits the convenience of the zero-copy buffer-protocol interface for structured Python objects.
