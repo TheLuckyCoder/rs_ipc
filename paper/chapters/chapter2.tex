@@ -3,6 +3,8 @@
 
 % Foundations: POSIX shm/mmap, synchronization primitives, futex subsystem
 
+The design of a shared memory IPC library rests on operating system primitives for memory sharing and process synchronization. This chapter presents the foundational mechanisms that underpin the implementation described in Chapter~\ref{chap:ch4}: POSIX shared memory and memory-mapped I/O for establishing shared address spaces, synchronization primitives for coordinating concurrent access, and the Linux futex subsystem that enables efficient blocking without kernel-mediated lock objects. The chapter concludes by deriving the requirements that these foundations impose on the library's architecture.
+
 \section{POSIX Shared Memory and Memory Mapping}
 \label{sec:shm}
 
@@ -116,18 +118,13 @@ CPython employs a Global Interpreter Lock (GIL) that permits only one thread to 
 
 Native extensions written in C, C++, or Rust can release the GIL while executing code that does not interact with Python objects. The CPython C~API provides the macros \texttt{Py\_BEGIN\_ALLOW\_THREADS} and \texttt{Py\_END\_ALLOW\_THREADS} for this purpose. In the Rust ecosystem, the PyO3 framework provides an equivalent mechanism through the \texttt{Python::detach()} method, called on the GIL token, which releases the GIL for the duration of the provided closure~\cite{pyo3}.
 
-The safety invariant is that no Python objects may be accessed (read, written, or reference-counted) while the GIL is released. Code operating exclusively on Rust-owned data structures satisfies this invariant trivially, making IPC operations ideal candidates for GIL release: blocking waits proceed without holding the GIL, allowing other Python threads to execute concurrently.
+The safety invariant is that no Python objects may be accessed (read, written, or reference-counted) while the GIL is released. Code operating exclusively on Rust-owned data structures satisfies this invariant trivially.
 
 \subsection{Free-Threading in Python 3.13+}
 
 Python 3.13 introduced an experimental build configuration that removes the GIL (PEP~703)~\cite{pep703}, relying instead on biased reference counting and per-object locks. PEP~779~\cite{pep779}, accepted for Python~3.14, elevates free-threading from experimental to officially supported status. However, every C extension must explicitly declare compatibility; extensions that lack this declaration cause the interpreter to silently re-enable the GIL. Given the breadth of Python's extension ecosystem, widespread adoption is expected to require several years.
 
 Crucially, free-threading addresses only \textit{intra-process} parallelism. Multi-process architectures remain necessary for fault isolation and independent resource limits, so IPC is not obsoleted. The GIL release patterns described in this work also remain beneficial: even without a global lock, blocking extensions must release the Python thread state via \texttt{py.detach()} so that interpreter-wide operations (stop-the-world garbage collection, biased reference count resolution) can proceed.
-
-\subsection{Standard Library IPC Limitations}
-
-Python's \texttt{multiprocessing} module provides \texttt{Queue} (pipe-based with pickle serialization), \texttt{Pipe} (lower overhead but still kernel-copied), and \texttt{shared\_memory} (raw access, no synchronization). As discussed in Section~\ref{sec:problem_statement}, all three impose either serialization overhead, kernel copies, or manual synchronization burdens that motivate a native extension approach. Critically, \texttt{multiprocessing.Lock} cannot reside in shared memory itself, forcing applications to pass synchronization primitives through the parent-child process relationship.
-
 
 \section{Rust for Safe Systems Programming}
 \label{sec:rust}

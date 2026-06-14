@@ -1,6 +1,8 @@
 \chapter{Introduction}
 \label{chap:intro}
 
+This chapter motivates the need for efficient inter-process communication in Python's multiprocessing ecosystem, formulates the specific problem addressed by this thesis, and outlines the contributions and structure of the remaining chapters.
+
 \section{Context and Motivation}
 
 Python's Global Interpreter Lock (GIL) prevents multiple threads from executing Python bytecode simultaneously, forcing CPU-bound workloads into a multiprocessing architecture where separate processes must exchange data through inter-process communication. Python's dominance in data-intensive domains~\cite{stackoverflow2024}---computer vision, machine learning, scientific computing---means these systems frequently require the kind of concurrent, low-latency data transfer that Python's standard library was never designed to provide.
@@ -66,3 +68,7 @@ The remainder of this thesis is organized as follows:
 \textbf{Chapter~\ref{chap:ch5}} presents the performance evaluation methodology and results. Benchmarks compare the library against Python's native IPC mechanisms across various data sizes and hardware configurations.
 
 \textbf{Chapter~\ref{chap:conclusions}} summarizes the contributions, discusses limitations, and identifies directions for future work.
+
+\section{Declaration of Generative AI in the writing process}
+During the preparation of this work the author used various Large Language Models in order to improve the readability and coherence of the text.
+After using these tools, the author reviewed and edited the content as needed and takes full responsibility for the content of the thesis.

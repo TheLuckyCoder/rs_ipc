@@ -40,7 +40,7 @@ The companion \texttt{ShareableList} class provides a higher-level interface but
 \section{The posix\_ipc Library}
 \label{sec:posix_ipc}
 
-The \texttt{posix\_ipc} package~\cite{posixipc_pkg} provides a thin Python/C wrapper around the POSIX IPC API: shared memory objects (\texttt{shm\_open}/\texttt{shm\_unlink}) and named semaphores (\texttt{sem\_open}/\texttt{sem\_wait}/\texttt{sem\_post})~\cite{posix2017}. It does not implement any protocol layer; the user must build message framing, versioning, and read/write coordination manually.
+The \texttt{posix\_ipc} package~\cite{posixipc_pkg} provides a thin Python/C wrapper around the POSIX IPC API: shared memory objects and named semaphores~\cite{posix2017}. It does not implement any protocol layer; the user must build message framing, versioning, and read/write coordination manually.
 
 The benchmarks in Chapter~\ref{chap:ch5} use \texttt{posix\_ipc} with a protocol that matches the \texttt{rs\_ipc} data path as closely as possible: a shared memory region for payload transfer, a producer semaphore to signal data availability, and a consumer semaphore to signal consumption. Message headers (size, sequence number) are packed using Python's \texttt{struct} module at the beginning of the shared region.
 
@@ -68,7 +68,7 @@ Several limitations emerge when scaling beyond the simple case:
 \section{ZeroMQ}
 \label{sec:zeromq}
 
-ZeroMQ is a brokerless message-passing library that presents an asynchronous socket-like API for inter-thread, inter-process, and inter-machine communication~\cite{zeromq2013, zeromq_guide}. The benchmarks in Chapter~\ref{chap:ch5} use the PyZMQ bindings~\cite{pyzmq} with the \texttt{ipc://} transport (Unix domain sockets) and the PUSH/PULL socket pattern.
+ZeroMQ is a brokerless message-passing library that presents an asynchronous socket-like API for communication across threads, processes, and machines~\cite{zeromq2013}. The benchmarks in Chapter~\ref{chap:ch5} use the PyZMQ bindings~\cite{pyzmq, zeromq_guide} with the \texttt{ipc://} transport (Unix domain sockets) and the PUSH/PULL socket pattern.
 
 \subsection{Architecture}
 
@@ -129,7 +129,7 @@ Beyond its deprecation, Plasma's architecture differed from the use case address
 
 Several other IPC mechanisms occupy adjacent design points but target different constraints:
 
-\textbf{POSIX message queues} (\texttt{mq\_open}/\texttt{mq\_send}/\texttt{mq\_receive}) provide kernel-managed message passing with priority ordering and notification. However, the Linux default maximum message size is 8\,192 bytes (\texttt{/proc/sys/fs/mqueue/msgsize\_max}), and even when raised, messages are copied into and out of kernel memory---making the mechanism unsuitable for the multi-megabyte payloads targeted by this work.
+\textbf{POSIX message queues} (\texttt{mq\_send}, \texttt{mq\_receive}) provide kernel-managed message passing with priority ordering and notification. However, the Linux default maximum message size is 8\,192 bytes (\texttt{/proc/sys/fs/mqueue/msgsize\_max}), and even when raised, messages are copied into and out of kernel memory---making the mechanism unsuitable for the multi-megabyte payloads targeted by this work.
 
 \textbf{io\_uring} provides high-performance asynchronous I/O through a shared submission/completion ring between user space and kernel~\cite{axboe2019}. While its registered-buffer mechanism enables zero-copy for network and disk I/O, it does not address user-to-user shared memory coordination: processes sharing a memory region still require a synchronization and notification mechanism orthogonal to the I/O submission path.
 

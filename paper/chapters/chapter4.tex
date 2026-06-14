@@ -1,6 +1,8 @@
 \chapter{Architecture \& Implementation}
 \label{chap:ch4}
 
+This chapter presents the design and implementation of the \texttt{rs\_ipc} library. Building on the OS primitives and synchronization mechanisms introduced in Chapter~\ref{chap:ch2}, it describes how the library is organized into layered components---from raw memory management through synchronization primitives to the shared message protocol and its Python bindings. Each section addresses both the design rationale and the implementation details, concluding with a discussion of the trade-offs that shaped the final architecture.
+
 % Structure: §overview → §memory → §sync → §SharedMessage → §protocol → §python → §tradeoffs
 
 
@@ -23,7 +25,6 @@ The design pursues five goals:
     \item \textbf{RAII safety}: All shared resources (memory mappings, file descriptors, read/\-write access) are managed through Rust's ownership system, ensuring cleanup without manual lifecycle management.
 \end{enumerate}
 
-\newpage
 The library is organized into four layers illustrated in Figure~\ref{fig:arch_layers}, each building on the one below:
 
 \begin{enumerate}
@@ -381,14 +382,19 @@ The protocol achieves lock-free reader access through three key mechanisms:
 \subsection{Read Guard Release}
 \label{subsec:guard_release}
 
-When a \texttt{ReadGuard} is dropped (either explicitly or by leaving scope), it performs two updates in a single CAS operation on \texttt{readers\_state}: decrementing \texttt{active\_\-readers} and incrementing \texttt{data\_consumed}. If \texttt{active\_readers} reaches zero after the decrement, the guard notifies the \texttt{reader\_done\_\-condvar} to wake the writer (which may be waiting to begin a new write in Algorithm~\ref{alg:write}, lines 13--17). The conditional notification avoids unnecessary \texttt{futex\_wake} system calls when other readers are still active.
+\begin{sloppypar}
+When a \texttt{ReadGuard} is dropped (either explicitly or by leaving scope), it performs two updates in a single CAS operation on \texttt{readers\_state}: decrementing \texttt{active\_readers} and incrementing \texttt{data\_consumed}.
+If \texttt{active\_readers} reaches zero after the decrement, the guard notifies the \texttt{reader\_done\_condvar} to wake the writer (which may be waiting to begin a new write in Algorithm~\ref{alg:write}, lines 13--17).
+The conditional notification avoids unnecessary \texttt{futex\_wake} system calls when other readers are still active.
+\end{sloppypar}
 
 Duplicate consumption is prevented at the protocol level: the \texttt{read} function requires the caller's last-seen sequence number and returns \texttt{None} if no newer message exists (Algorithm~\ref{alg:read}, line~6), ensuring that \texttt{data\_consumed} is incremented at most once per reader per message version.
 
 \subsection{Producer-Consumer Policies}
 \label{subsec:policies}
 
-The \texttt{ReaderWaitPolicy} configures the writer's blocking behavior through the \texttt{target\_read} field in \texttt{ReadersStateCount}. Table~\ref{tab:policies} summarizes the three modes.
+The \texttt{ReaderWaitPolicy} configures the writer's blocking behavior through the \texttt{target\_read} field in \texttt{ReadersStateCount}.
+Table~\ref{tab:policies} summarizes the three modes.
 
 \begin{table}[htbp]
     \centering
@@ -406,12 +412,14 @@ The \texttt{ReaderWaitPolicy} configures the writer's blocking behavior through 
     \end{tabular}
 \end{table}
 
-With \texttt{Count(0)}, the consumption wait loop in Algorithm~\ref{alg:write} (lines 5--10) is skipped entirely. The writer proceeds directly to setting the WIP flag and draining active readers; slow consumers simply skip to the next available message. With \texttt{All()}, the effective threshold resolves to the actual consumer count via $\min(\text{\texttt{target\_read}}, \text{\texttt{consumers}})$, ensuring full delivery before overwrite.
+With \texttt{Count(0)}, the consumption wait loop in Algorithm~\ref{alg:write} (lines 5--10) is skipped entirely. The writer proceeds directly to setting the WIP flag and draining active readers; slow consumers simply skip to the next available message.
+With \texttt{All()}, the effective threshold resolves to the actual consumer count via $\min(\text{\texttt{target\_read}}, \text{\texttt{consumers}})$, ensuring full delivery before overwrite.
 
 \subsection{Graceful Shutdown}
 \label{subsec:shutdown}
 
-The \texttt{stop()} operation sets bit~63 of \texttt{sequence\_and\_flags} (the stopped flag) using an atomic fetch-or with AcqRel ordering, then notifies both condition variables. Readers blocking in Algorithm~\ref{alg:read}, line~8 are woken and observe the stopped flag on retry (line~4), returning \texttt{None}; the writer blocking in Algorithm~\ref{alg:write} (lines 6--10 or 13--17) is similarly woken, clears the WIP flag if set, and returns \texttt{None}. The stopped flag is checked at every wait point in both algorithms, guaranteeing that no thread remains indefinitely blocked after shutdown is initiated.
+The \texttt{stop()} operation sets bit~63 of \texttt{sequence\_and\_flags} (the stopped flag) using an atomic fetch-or with AcqRel ordering, then notifies both condition variables. Readers blocking in Algorithm~\ref{alg:read}, line~8 are woken and observe the stopped flag on retry (line~4), returning \texttt{None}; the writer blocking in Algorithm~\ref{alg:write} (lines 6--10 or 13--17) is similarly woken, clears the WIP flag if set, and returns \texttt{None}.
+The stopped flag is checked at every wait point in both algorithms, guaranteeing that no thread remains indefinitely blocked after shutdown is initiated.
 
 
 \section{Python Integration Layer}
@@ -446,7 +454,7 @@ The copy path (\texttt{write(data)} / \texttt{read()}) separates serialization f
 
 Both directions release the GIL for their entire duration. The release is safe because all code executing after release operates exclusively on Rust-owned data structures: shared memory regions accessed through atomic operations, futex-based locks, and condvar counters. No Python objects are read, written, or reference-counted while the GIL is released. The same safety argument applies to all modes described below.
 
-The critical section in copy mode is bounded by the \texttt{memcpy} duration---approximately 15~\textmu s per MiB of payload based on the microbenchmarks in Section~\ref{sec:rust_microbench}, or roughly 40~\textmu s for the 2.64~MiB benchmark payload. Synchronization overhead (lock acquisition, sequence CAS, condvar notify) adds less than 2~\textmu s. This short critical section makes copy mode tolerant of writer contention.
+The critical section in copy mode is bounded by the \texttt{memcpy} duration --- approximately 15~\textmu s per MiB of payload based on the microbenchmarks in Section~\ref{sec:rust_microbench}, or roughly 40~\textmu s for the 2.64~MiB benchmark payload. Synchronization overhead (lock acquisition, sequence CAS, condvar notify) adds less than 2~\textmu s. This short critical section makes copy mode tolerant of writer contention.
 
 \subsection{Zerocopy Path}
 \label{subsec:zerocopy_path}
